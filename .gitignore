@@ -28,3 +28,6 @@ bench/gold-candidates*.json
 bench/bench-runs*.txt
 bench/eval-output.txt
 bench/gold-m2-filtered.json
+
+# Personal Claude Code permissions (machine-local)
+.claude/settings.local.json
