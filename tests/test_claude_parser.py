@@ -7,7 +7,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "lib" / "ask_claude.sh"
+SCRIPT = ROOT / "lib" / "legs" / "ask_claude.sh"
 
 
 def extract_served(payload: dict, requested: str = "") -> subprocess.CompletedProcess[str]:

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-model price research</title>
+  <style>
+    :root { color-scheme: light; --ink: #1f2933; --muted: #667085; --line: #d9e2ec; --bg: #f7f9fb; --panel: #ffffff; --accent: #0f766e; --bad: #b42318; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+    header { padding: 20px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0; }
+    main { max-width: 1120px; margin: 0 auto; padding: 20px; display: grid; gap: 18px; }
+    form { display: grid; gap: 10px; }
+    .controls { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 12px; align-items: end; }
+    .control { display: grid; gap: 4px; }
+    .control-label { font-size: 13px; color: var(--muted); }
+    .control input[type="text"] { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: var(--ink); background: var(--panel); }
+    .control input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .badge { display: inline-block; margin: 2px 0 6px; padding: 2px 8px; border-radius: 999px; background: #fef0c7; color: #93370d; font-size: 12px; font-weight: 650; }
+    .history { display: grid; gap: 6px; }
+    .history-row { text-align: left; border: 1px solid var(--line); background: #fbfdff; color: var(--ink); border-radius: 8px; padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; min-height: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .history-row.active { border-color: var(--accent); background: #ecfdf5; }
+    textarea { width: 100%; min-height: 92px; resize: vertical; padding: 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: var(--ink); background: var(--panel); }
+    button { min-height: 44px; padding: 0 18px; border: 0; border-radius: 8px; background: var(--accent); color: white; font: inherit; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: default; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .status { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: var(--muted); }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; color: var(--ink); background: #fbfdff; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+    article { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+    article h3 { margin: 0 0 8px; font-size: 15px; line-height: 1.35; letter-spacing: 0; }
+    article a { color: var(--accent); overflow-wrap: anywhere; }
+    .price { font-size: 18px; font-weight: 750; margin: 6px 0; }
+    .muted { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .bad { color: var(--bad); }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #eef2ff; padding: 14px; border-radius: 8px; max-height: 520px; overflow: auto; }
+    @media (max-width: 680px) { .controls { grid-template-columns: 1fr; } button { width: 100%; } main { padding: 12px; } }
+  </style>
+</head>
+<body>
+  <header><h1>Multi-model research</h1></header>
+  <main>
+    <section>
+      <form id="runForm">
+        <textarea id="prompt" placeholder="Find the cheapest MacBook Air M2 in Ukraine with working links"></textarea>
+        <div class="controls">
+          <label class="control">
+            <span class="control-label">Restrict to site (optional)</span>
+            <input id="site" type="text" placeholder="olx.ua, prom.ua">
+          </label>
+          <label class="control effort">
+            <span class="control-label">Effort: <strong id="effortName"></strong></span>
+            <input id="effort" type="range" min="1" max="4" step="1" value="2">
+            <span class="muted" id="effortHint"></span>
+          </label>
+          <button id="submit" type="submit">Start</button>
+        </div>
+      </form>
+    </section>
+    <section>
+      <div class="status">
+        <span class="pill" id="runId">No run</span>
+        <span class="pill" id="status">Idle</span>
+        <span class="pill" id="progress" hidden></span>
+        <span class="pill bad" id="legHealth" hidden></span>
+        <span class="pill" id="runConfig" hidden></span>
+        <span class="pill" id="counts">0 verified / 0 rejected</span>
+      </div>
+    </section>
+    <section>
+      <h2>Run history</h2>
+      <div id="history" class="history"></div>
+    </section>
+    <section>
+      <h2>Verified</h2>
+      <div id="verified" class="grid"></div>
+    </section>
+    <section>
+      <h2>Rejected / unverified</h2>
+      <div id="rejected" class="grid"></div>
+    </section>
+    <section>
+      <h2>Final report</h2>
+      <pre id="final">No report yet.</pre>
+    </section>
+  </main>
+  <script>
+    const EFFORTS = {
+      1: { name: 'Quick', hint: '3 tasks x 2 models, 1 rescue round, Sonnet adjudicates disputes' },
+      2: { name: 'Standard', hint: '4 tasks x 2 models, 1 rescue round, Sonnet adjudication' },
+      3: { name: 'Deep', hint: '5 tasks x 2 models, 2 rescue rounds (second model retries failures), Gemini adversarial review, Opus adjudication' },
+      4: { name: 'Max', hint: '6 tasks x 2 models at max reasoning, 2 rescue rounds with BOTH models per item, Gemini+Opus reviews, Opus adjudication' }
+    };
+    const form = document.getElementById('runForm');
+    const promptEl = document.getElementById('prompt');
+    const siteEl = document.getElementById('site');
+    const effortEl = document.getElementById('effort');
+    const effortNameEl = document.getElementById('effortName');
+    const effortHintEl = document.getElementById('effortHint');
+    const submit = document.getElementById('submit');
+    const runIdEl = document.getElementById('runId');
+    const statusEl = document.getElementById('status');
+    const progressEl = document.getElementById('progress');
+    const legHealthEl = document.getElementById('legHealth');
+    const runConfigEl = document.getElementById('runConfig');
+    const countsEl = document.getElementById('counts');
+    const historyEl = document.getElementById('history');
+    const verifiedEl = document.getElementById('verified');
+    const rejectedEl = document.getElementById('rejected');
+    const finalEl = document.getElementById('final');
+    let currentRun = localStorage.getItem('currentRun') || null;
+    let pollTimer = null;
+
+    function syncEffortLabel() {
+      const effort = EFFORTS[effortEl.value] || EFFORTS[2];
+      effortNameEl.textContent = effortEl.value + ' - ' + effort.name;
+      effortHintEl.textContent = effort.hint;
+    }
+    effortEl.addEventListener('input', syncEffortLabel);
+    syncEffortLabel();
+
+    function itemCard(item, rejected) {
+      const article = document.createElement('article');
+      const title = document.createElement('h3');
+      title.textContent = item.title || 'Untitled';
+      article.appendChild(title);
+      const price = document.createElement('div');
+      price.className = 'price';
+      price.textContent = item.price ? `${item.price} ${item.currency || ''}` : 'No price';
+      article.appendChild(price);
+      if (item.disputed) {
+        const disputed = document.createElement('span');
+        disputed.className = 'badge';
+        disputed.textContent = 'disputed: ' + (item.price_candidates || []).map(c => c.price).join(' vs ');
+        article.appendChild(disputed);
+      }
+      if (item.url) {
+        const link = document.createElement('a');
+        link.href = item.url;
+        link.target = '_blank';
+        link.rel = 'noreferrer';
+        link.textContent = item.url;
+        article.appendChild(link);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'muted';
+      meta.textContent = [item.marketplace, item.location, item.availability].filter(Boolean).join(' | ');
+      article.appendChild(meta);
+      if (item.adjudication) {
+        const note = document.createElement('div');
+        note.className = 'muted';
+        note.textContent = 'arbiter: ' + item.adjudication;
+        article.appendChild(note);
+      }
+      if (rejected) {
+        const reasons = document.createElement('div');
+        reasons.className = 'muted bad';
+        reasons.textContent = (item.reasons || []).join(', ');
+        article.appendChild(reasons);
+      }
+      return article;
+    }
+
+    function renderList(node, items, rejected) {
+      node.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = 'Nothing yet.';
+        node.appendChild(empty);
+        return;
+      }
+      items.slice(0, 12).forEach(item => node.appendChild(itemCard(item, rejected)));
+    }
+
+    function describeConfig(config) {
+      if (!config) return '';
+      const parts = [];
+      if (config.effort) parts.push('effort: ' + config.effort);
+      if (config.sites && config.sites.length) parts.push('sites: ' + config.sites.join(', '));
+      return parts.join(' | ');
+    }
+
+    async function loadHistory() {
+      const res = await fetch('/api/runs');
+      if (!res.ok) return;
+      const data = await res.json();
+      historyEl.replaceChildren();
+      (data.runs || []).slice(0, 15).forEach(run => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'history-row' + (run.run_id === currentRun ? ' active' : '');
+        const text = (run.prompt || '').replace(/\s+/g, ' ').slice(0, 80);
+        const stats = `${run.status || '?'} | ${run.verified_count ?? 0} ok`;
+        row.textContent = `${(run.created_at || '').slice(0, 16)}  ${text}  [${stats}]`;
+        row.addEventListener('click', () => { watchRun(run.run_id); });
+        historyEl.appendChild(row);
+      });
+      if (!historyEl.children.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = 'No runs yet.';
+        historyEl.appendChild(empty);
+      }
+    }
+
+    function watchRun(runId) {
+      currentRun = runId;
+      localStorage.setItem('currentRun', currentRun);
+      finalEl.textContent = 'Loading...';
+      refresh();
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refresh, 2000);
+      loadHistory();
+    }
+
+    async function refresh() {
+      if (!currentRun) return;
+      const res = await fetch(`/api/runs/${encodeURIComponent(currentRun)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const run = data.run || {};
+      runIdEl.textContent = run.run_id || currentRun;
+      statusEl.textContent = `${run.status || 'unknown'} / ${run.phase || 'unknown'}`;
+      const progress = run.progress;
+      progressEl.hidden = !(progress && progress.total);
+      if (progress && progress.total) progressEl.textContent = `calls: ${progress.done}/${progress.total}`;
+      const downLegs = run.degraded_legs
+        || Object.entries(run.leg_health || {}).filter(([, h]) => h.disabled).map(([leg]) => leg);
+      legHealthEl.hidden = !downLegs.length;
+      if (downLegs.length) legHealthEl.textContent = `model down: ${downLegs.join(', ')}`;
+      let configText = describeConfig(run.config);
+      if (run.recheck_dropped) configText += ` | rescue budget skipped: ${run.recheck_dropped}`;
+      runConfigEl.hidden = !configText;
+      runConfigEl.textContent = configText;
+      countsEl.textContent = `${data.verified.length} verified / ${data.rejected.length} rejected`;
+      renderList(verifiedEl, data.verified || [], false);
+      renderList(rejectedEl, data.rejected || [], true);
+      if (data.final_url) {
+        const finalRes = await fetch(data.final_url);
+        finalEl.textContent = await finalRes.text();
+      }
+      if (run.status === 'completed' || run.status === 'failed') {
+        submit.disabled = false;
+        if (pollTimer) clearInterval(pollTimer);
+        loadHistory();
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const prompt = promptEl.value.trim();
+      if (!prompt) return;
+      submit.disabled = true;
+      finalEl.textContent = 'Running...';
+      const res = await fetch('/api/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, effort: Number(effortEl.value), sites: siteEl.value })
+      });
+      const data = await res.json();
+      watchRun(data.run_id);
+    });
+
+    loadHistory();
+    if (currentRun) {
+      refresh();
+      pollTimer = setInterval(refresh, 2000);
+    }
+  </script>
+</body>
+</html>

@@ -15,8 +15,8 @@ rounds (other leg) → Claude adjudication of disputes (effort >= 3) → synthes
 cross-vendor adversarial review + revision (effort >= 3) → `final.md`.
 
 Three legs, all subscription-only, all callable from ANY environment (no Claude Code session
-needed): `lib/ask_codex.sh` (gpt-5.5), `lib/ask_gemini.sh` (gemini-3.1-pro-preview),
-`lib/ask_claude.sh` (opus alias; NEW 2026-06-11). Claude is THIN by design: adjudicator and
+needed): `lib/legs/ask_codex.sh` (gpt-5.5), `lib/legs/ask_gemini.sh` (gemini-3.1-pro-preview),
+`lib/legs/ask_claude.sh` (opus alias; NEW 2026-06-11). Claude is THIN by design: adjudicator and
 adversarial reviewer only, never heavy search.
 
 Effort system (1-4 / quick / standard / deep / max) scales task count, recheck rounds/items,
@@ -72,7 +72,11 @@ through provider quota exhaustion windows — resilience proven, marginal qualit
 unmeasured; re-run them on a quota-healthy day. Provider quotas, not effort design, were the
 limiting factor; quota-aware pacing is the next optimization.
 
-Not a git repo. Owner controls all git — do NOT `git init`/commit/push without explicit instruction.
+Git: public repo at github.com/LoyEgor/multi-model-research (published 2026-06-12). The vendor
+legs were EXTRACTED into the shared github.com/LoyEgor/llm-legs library, consumed as a git
+submodule at lib/legs/ (clone with --recurse-submodules). Audit logs land in the caller's
+data/ dir ($PWD/data by default; LLM_LEGS_DATA_DIR overrides). The owner still controls git —
+do NOT commit/push without explicit per-action instruction (see the owner's global rules).
 
 ## Done (originally audit findings 1-8, plus owner feature requests)
 

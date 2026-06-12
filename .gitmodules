@@ -1,0 +1,3 @@
+[submodule "lib/legs"]
+	path = lib/legs
+	url = https://github.com/LoyEgor/llm-legs

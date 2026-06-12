@@ -1,0 +1,1197 @@
+{
+ "run": {
+  "config": {
+   "effort": "max",
+   "effort_level": 4,
+   "recheck_rounds": 2,
+   "review_legs": [
+    "gemini",
+    "claude"
+   ],
+   "sites": [
+    "olx.ua"
+   ],
+   "task_count": 6
+  },
+  "created_at": "2026-06-12T16:53:13Z",
+  "degraded_legs": [
+   "claude",
+   "gemini"
+  ],
+  "disputed_count": 2,
+  "error": null,
+  "final_path": "runs/20260612T165313Z-macbook-air-m2-76001dd2-49faa7/final.md",
+  "leg_health": {
+   "claude": {
+    "consecutive_failures": 3,
+    "disabled": true
+   },
+   "codex": {
+    "consecutive_failures": 0,
+    "disabled": false
+   },
+   "gemini": {
+    "consecutive_failures": 0,
+    "disabled": true
+   }
+  },
+  "phase": "completed",
+  "progress": null,
+  "prompt": "найди самый дешевый MacBook Air M2 в Украине",
+  "recheck_dropped": 1,
+  "rejected_count": 25,
+  "run_id": "20260612T165313Z-macbook-air-m2-76001dd2-49faa7",
+  "status": "completed",
+  "updated_at": "2026-06-12T17:33:07Z",
+  "verified_count": 15
+ },
+ "tasks": [
+  {
+   "focus": "Find broad current OLX listings for MacBook Air M2 in Ukraine; record the lowest real purchasable prices and exclude accessories, parts, and wanted ads.",
+   "id": "task-1",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "MacBook Air M2 OLX Україна"
+  },
+  {
+   "focus": "Check base 13-inch 2022 MacBook Air M2 8GB/256GB offers, usually the cheapest configuration; verify condition, battery cycles, location, and seller credibility.",
+   "id": "task-2",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "MacBook Air M2 13 2022 8 256 OLX"
+  },
+  {
+   "focus": "Search Russian-language OLX listings that may not appear in English queries; compare lowest prices and confirm they are complete working laptops.",
+   "id": "task-3",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "Макбук Air M2 OLX Украина"
+  },
+  {
+   "focus": "Search Ukrainian-language OLX listings using localized spelling; identify cheap offers and verify model year, RAM, storage, and whether delivery or pickup is available.",
+   "id": "task-4",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "Макбук Ейр M2 OLX Україна"
+  },
+  {
+   "focus": "Search by Apple model number A2681 for the 13-inch M2 Air; catch listings that omit 'M2' from the title and verify they are not Intel or M1 models.",
+   "id": "task-5",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "MacBook Air A2681 M2 OLX"
+  },
+  {
+   "focus": "Check 15-inch M2 Air listings separately so they are not confused with cheaper 13-inch models; note whether any unusually low 15-inch offer affects the cheapest overall result.",
+   "id": "task-6",
+   "preferred_sites": [
+    "olx.ua"
+   ],
+   "query": "MacBook Air M2 15 OLX Україна"
+  }
+ ],
+ "verified": [
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "damaged",
+   "confidence": 0.95,
+   "currency": "UAH",
+   "disputed": true,
+   "evidence": "Active ad for 18,850 UAH. Front camera not working and minor screen backlight spots, clean iCloud, 94% battery. | OLX notebook search result shows M2 A2681, 8/256, 94% battery, used, 20300 грн | OLX result shows M2 Air A2681, 8/256GB, 94% battery, used, 20300 грн | Title verifies M2 2022, 8/256, A2681 and 94% battery; OLX shows used and 18 300 грн; delivery/seller trust not visible; unusually low price | OLX result shows 18 300 грн, Вживане, 94% АКБ; price far below nearby M2 Air offers, scam/issue risk | OLX search card lists this full-spec Air M2 offer at 18 300 грн, Вживане, 94% battery | Live OLX search result shows MacBook Air M2 A2681 listing, 18 300 грн, used, Dnipro. | Exact ID10hhmS not found live; closest active OLX laptop-category result shows M2 A2681, 8/256GB, 94% battery, 18 300 грн, used.",
+   "location": "Дніпро, Центральний",
+   "marketplace": "OLX",
+   "price": 18300.0,
+   "price_candidates": [
+    {
+     "price": 18850.0,
+     "source_model": "gemini"
+    },
+    {
+     "price": 20300.0,
+     "source_model": "codex"
+    },
+    {
+     "price": 18300.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-1-gemini-01ad259e",
+   "seller": "Business seller: Максим, account created 2019-02-04",
+   "shipping": "Local pickup or shipping by agreement",
+   "source_model": "gemini",
+   "source_models": [
+    "codex",
+    "gemini"
+   ],
+   "task_id": "task-1",
+   "title": "Macbook Air M2 14 2022 8/256gb 94% акб Starlight A2681 макбук аир м2 не про",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-14-2022-8-256gb-94-akb-starlight-a2681-makbuk-air-m2-ne-pro-ID10p3BR.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.95,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "closest equivalent offer for Macbook Air 13 M2 8/256 Midnight at a similar price after the original listing was removed",
+   "location": "Київ",
+   "marketplace": "OLX",
+   "price": 22100.0,
+   "price_candidates": [
+    {
+     "price": 22100.0,
+     "source_model": "gemini"
+    }
+   ],
+   "record_id": "recheck-recheck-1-3-gemini-gemini-63b44dc6",
+   "seller": "macon.sale (account since 2019)",
+   "shipping": null,
+   "source_model": "gemini",
+   "source_models": [
+    "gemini"
+   ],
+   "task_id": "recheck-1-3-gemini",
+   "title": "Apple Macbook Air 13.6 M2 2022 8GB RAM 256GB SSD Midnight IL7198",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/apple-macbook-air-13-6-m2-2022-8gb-ram-256gb-ssd-midnight-il7198-ID10zmHK.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.95,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "closest equivalent offer for Macbook Air 13 M2 8/256 Midnight at a similar price after the original listing was removed",
+   "location": "Львів",
+   "marketplace": "OLX",
+   "price": 22390.0,
+   "price_candidates": [
+    {
+     "price": 22390.0,
+     "source_model": "gemini"
+    }
+   ],
+   "record_id": "recheck-recheck-1-3-gemini-gemini-63b44dc6",
+   "seller": "Юрій (account since 2012)",
+   "shipping": null,
+   "source_model": "gemini",
+   "source_models": [
+    "gemini"
+   ],
+   "task_id": "recheck-1-3-gemini",
+   "title": "MacBook Air 13\" 2022 M2 Midnight 8GB 256GB SSD",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-13-2022-m2-midnight-8gb-256gb-ssd-ID10oxKe.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.95,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Verified price of 24,700 UAH. Device has 99% battery health and is in good technical and physical condition. | OLX broad search result shows Air M2 8/256, 99% battery, used, 24700 грн | OLX Russian result shows M2 Air 8/256GB, 99% battery, used, 24700 грн | Title verifies MacBook Air M2, 8/256 and 99% battery; OLX shows used and 24 700 грн; model year and delivery not visible | OLX card shows MacBook Air M2 8/256, battery 99%, used, 24 700 грн; no Intel/M1 wording | OLX result shows 24 700 грн, Вживане, title says battery 99% | Exact ID10x0GK appears gone; active closest cheaper 8/256 M2 listing, HTTP 200, 99% battery | Recovered direct OLX listing; title matches 8/256gb battery 99%; price shown as 24 700 грн",
+   "location": "Львів, Залізничний",
+   "marketplace": "OLX",
+   "price": 24700.0,
+   "price_candidates": [
+    {
+     "price": 24700.0,
+     "source_model": "gemini"
+    },
+    {
+     "price": 24700.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-1-gemini-01ad259e",
+   "seller": "Account age: since December 2020, private seller Oleg",
+   "shipping": "Hand-to-hand meetup in Lviv preferred",
+   "source_model": "gemini",
+   "source_models": [
+    "codex",
+    "gemini"
+   ],
+   "task_id": "task-1",
+   "title": "Apple Macbook air M2 8/256gb батарея 99%",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/apple-macbook-air-m2-8-256gb-batareya-99-ID10xQ56.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.8,
+   "currency": "UAH",
+   "disputed": true,
+   "evidence": "Search result indicates 13-inch M2 8/256GB with 99% battery in Lviv for 24700 UAH | Search result indicates 13-inch M2 8/256GB in perfect condition with case in Kyiv for 25000 UAH | Search result indicates standard 13-inch M2 8/256GB listing in Kyiv for 30000 UAH",
+   "location": "Львів",
+   "marketplace": "OLX",
+   "price": 24700.0,
+   "price_candidates": [
+    {
+     "price": 24700.0,
+     "source_model": "gemini"
+    },
+    {
+     "price": 25000.0,
+     "source_model": "gemini"
+    },
+    {
+     "price": 30000.0,
+     "source_model": "gemini"
+    }
+   ],
+   "record_id": "search-task-2-gemini-dd22af77",
+   "seller": null,
+   "shipping": null,
+   "source_model": "gemini",
+   "source_models": [
+    "gemini"
+   ],
+   "task_id": "task-2",
+   "title": "MacBook Air 13 M2, 8/256 ГБ, батарея 99%",
+   "url": "https://www.olx.ua/uk/list/q-macbook-air-m2-13-8-256/",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.93,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Listing page verifies A2681 M2 8GB/256GB, used, 95% battery with 90 cycles, iCloud clean, no corporate profiles | Closest same-color/config replacement: active A2681 Midnight 8/256 M2 listing, HTTP 200, 95% battery | Listing page shows A2681, 95% battery, used condition, published today, price 24 989 грн.",
+   "location": "Київ, Дніпровський",
+   "marketplace": "OLX",
+   "price": 24989.0,
+   "price_candidates": [
+    {
+     "price": 24989.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-2-codex-85be4a79",
+   "seller": "Business seller; Максим on OLX since April 2017; online at 12:45; rating/reviews not shown",
+   "shipping": "OLX Доставка; seller also says pickup/check in Kyiv or Nova Poshta shipping possible",
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-2",
+   "title": "Macbook air m2 A2681 midnight 8gb 256gb",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-a2681-midnight-8gb-256gb-IDYNTVB.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.91,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX card explicitly says Apple MacBook Air A2681 M2, used, 25 000 грн",
+   "location": "Киев, Голосеевский",
+   "marketplace": "OLX",
+   "price": 25000.0,
+   "price_candidates": [
+    {
+     "price": 25000.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-5-codex-234b0900",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-5",
+   "title": "Apple MacBook Air a2681 m2",
+   "url": "https://www.olx.ua/d/obyavlenie/apple-macbook-air-a2681-m2-ID10n1GV.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.68,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Exact ID10p3BR was not recoverable; current OLX results show this 8/256 M2 listing at 25 000 грн, used, Львів",
+   "location": "Львів, Залізничний",
+   "marketplace": "OLX",
+   "price": 25000.0,
+   "price_candidates": [
+    {
+     "price": 25000.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "recheck-recheck-1-12-codex-codex-4fbd799e",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "recheck-1-12-codex",
+   "title": "Apple Macbook air M2 8/256gb батарея 99%",
+   "url": "https://www.olx.ua/uk/list/q-macbook-air-m2/",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.8,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX Russian result says 8/256GB, ideal condition plus case, used, 25000 грн | Title verifies MacBook Air M2, 8/256 and says ideal condition plus case; OLX shows used and 25 000 грн; model year/delivery not visible | OLX result shows 25 000 грн, Вживане, title says ideal condition plus case",
+   "location": "Київ, Дніпровський",
+   "marketplace": "OLX",
+   "price": 25000.0,
+   "price_candidates": [
+    {
+     "price": 25000.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-3-codex-27722f6e",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-3",
+   "title": "MacBook Air M2 8/256 ГБ - ідеальний стан + чохол",
+   "url": "https://www.olx.ua/d/obyavlenie/macbook-air-m2-8-256-gb-dealniy-stan-chohol-ID10BZWe.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.76,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Title verifies MacBook Air M2, 8/256; OLX shows used and 25 000 грн; model year and delivery not visible",
+   "location": "Львів, Галицький",
+   "marketplace": "OLX",
+   "price": 25000.0,
+   "price_candidates": [
+    {
+     "price": 25000.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-4-codex-1a3f89dc",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-4",
+   "title": "Macbook Air M2 8/256gb, класний на кожен день",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-8-256gb-klasniy-na-kozhen-den-ID10yHAm.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.68,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "15-inch M2 checked separately; OLX result shows 27 400 грн, Вживане",
+   "location": "Ірпінь",
+   "marketplace": "OLX",
+   "price": 27400.0,
+   "price_candidates": [
+    {
+     "price": 27400.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-6-codex-b1b280fc",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-6",
+   "title": "Macbook air 15 m2 8/256 gb",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-15-m2-8-256-gb-ID10zMBC.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.68,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Recovered current OLX listing at the disputed 27 500 грн price from live search results.",
+   "location": "Київ, Дніпровський",
+   "marketplace": "OLX",
+   "price": 27500.0,
+   "price_candidates": [
+    {
+     "price": 27500.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "recheck-recheck-1-11-codex-codex-4338b7cf",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "recheck-1-11-codex",
+   "title": "MacBook Air 13\" Midnight M2 8/256GB 2022",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-13-midnight-m2-8-256gb-2022-ID10yJhu.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.95,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Closest available equivalent (original 23,000 UAH listing is 410 Gone)",
+   "location": "Одеса, Пересипський",
+   "marketplace": "OLX",
+   "price": 27999.0,
+   "price_candidates": [
+    {
+     "price": 27999.0,
+     "source_model": "gemini"
+    }
+   ],
+   "record_id": "recheck-recheck-1-4-gemini-gemini-6aee6f54",
+   "seller": null,
+   "shipping": "Nova Poshta, OLX Delivery",
+   "source_model": "gemini",
+   "source_models": [
+    "gemini"
+   ],
+   "task_id": "recheck-1-4-gemini",
+   "title": "Ідеал!Macbook Air 13” M2 8/256Gb Midnight",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/deal-macbook-air-13-m2-8-256gb-midnight-ID10zs4z.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.66,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "15-inch M2 OLX result shows 29 000 грн, Вживане",
+   "location": "Київ, Шевченківський",
+   "marketplace": "OLX",
+   "price": 29000.0,
+   "price_candidates": [
+    {
+     "price": 29000.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-6-codex-b1b280fc",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-6",
+   "title": "MacBook Air 15 M2 2023",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-15-m2-2023-ID10bffe.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.7,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "15-inch M2 OLX result shows 30 999 грн, Вживане, title says ideal",
+   "location": "Київ, Голосіївський",
+   "marketplace": "OLX",
+   "price": 30999.0,
+   "price_candidates": [
+    {
+     "price": 30999.0,
+     "source_model": "codex"
+    }
+   ],
+   "record_id": "search-task-6-codex-b1b280fc",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-6",
+   "title": "Macbook air 15 m2 ідеал",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-15-m2-deal-ID10DpPU.html",
+   "url_check": {
+    "method": "HEAD",
+    "ok": true,
+    "reason": "ok",
+    "status": 200
+   }
+  }
+ ],
+ "rejected": [
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "unknown",
+   "confidence": 0.78,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows active used listing at 7000 грн; far below market with no explanation, scam/damage risk | OLX result shows MacBook Air M2 title, 7000 грн, used; price far below market with no explanation | OLX notebook listing shows MacBook Air 13 2022 M2 Starlight, used, 7 000 грн; RAM/storage and delivery not visible; price is far below comparable listings with no visible explanation, scam/damage risk | Exact title appears in live OLX notebook search at 7 000 грн, marked Вживане, Київ Деснянський, 11 травня 2026 р. | OLX search card lists this offer at 7 000 грн, Вживане, Київ, Деснянський",
+   "location": "Київ, Деснянський",
+   "marketplace": "OLX",
+   "price": 7000.0,
+   "price_candidates": [
+    {
+     "price": 7000.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": " MacBook Air 13 2022 M2 Starlight",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-13-2022-m2-starlight-ID1035u4.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "unknown",
+   "confidence": 0.25,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX result shows MacBook Air M2 title, 14900 грн, used; far below market and no working-condition details",
+   "location": "Дніпро, Центральний",
+   "marketplace": "OLX",
+   "price": 14900.0,
+   "price_candidates": [
+    {
+     "price": 14900.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_404"
+   ],
+   "record_id": "search-task-3-codex-27722f6e",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-3",
+   "title": "Макбук Macbook Air M2 250 ноутбук",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/makbuk-macbook-air-m2-250-noutbuk-IDX3C8s.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_404",
+    "status": 404
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.76,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX card shows MacBook Air 13 M2 8/256, used, 22 500 грн; 13-inch M2 matches A2681, not M1/Intel; low but not impossibly low",
+   "location": "Киев, Подольский",
+   "marketplace": "OLX",
+   "price": 22500.0,
+   "price_candidates": [
+    {
+     "price": 22500.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-5-codex-234b0900",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-5",
+   "title": "Macbook Air 13 m2 8/256 midnight",
+   "url": "https://www.olx.ua/d/obyavlenie/macbook-air-13-m2-8-256-midnight-ID10x0GK.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.82,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows MacBook Air A2681 M2 8/256, used, 23000 грн | OLX result shows MacBook Air A2681 M2 8/256, used, 23000 грн | Title verifies MacBook Air 13 A2681, M2, 8/256 and says 2024; OLX shows used and 23 000 грн; delivery/seller trust not visible | Exact title appears in current OLX search results at 23 000 грн, Вживане, Київ Оболонський",
+   "location": "Київ, Оболонський",
+   "marketplace": "OLX",
+   "price": 23000.0,
+   "price_candidates": [
+    {
+     "price": 23000.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "Ноутбук APPLE MACBOOK AIR 13 (A2681) Apple M2 chip with 8-core 8/256 (2024)",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/noutbuk-apple-macbook-air-13-a2681-apple-m2-chip-with-8-core-8-256-2024-ID10qbrr.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.86,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows Air M2 8/512, used, 23500 грн | OLX result shows MacBook Air M2 8/512GB, used, 23500 грн | Title verifies MacBook Air 13 M2, 8/512; OLX shows used and 23 500 грн; model year and delivery not visible | OLX card shows MacBook Air 13 M2 8/512, used, 23 500 грн; 13-inch M2 matches A2681 | Exact title appears in live OLX notebooks search at 23 500 грн, used, Шепетівка.",
+   "location": "Шепетівка",
+   "marketplace": "OLX",
+   "price": 23500.0,
+   "price_candidates": [
+    {
+     "price": 23500.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_404"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "MacBook Air 13 m2 8/512Gb",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-13-m2-8-512gb-ID10wQ4I.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_404",
+    "status": 404
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.82,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows Air M2 16/256, used, 24000 грн | OLX result shows MacBook Air M2 16/256, used, 24000 грн | Title verifies MacBook Air M2, 16/256; OLX shows used and 24 000 грн; model year and delivery not visible | Exact OLX search result shows title, 24 000 грн, Вживане, Одеса, Київський, 14 травня 2026.",
+   "location": "Одеса, Київський",
+   "marketplace": "OLX",
+   "price": 24000.0,
+   "price_candidates": [
+    {
+     "price": 24000.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "Macbook Air M2 16/256",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-16-256-ID10umPB.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:29:09Z",
+   "condition": "used-good",
+   "confidence": 0.74,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Closest current OLX result after original ID10kcTi was gone: title matches MacBook Air M2 8/256, 24 000 грн, Вживане, listed today 08:52.",
+   "location": "Київ, Дарницький",
+   "marketplace": "OLX",
+   "price": 24000.0,
+   "price_candidates": [
+    {
+     "price": 24000.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "recheck-recheck-1-10-codex-codex-1900486c",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "recheck-1-10-codex",
+   "title": "Ноутбук Apple Macbook air 13.6” m2 8gb 256gb",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/noutbuk-apple-macbook-air-13-6-m2-8gb-256gb-ID10hhmS.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.88,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows 15-inch Air M2 8/512, used, 24200 грн | OLX result shows 15-inch MacBook Air M2 8/512GB, used, 24200 грн | Title verifies 15-inch MacBook Air M2 2023, 8/512; OLX shows used and 24 200 грн; delivery/seller trust not visible; low for this spec | Exact title appears in current OLX notebooks search with 24 200 грн, Вживане, Київ Солом'янський, 23 травня 2026 р.",
+   "location": "Київ, Солом'янський",
+   "marketplace": "OLX",
+   "price": 24200.0,
+   "price_candidates": [
+    {
+     "price": 24200.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "MacBook Air 15-inch M2 2023 8/512gb Midnight",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-15-inch-m2-2023-8-512gb-midnight-ID10w608.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.91,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows Air M2 A2681 8/256, used, 24500 грн, posted today | OLX result shows MacBook Air M2 A2681 8/256, used, 24500 грн | Title verifies MacBook Air M2, 8/256, A2681; OLX shows used and 24 500 грн; listing date today; delivery/seller trust not visible | OLX card explicitly says MacBook Air M2 8/256 A2681, used, 24 500 грн | Exact ID10vMQ6 appears in OLX laptops search: 24 500 грн, Вживане, Крюківщина, Сьогодні о 10:29.",
+   "location": "Крюківщина",
+   "marketplace": "OLX",
+   "price": 24500.0,
+   "price_candidates": [
+    {
+     "price": 24500.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "Macbook Air M2 8/256 A2681",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-8-256-a2681-ID10vMQ6.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.82,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows MacBook Air M2 2022, used, 24500 грн | Exact OLX item ID10xRV8 appears in active notebook-category search results with title, 24 500 грн, used condition, and Львів location.",
+   "location": "Львів, Франківський",
+   "marketplace": "OLX",
+   "price": 24500.0,
+   "price_candidates": [
+    {
+     "price": 24500.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "Macbook air m2 2022",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-2022-ID10xRV8.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "available",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.68,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "OLX notebook search result shows Air M2 A2681 8/256, used, 25000 грн",
+   "location": "Київ, Святошинський",
+   "marketplace": "OLX",
+   "price": 25000.0,
+   "price_candidates": [
+    {
+     "price": 25000.0,
+     "source_model": "codex"
+    }
+   ],
+   "reasons": [
+    "http_410"
+   ],
+   "record_id": "search-task-1-codex-575160c5",
+   "seller": null,
+   "shipping": null,
+   "source_model": "codex",
+   "source_models": [
+    "codex"
+   ],
+   "task_id": "task-1",
+   "title": "Macbook Air M2 A2681 8gb/256",
+   "url": "https://www.olx.ua/d/uk/obyavlenie/macbook-air-m2-a2681-8gb-256-ID10kcTi.html",
+   "url_check": {
+    "ok": false,
+    "reason": "http_410",
+    "status": 410
+   }
+  },
+  {
+   "availability": "unknown",
+   "checked_at": "2026-06-12T17:05:15Z",
+   "condition": "used-good",
+   "confidence": 0.5,
+   "currency": "UAH",
+   "disputed": false,
+   "evidence": "Aggregated search results indicate baseline prices for used good condition units start at 27500 UAH.",
+   "location": null,
+   "marketplace": "OLX",
+   "price": 27500.0,
+   "price_candidates": [
+    {
+     "price": 27500.0,
+     "source_model": "gemini"
+    }
+   ],
+   "reasons": [
+    "http_404"
+   ],
+   "record_id": "search-task-5-gemini-35149e25",
+   "seller": null,
+   "shipping": null,
+   "source_model": "gemini",
+   "source_models": [
+    "gemini"
+   ],
+   "task_id": "task-5",
+   "title": "MacBook Air 13.6\" M2 (A2681)",
+   "url": "https://www.olx.ua/d/elektronika/noutbuki-i-aksessuary/noutbuki/q-macbook-air-m2/",
+   "url_check": {
+    "ok": false,
+    "reason": "http_404",
+    "status": 404
+   }
+  },
+  {
+   "parse_failed": true,
+   "raw_file": "raw/search-task-3-gemini-93562ed6.txt",
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "search-task-3-gemini-93562ed6",
+   "source_model": "gemini",
+   "task_id": "task-3"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": "raw/search-task-4-gemini-014aa8e6.txt",
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "search-task-4-gemini-014aa8e6",
+   "source_model": "gemini",
+   "task_id": "task-4"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": "raw/search-task-6-gemini-25d0216e.txt",
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "search-task-6-gemini-25d0216e",
+   "source_model": "gemini",
+   "task_id": "task-6"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": "raw/recheck-recheck-1-2-gemini-gemini-4c527e9f.txt",
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-2-gemini-gemini-4c527e9f",
+   "source_model": "gemini",
+   "task_id": "recheck-1-2-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": "raw/recheck-recheck-1-1-gemini-gemini-94e456af.txt",
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-1-gemini-gemini-94e456af",
+   "source_model": "gemini",
+   "task_id": "recheck-1-1-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-5-gemini-gemini-f1e746cc",
+   "source_model": "gemini",
+   "task_id": "recheck-1-5-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-6-gemini-gemini-892829d5",
+   "source_model": "gemini",
+   "task_id": "recheck-1-6-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-7-gemini-gemini-b019f85c",
+   "source_model": "gemini",
+   "task_id": "recheck-1-7-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-8-gemini-gemini-1d2f46ea",
+   "source_model": "gemini",
+   "task_id": "recheck-1-8-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-9-gemini-gemini-6a956ea6",
+   "source_model": "gemini",
+   "task_id": "recheck-1-9-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-10-gemini-gemini-4bf29935",
+   "source_model": "gemini",
+   "task_id": "recheck-1-10-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-11-gemini-gemini-7715f1a3",
+   "source_model": "gemini",
+   "task_id": "recheck-1-11-gemini"
+  },
+  {
+   "parse_failed": true,
+   "raw_file": null,
+   "reasons": [
+    "parse_failed"
+   ],
+   "record_id": "recheck-recheck-1-12-gemini-gemini-531bfce9",
+   "source_model": "gemini",
+   "task_id": "recheck-1-12-gemini"
+  }
+ ],
+ "final_url": "/api/runs/20260612T165313Z-macbook-air-m2-76001dd2-49faa7/final.md"
+}

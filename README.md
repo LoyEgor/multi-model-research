@@ -33,7 +33,13 @@ are trying to save. Keep the control-flow cheap:
 
 ## Files
 
-- `lib/ask_gemini.sh` — **Google** leg via the Antigravity CLI (`agy`), subscription-only.
+The three vendor legs live in the shared **[llm-legs](https://github.com/LoyEgor/llm-legs)**
+library, consumed as a git submodule at `lib/legs/` (clone this repo with
+`git clone --recurse-submodules`, or run `git submodule update --init` after a plain clone).
+One wrapper fix there propagates to every consumer project via a pin bump. Descriptions below
+document the legs as used here:
+
+- `lib/legs/ask_gemini.sh` — **Google** leg via the Antigravity CLI (`agy`), subscription-only.
   Headless `--print` with the model PINNED per call (`AGY_MODEL`, default
   `"Gemini 3.1 Pro (High)"`; in-family fallback `AGY_MODEL_FALLBACK`, default
   `"Gemini 3.1 Pro (Low)"`). Weak flash/lite tiers are refused (`GEMINI_ALLOW_WEAK=1`
@@ -42,11 +48,11 @@ are trying to save. Keep the control-flow cheap:
   unverified. ~8-15 s per simple call. Modes: `--probe` (no model call), `--list-models`.
   The retired multi-transport Gemini-CLI wrapper lives in `lib/legacy/ask_gemini_cli.sh`
   (the Gemini CLI dies ~2026-06-18; migrated early 2026-06-12).
-- `lib/ask_codex.sh` — **OpenAI GPT** (gpt-5.5) leg via Codex CLI. Subscription, read-only sandbox.
+- `lib/legs/ask_codex.sh` — **OpenAI GPT** (gpt-5.5) leg via Codex CLI. Subscription, read-only sandbox.
   Does NOT hardcode the model (auto-tracks the CLI flagship) but **guards the tier** — rejects weak
   tiers (exit 3). Reasoning effort pinned `xhigh` (`CODEX_EFFORT=medium` for light calls). Logs
   `{requested, served}`. Mode: `--probe`. Overrides: `CODEX_MODEL`, `CODEX_ALLOW_WEAK=1`.
-- `lib/ask_claude.sh` — **Anthropic Claude** leg. Subscription (OAuth), headless `claude -p
+- `lib/legs/ask_claude.sh` — **Anthropic Claude** leg. Subscription (OAuth), headless `claude -p
   --output-format json` — runs from ANY environment, no Claude Code session required. Defaults to
   the `opus` alias; guards the tier by parsing `.modelUsage` (auxiliary haiku entries do not poison
   the guard — the requested-alias match wins, else dominant-by-outputTokens). Unsets
@@ -60,7 +66,7 @@ are trying to save. Keep the control-flow cheap:
   (so you can PROVE pro vs flash). Created on first call.
 - `.gitignore` — ignores `.secrets/`, `.venv/`, `data/cache/`, logs.
 
-Calling a leg: `lib/ask_codex.sh "<prompt>"` or `echo "<prompt>" | lib/ask_gemini.sh` → prints the
+Calling a leg: `lib/legs/ask_codex.sh "<prompt>"` or `echo "<prompt>" | lib/legs/ask_gemini.sh` → prints the
 model's text answer to stdout. A leg that cannot serve a strong model exits non-zero and logs
 `weak_tier:1` — treat that leg as unavailable rather than trusting a cheap model.
 
@@ -93,7 +99,7 @@ verification layers; it NEVER swaps in weaker model tiers:
 | 4 max | 6 | 2 | 12 | 2 (both) | Gemini + Opus | Opus | xhigh everywhere |
 
 The Claude seat is tiered by cost: Sonnet at low effort, Opus at high effort. **Opus is the hard
-cost ceiling** — `lib/ask_claude.sh` refuses Mythos-class models (fable/mythos) outright, no
+cost ceiling** — `lib/legs/ask_claude.sh` refuses Mythos-class models (fable/mythos) outright, no
 override. Dispute adjudication runs at EVERY level (it is cheap and only fires when models
 disagree); review layers appear from level 3.
 
@@ -202,12 +208,12 @@ the two goals (better research + minimal Opus).
 ## MANDATORY before you rely on this — re-run the smoke tests HERE
 
 Prior tests were in the source project; auth/paths must be re-confirmed in THIS folder:
-1. `lib/ask_codex.sh --probe` → reports a non-weak served model (gpt-5.5).
-2. `lib/ask_gemini.sh --probe` → reports `gemini-3.1-pro-preview` (NOT a flash/lite tier).
-2b. `lib/ask_claude.sh --probe` → reports a non-weak served model (e.g. `claude-opus-4-8`,
+1. `lib/legs/ask_codex.sh --probe` → reports a non-weak served model (gpt-5.5).
+2. `lib/legs/ask_gemini.sh --probe` → reports `gemini-3.1-pro-preview` (NOT a flash/lite tier).
+2b. `lib/legs/ask_claude.sh --probe` → reports a non-weak served model (e.g. `claude-opus-4-8`,
    weak_tier=0). Requires a logged-in `claude` CLI (subscription OAuth), works headless.
 3. Ask each leg for a current web fact + source URL; confirm it's real (web grounding works).
-4. Run a normal Gemini call such as `lib/ask_gemini.sh "Reply with exactly: ok"`; `--probe` does
+4. Run a normal Gemini call such as `lib/legs/ask_gemini.sh "Reply with exactly: ok"`; `--probe` does
    not append an audit row.
 5. `cat data/served-models.jsonl` → confirm Gemini's `served` is the pro tier with `weak_tier:0`.
 
