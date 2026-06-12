@@ -1,0 +1,45 @@
+{
+  "query": "найди самый дешевый MacBook Air M2 в Украине (site: olx.ua)",
+  "built_at": "2026-06-11T20:55:00Z",
+  "version": 2,
+  "method": "Multi-query union sweep of OLX search (6 query variants x 2 pages, price-asc, 253 unique ads merged by listing ID), then page-by-page code verification of every sub-25k candidate (status, price, description, seller account age) + human-grade judgment by the orchestrating model. v1 used a single query and MISSED cheaper valid items — OLX full-text matching is phrase-adjacency-sensitive ('Air 2022 M2' does not match 'air m2'). Single-query sweeps are NOT exhaustive; the owner's challenge (ID10o7Mh) exposed this.",
+  "best_pick": {
+    "url": "https://www.olx.ua/d/uk/obyavlenie/apple-macbook-air-13-m2-8-256-ID10EvHY.html",
+    "listing_id": "olx:10evhy",
+    "price": 20500,
+    "currency": "UAH",
+    "title": "Apple Macbook Air 13 M2 8/256",
+    "condition": "used, 'ideal state', charger included, no box",
+    "seller": "private (Михаил), account since 2014-05, Kyiv, OLX delivery offered",
+    "why": "Cheapest currently active working M2 with a clean, plain description, no lock/damage/scam markers, 12-year-old account, OLX delivery (buyer protection)."
+  },
+  "risky_cheaper": [
+    {
+      "url_tail": "ID10p3BR",
+      "price": 18850,
+      "note": "8/256 Starlight, claims clean iCloud and 94% battery. Risk markers: 'Найдешевша ціна в Україні!!!' hype, nonexistent 'Air M2 14' size in title (keyword stuffing). ~20% below the credible cluster. A human would inspect in person before paying; cannot be confirmed online."
+    }
+  ],
+  "runners_up": [
+    {"url_tail": "IDYFCWL", "price": 22000, "note": "owner-sold, 2 years use, clean iCloud, no MDM, account since 2018"},
+    {"url_tail": "ID10zmHK", "price": 22100, "note": "reseller macon.sale, 'satisfactory' (worn) condition, video review available"},
+    {"url_tail": "ID10oxKe", "price": 22390, "note": "363 cycles / 90% battery, no MDM, account since 2012"},
+    {"url_tail": "IDZqWMC", "price": 22999, "note": "95% battery, Kyiv"},
+    {"url_tail": "ID10o7Mh", "price": 25000, "note": "OWNER'S FIND that triggered gold v2. Reseller iMax (since 2021, Zaporizhzhia), 87% battery, neverlock, OLX delivery. Fully credible."},
+    {"url_tail": "ID10Bwq6", "price": 26000, "note": "v1 best pick. Private, full factory kit, hand-to-hand Kyiv only."},
+    {"url_tail": "ID10xiVs", "price": 27549, "note": "8/512 battery 87% — best value per GB."}
+  ],
+  "cheaper_but_disqualified": [
+    {"price": 12199, "url_tail": "ID10amAR", "reason": "explicitly 'на запчастини' (for parts)"},
+    {"price": "12380-13000", "url_tail": "IDW7Kw0 / IDWTylE / ID10yP5E / IDYb3JK", "reason": "disassembly/display-only listings"},
+    {"price": 17000, "url_tail": "ID10FsaC", "reason": "actually MacBook Air M1; 'm2 m3' keyword bait"},
+    {"price": 17500, "url_tail": "IDZLnhr", "reason": "admits 'полоса на екрані' (visible band on display) while claiming 'ідеальний стан, жодних дефектів' — contradictory description, damaged display; 16/256 at half market price reflects the defect"},
+    {"price": 17500, "url_tail": "ID10uife", "reason": "URL slug says macbook-air-m2 but the LIVE ad sells a Dyson Airstrait hair straightener — listing repurposed by seller. Only page-content vs claim comparison catches this."},
+    {"price": 17991, "url_tail": "IDYA7fY", "reason": "MacBook Air M1, 'm2 m3' keyword bait"},
+    {"price": 20700, "url_tail": "IDXwWwv", "reason": "'утеряны все данные, нужно разлочить' — iCloud-LOCKED, unusable/possibly stolen"},
+    {"price": 21699, "url_tail": "IDYSAqb", "reason": "M1 Air + M2 PRO combo listing, not an Air M2"},
+    {"price": 21800, "url_tail": "ID10F7ch", "reason": "MacBook Air M1, 'm2' keyword bait"},
+    {"price": 22000, "url_tail": "ID1070hY", "reason": "MDM-locked (honest title) — corporate management profile, real usage constraint"}
+  ],
+  "trap_notes": "1) Gemini single-call 'top 10' fabricated ALL listing URLs (sequential -ID1..-ID10, every one 404). 2) An OLX listing can be repurposed: slug 'macbook-air-m2', live content = Dyson straightener (HTTP 200, status active). 3) OLX search itself is phrase-adjacency-sensitive — a single query misses valid items; ANY sweep (model or code) must union multiple query variants. 4) Cheapest-looking items carry the disqualifiers: parts, M1 bait, admitted defects, iCloud/MDM locks."
+}

@@ -1,0 +1,5 @@
+Find the 10 cheapest CURRENTLY ACTIVE listings for Apple MacBook Air M2 (13.6", 2022, any RAM/SSD config) on olx.ua in Ukraine.
+Use live web results. Hard constraint: only direct listing pages on olx.ua (URLs containing /d/obyavlenie/ or /d/uk/obyavlenie/), never search or category pages.
+For each listing report: title, price (numeric UAH), url, availability, condition (new / used-good / damaged / for parts / unknown), seller trust signals (rating, reviews count, account age, business vs private — whatever the page shows), location, evidence (what you saw on the page), confidence 0-1.
+A price far below market (under ~18000 UAH for a working M2) is a scam/damage signal — still report it but flag it in evidence.
+Return ONLY valid JSON: {"findings": [...]}. No Markdown.

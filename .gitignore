@@ -1,0 +1,30 @@
+# OS / editor
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Transient
+*.log
+runs/
+
+# Secrets (API keys) — never commit
+.secrets/
+
+# Bulky local cache (rebuildable)
+data/cache/
+
+# Local usage/audit logs — private to this machine
+data/*.jsonl
+
+# Benchmark transients: raw model outputs, market snapshots, run lists
+bench/*-raw.txt
+bench/*-err.txt
+bench/gold-candidates*.json
+bench/bench-runs*.txt
+bench/eval-output.txt
+bench/gold-m2-filtered.json
