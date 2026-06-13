@@ -1,10 +1,13 @@
 # Roadmap (agreed with the owner 2026-06-12; order may be re-shuffled by real-usage feedback)
 
-## Phase 1 — UI v2 (in progress, split into two tracks)
-- **1b. Frontend redesign — DELEGATED** to a parallel agent (Cursor, branch `ui-v2`), spec in
-  `docs/ui-v2-brief.md`: report-first layout with importance tiers, Claude-style segmented
-  effort control, collapsible technical sections, run-history sidebar, mock fixtures in
-  `ui/fixtures/`. UI is a single static file served from disk (`ui/index.html`).
+## Phase 1 — UI v2 (DONE 2026-06-13)
+- **1b. Frontend redesign — DONE** (Cursor agent on `ui-v2` per `docs/ui-v2-brief.md`, finished
+  in-session): report-first layout with importance tiers, segmented effort control, collapsible
+  technical panels, run-history sidebar with search, SSE-driven per-call activity, cancel,
+  mock-fixture dev mode. Polish pass: single always-usable composer with compact/expanded
+  states, uniform control spacing, four-size type scale, brighter/lower-contrast palette,
+  degradation warnings render as callouts (never as the best pick), garbage runs filtered
+  from history.
 - **1a. Live backend — DONE 2026-06-12 (stdlib, no new deps):** per-run `events.jsonl`
   (lifecycle, per-call start/finish, breaker, stragglers), SSE at `GET /api/runs/<id>/events`,
   `POST /api/runs/<id>/cancel` (kills in-flight calls, produces a partial report), cancel

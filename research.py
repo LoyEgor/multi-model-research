@@ -1089,8 +1089,9 @@ Also include:
   separate "Unverified — check manually" section with their URLs and what to verify. Never
   silently drop them.
 - Short rejection/risk notes for stale, out-of-stock, off-site, or disproven items.
-- If degraded_legs is set, one of the search models failed during this run — say so plainly and
-  warn that coverage may be incomplete.
+- If degraded_legs is set, one of the search models failed during this run — state it as a
+  Markdown blockquote AT THE VERY TOP of the report (format: `> WARNING: ...`), warning that
+  coverage may be incomplete. Never present this warning as the best pick or first section.
 - A clear conclusion: the best pick and the strongest runner-up.
 """
 
@@ -1909,6 +1910,8 @@ def list_runs() -> list[dict]:
         if not path.is_dir():
             continue
         meta = refresh_stale_status(path, read_json(path / "run.json", {}) or {})
+        if not meta.get("prompt") or not meta.get("created_at"):
+            continue  # crashed-before-init garbage; keep on disk for forensics, hide from the UI
         rows.append(
             {
                 "run_id": path.name,

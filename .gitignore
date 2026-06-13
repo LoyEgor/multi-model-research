@@ -31,3 +31,17 @@ bench/gold-m2-filtered.json
 
 # Personal Claude Code permissions (machine-local)
 .claude/settings.local.json
+
+# agy pre-sandbox scratch litter (kept locally for forensics)
+scrape_*.py
+search_ddg.py
+parse_plati.py
+plati_*.html
+plati_*.json
+
+# agy/tool scratch litter in repo root (pre-sandbox file writes; not project files)
+get_*.py
+resolve_urls.py
+item.html
+item_*.html
+item_*.json
