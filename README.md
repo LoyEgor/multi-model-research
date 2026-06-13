@@ -134,6 +134,10 @@ What v1 does:
 - uses Codex as the final judge/synthesizer; at effort >= 3 the draft is adversarially reviewed
   by another vendor (Gemini, then Claude at effort 4) and revised by Codex on concrete issues;
 - marks a "running" run with no heartbeat for ~25 min as failed (stale-run detection);
+- streams a live event feed: every run appends to `runs/<id>/events.jsonl` (lifecycle, every
+  model call start/finish, breaker trips, straggler kills), served as SSE at
+  `GET /api/runs/<id>/events`; runs can be cancelled (`POST /api/runs/<id>/cancel` or the UI
+  button) — in-flight calls are killed and a partial report is still produced;
 - survives provider failures: a leg with 3 consecutive failed calls is disabled for the rest of
   the run (circuit breaker; shown in the UI and warned about in the report), slow stragglers are
   killed once 75% of a phase has returned (their items go to rescue), per-phase timeouts come

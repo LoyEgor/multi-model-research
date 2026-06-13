@@ -5,8 +5,12 @@
   `docs/ui-v2-brief.md`: report-first layout with importance tiers, Claude-style segmented
   effort control, collapsible technical sections, run-history sidebar, mock fixtures in
   `ui/fixtures/`. UI is a single static file served from disk (`ui/index.html`).
-- **1a. Live backend (this track):** FastAPI + uvicorn + SSE, per-run `events.jsonl`,
-  per-call live cards, cancel button. After 1b lands, wire SSE into the new frontend.
+- **1a. Live backend — DONE 2026-06-12 (stdlib, no new deps):** per-run `events.jsonl`
+  (lifecycle, per-call start/finish, breaker, stragglers), SSE at `GET /api/runs/<id>/events`,
+  `POST /api/runs/<id>/cancel` (kills in-flight calls, produces a partial report), cancel
+  button in the current UI. E2E-verified live (run cancelled mid-search; SSE frames captured).
+  FastAPI migration deferred — stdlib SSE proved sufficient and keeps `start.command`
+  dependency-free. After 1b lands, wire SSE into the new frontend.
 
 ## Phase 1.5 — shared legs library (DONE 2026-06-12)
 - Vendor wrappers extracted to github.com/LoyEgor/llm-legs, consumed as submodule `lib/legs/`.

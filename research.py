@@ -181,6 +181,37 @@ def clear_run_registry(run_id: str) -> None:
         RUN_PROCS.pop(run_id, None)
         RUN_DROPPED.pop(run_id, None)
 
+
+# Run cancellation: the UI's cancel button sets the flag and kills in-flight subprocesses;
+# the pipeline notices between phases (and before spawning any new call) and finishes with a
+# partial report instead of dying mid-write.
+CANCEL_LOCK = threading.Lock()
+CANCELLED_RUNS: set[str] = set()
+
+
+class RunCancelled(Exception):
+    pass
+
+
+def run_cancelled(run_id: str) -> bool:
+    with CANCEL_LOCK:
+        return run_id in CANCELLED_RUNS
+
+
+def request_cancel(run_id: str) -> bool:
+    """Returns False when the run is not active in this process."""
+    if run_id not in ACTIVE_RUNS:
+        return False
+    with CANCEL_LOCK:
+        CANCELLED_RUNS.add(run_id)
+    kill_stragglers(run_id)  # abort in-flight model calls; queued ones are blocked at spawn
+    return True
+
+
+def clear_cancel(run_id: str) -> None:
+    with CANCEL_LOCK:
+        CANCELLED_RUNS.discard(run_id)
+
 # Effort scales breadth (tasks), depth (recheck rounds/items) and verification layers (cross-vendor
 # adversarial review of the draft, Claude adjudication of disputes). The search legs (codex/gemini)
 # NEVER downgrade — flagship only, tier guards in lib/ask_*.sh stay in force. The Claude seat is
@@ -1182,14 +1213,18 @@ def call_model(
             "latency_sec": 0.0,
         }
         write_json(raw_base.with_suffix(".meta.json"), meta)
+        emit_event(run_dir, "call_finished", **{k: v for k, v in meta.items() if k != "rc"})
         meta["stdout"] = ""
         meta["stderr"] = reason_text
         return meta
 
+    if run_cancelled(run_id):
+        return skipped_meta("skipped_by_cancel", "run was cancelled")
     if not bypass_breaker and leg_disabled(run_id, leg):
         return skipped_meta("skipped_by_breaker", "leg disabled by circuit breaker for this run")
     if not bypass_breaker and not consume_leg_budget(run_id, leg):
         return skipped_meta("skipped_by_budget", "leg call budget for this run is spent")
+    emit_event(run_dir, "call_started", record_id=record_id, leg=leg, task_type=task_type, task_id=task_id)
 
     started = time.monotonic()
     env = os.environ.copy()
@@ -1200,6 +1235,11 @@ def call_model(
     semaphore = GEMINI_CONCURRENCY if leg == "gemini" else None
     if semaphore is not None:
         semaphore.acquire()
+        if run_cancelled(run_id):
+            # The cancel may have landed while this thread waited for a semaphore slot —
+            # never spawn a new subprocess into a cancelled run.
+            semaphore.release()
+            return skipped_meta("skipped_by_cancel", "run was cancelled")
 
     try:
         proc = subprocess.Popen(
@@ -1209,6 +1249,7 @@ def call_model(
             text=True,
             encoding="utf-8",
             errors="replace",
+            stdin=subprocess.DEVNULL,  # legs must never inherit the server's stdin
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -1256,10 +1297,24 @@ def call_model(
         "stderr_file": str(raw_base.with_suffix(".stderr.txt").relative_to(run_dir)),
     }
     write_json(raw_base.with_suffix(".meta.json"), meta)
+    emit_event(
+        run_dir,
+        "call_finished",
+        record_id=record_id,
+        leg=leg,
+        task_type=task_type,
+        task_id=task_id,
+        success=meta["success"],
+        rc=rc,
+        latency_sec=meta["latency_sec"],
+        timed_out=timed_out,
+        dropped_as_straggler=meta["dropped_as_straggler"],
+    )
     breaker_tripped = record_leg_result(run_id, leg, meta["success"])
     if rc == 5 and force_disable_leg(run_id, leg, "quota_exhausted"):
         breaker_tripped = True
     if breaker_tripped:
+        emit_event(run_dir, "leg_disabled", leg=leg, reason="quota_exhausted" if rc == 5 else "circuit_breaker")
         update_run(run_dir, leg_health=leg_health_snapshot(run_id))
     meta["stdout"] = stdout
     meta["stderr"] = stderr
@@ -1292,10 +1347,25 @@ def init_run(prompt: str, config: dict) -> Path:
             "error": None,
         },
     )
+    emit_event(run_dir, "run_created", prompt=prompt, effort=config["effort"], sites=config.get("sites") or [])
     return run_dir
 
 
 RUN_JSON_LOCK = threading.Lock()
+EVENTS_LOCK = threading.Lock()
+
+
+def emit_event(run_dir: Path, event: str, **fields: object) -> None:
+    """Append one event to the run's events.jsonl — the live feed the UI streams via SSE.
+    Append-only, one JSON object per line; never read back by the pipeline itself."""
+    row = {"ts": utc_now(), "event": event}
+    row.update(fields)
+    try:
+        with EVENTS_LOCK:
+            with (run_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # the event feed is best-effort; never fail the run over it
 
 
 def update_run(run_dir: Path, **fields: object) -> None:
@@ -1304,9 +1374,20 @@ def update_run(run_dir: Path, **fields: object) -> None:
     with RUN_JSON_LOCK:
         path = run_dir / "run.json"
         data = read_json(path, {}) or {}
+        changed = {
+            key: value
+            for key, value in fields.items()
+            if key in {"status", "phase", "progress", "leg_health"} and data.get(key) != value
+        }
         data.update(fields)
         data["updated_at"] = utc_now()
         write_json(path, data)
+    if "status" in changed or "phase" in changed:
+        emit_event(run_dir, "status", status=data.get("status"), phase=data.get("phase"))
+    if changed.get("progress"):
+        emit_event(run_dir, "progress", **changed["progress"])
+    if "leg_health" in changed:
+        emit_event(run_dir, "leg_health", leg_health=changed["leg_health"])
 
 
 def decompose_tasks(prompt: str, run_dir: Path, config: dict) -> list[dict]:
@@ -1432,7 +1513,9 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
             median = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
             deadline = time.monotonic() + max(config["straggler_grace_sec"], median * 0.5)
         if deadline is not None and time.monotonic() >= deadline and not killed_once:
-            kill_stragglers(run_dir.name)
+            killed = kill_stragglers(run_dir.name)
+            if killed:
+                emit_event(run_dir, "stragglers_killed", record_ids=killed)
             killed_once = True
             deadline = time.monotonic() + 30  # killed procs unwind within seconds; don't re-kill
     return records
@@ -1685,23 +1768,33 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
     run_id = run_dir.name
     sites = config.get("sites") or []
     all_parsed_records: list[dict] = []
+    verified: list[dict] = []
+    rejected: list[dict] = []
     ACTIVE_RUNS.add(run_id)
     init_leg_health(run_id)
     init_leg_budget(run_id, {"gemini": config["gemini_call_budget"]})
+
+    def check_cancel() -> None:
+        if run_cancelled(run_id):
+            raise RunCancelled()
+
     try:
         update_run(run_dir, status="running", phase="decomposing", progress=None)
         tasks = decompose_tasks(prompt, run_dir, config)
         write_json(run_dir / "tasks.json", {"tasks": tasks})
+        check_cancel()
 
         update_run(run_dir, phase="primary_search", progress=None)
         primary_records = run_primary_search(prompt, tasks, run_dir, config)
         findings, parse_rejections, parsed_records = parse_model_records(primary_records)
         all_parsed_records.extend(parsed_records)
         write_json(run_dir / "findings.json", {"stage": "primary", "findings": findings, "parse_rejections": parse_rejections})
+        check_cancel()
 
         update_run(run_dir, phase="verifying", progress=None)
         verified, rejected = verify_findings(findings, parse_rejections, sites)
         write_json(run_dir / "verification.json", {"stage": "primary", "verified": verified, "rejected": rejected})
+        check_cancel()
 
         rescue_attempts: dict[str, set[str]] = {}
         recheck_dropped = 0
@@ -1717,13 +1810,16 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             findings = findings + recheck_findings
             parse_rejections = parse_rejections + recheck_parse_rejections
             verified, rejected = verify_findings(findings, parse_rejections, sites)
+            check_cancel()
         if recheck_dropped:
             # No silent caps: the report and UI must show how many candidates the budget skipped.
             update_run(run_dir, recheck_dropped=recheck_dropped)
+        check_cancel()
 
         if config["adjudicate_disputes"] and any(item.get("disputed") for item in verified):
             update_run(run_dir, phase="adjudicating", progress=None)
             verified, rejected = adjudicate_disputes(prompt, verified, rejected, run_dir, config)
+            check_cancel()
 
         write_json(run_dir / "findings.json", {"stage": "final", "findings": dedupe_findings(findings), "parse_rejections": parse_rejections})
         write_json(run_dir / "verification.json", {"stage": "final", "verified": verified, "rejected": rejected})
@@ -1731,6 +1827,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
 
         update_run(run_dir, phase="synthesizing", progress=None)
         report = synthesize_report(prompt, tasks, verified, rejected, run_dir, config)
+        check_cancel()
 
         if config["review_legs"]:
             update_run(run_dir, phase="reviewing", progress=None)
@@ -1749,11 +1846,27 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             degraded_legs=disabled_legs(run_id) or None,
             final_path=str((run_dir / "final.md").relative_to(ROOT)),
         )
+    except RunCancelled:
+        # Finish in the best shape available: whatever survived verification becomes a partial
+        # fallback report instead of vanishing.
+        report = fallback_report(prompt, verified, rejected, disabled_legs(run_id))
+        report = "> NOTE: this run was CANCELLED by the user — results below are partial.\n\n" + report
+        (run_dir / "final.md").write_text(report, encoding="utf-8")
+        update_run(
+            run_dir,
+            status="cancelled",
+            phase="cancelled",
+            progress=None,
+            verified_count=len(verified),
+            rejected_count=len(rejected),
+            final_path=str((run_dir / "final.md").relative_to(ROOT)),
+        )
     except Exception as exc:
         update_run(run_dir, status="failed", phase="failed", error=str(exc), traceback=traceback.format_exc())
         (run_dir / "final.md").write_text(f"# Research failed\n\n{exc}\n", encoding="utf-8")
     finally:
         ACTIVE_RUNS.discard(run_id)
+        clear_cancel(run_id)
         clear_leg_health(run_id)
         clear_leg_budget(run_id)
         clear_run_registry(run_id)
@@ -1890,6 +2003,11 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"runs": list_runs()})
             return
 
+        match = re.fullmatch(r"/api/runs/([^/]+)/events", path)
+        if match:
+            self.stream_run_events(Path(urllib.parse.unquote(match.group(1))).name)
+            return
+
         match = re.fullmatch(r"/api/runs/([^/]+)", path)
         if match:
             try:
@@ -1910,8 +2028,54 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_json(404, {"error": "not_found"})
 
+    def stream_run_events(self, run_id: str) -> None:
+        """SSE: replay events.jsonl from the start, then tail it until the run reaches a
+        terminal state. One `data:` frame per event line; a final `event: done` frame closes."""
+        run_dir = RUNS_DIR / run_id
+        if not run_dir.exists():
+            self.send_json(404, {"error": "run_not_found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        events_path = run_dir / "events.jsonl"
+        pos = 0
+        try:
+            while True:
+                chunk = b""
+                if events_path.exists():
+                    with events_path.open("rb") as f:
+                        f.seek(pos)
+                        chunk = f.read()
+                        pos = f.tell()
+                if chunk:
+                    for line in chunk.decode("utf-8", errors="replace").splitlines():
+                        if line.strip():
+                            self.wfile.write(b"data: " + line.encode("utf-8") + b"\n\n")
+                    self.wfile.flush()
+                meta = read_json(run_dir / "run.json", {}) or {}
+                if meta.get("status") not in {"queued", "running"} and not chunk:
+                    self.wfile.write(b"event: done\ndata: {}\n\n")
+                    self.wfile.flush()
+                    return
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+
+        match = re.fullmatch(r"/api/runs/([^/]+)/cancel", parsed.path)
+        if match:
+            run_id = Path(urllib.parse.unquote(match.group(1))).name
+            if request_cancel(run_id):
+                emit_event(RUNS_DIR / run_id, "cancel_requested")
+                self.send_json(202, {"status": "cancelling"})
+            else:
+                self.send_json(409, {"error": "run_not_active"})
+            return
+
         if parsed.path != "/api/runs":
             self.send_json(404, {"error": "not_found"})
             return

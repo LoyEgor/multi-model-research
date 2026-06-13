@@ -453,6 +453,82 @@ class ResearchTests(unittest.TestCase):
         finally:
             research.clear_run_registry(run_id)
 
+    def test_emit_event_and_update_run_events(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            research.emit_event(run_dir, "run_created", prompt="p")
+            research.update_run(run_dir, status="running", phase="decomposing")
+            research.update_run(run_dir, phase="decomposing")  # no change -> no event
+            research.update_run(run_dir, progress={"done": 1, "total": 4})
+            lines = [
+                research.json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text().splitlines()
+            ]
+        events = [row["event"] for row in lines]
+        self.assertEqual(events, ["run_created", "status", "progress"])
+        self.assertEqual(lines[1]["phase"], "decomposing")
+        self.assertEqual(lines[2]["done"], 1)
+
+    def test_cancel_flow(self):
+        import subprocess
+        import tempfile
+
+        run_id = "test-cancel-run"
+        research.ACTIVE_RUNS.add(run_id)
+        research.init_leg_health(run_id)
+        try:
+            proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            research.register_proc(run_id, "rec-1", proc.pid)
+            self.assertTrue(research.request_cancel(run_id))
+            self.assertTrue(research.run_cancelled(run_id))
+            proc.wait(timeout=10)  # killed by request_cancel
+
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp) / run_id
+                (run_dir / "raw").mkdir(parents=True)
+                record = research.call_model("gemini", "x", run_dir, "search", "t1")
+                self.assertTrue(record["skipped_by_cancel"])
+        finally:
+            research.ACTIVE_RUNS.discard(run_id)
+            research.clear_cancel(run_id)
+            research.clear_leg_health(run_id)
+            research.clear_run_registry(run_id)
+        self.assertFalse(research.request_cancel("not-active-run"))
+
+    def test_sse_stream_replays_events_and_closes(self):
+        import http.client
+        import tempfile
+        import threading
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = research.Path(tmp)
+            run_dir = runs_dir / "sse-run"
+            run_dir.mkdir()
+            research.write_json(run_dir / "run.json", {"run_id": "sse-run", "status": "completed"})
+            research.emit_event(run_dir, "run_created", prompt="p")
+            research.emit_event(run_dir, "status", status="completed", phase="completed")
+
+            with mock.patch.object(research, "RUNS_DIR", runs_dir):
+                server = research.http.server.ThreadingHTTPServer(("127.0.0.1", 0), research.ResearchHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                    conn.request("GET", "/api/runs/sse-run/events")
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("text/event-stream", response.getheader("Content-Type", ""))
+                    body = response.read().decode("utf-8")
+                    conn.close()
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=3)
+        self.assertIn('"event": "run_created"', body)
+        self.assertIn("event: done", body)
+
     def test_rejection_rules(self):
         parsed = {"parse_failed": True}
         self.assertEqual(research.rejection_reasons(parsed), ["parse_failed"])

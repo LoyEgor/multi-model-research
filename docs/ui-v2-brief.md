@@ -54,6 +54,19 @@ editing the file + refreshing the browser is the whole dev loop.
   `leg_health`, `degraded_legs`, `recheck_dropped`, `verified_count`, `rejected_count`,
   `disputed_count`, `error`.
 - `GET /api/runs/<run_id>/final.md` → the report, `text/markdown`.
+- `POST /api/runs/<run_id>/cancel` → `202 {"status": "cancelling"}` (or `409` when the run is
+  not active). A cancelled run ends with `run.status == "cancelled"` and a partial report.
+  The UI must offer a Cancel control while a run is `running` and treat `cancelled` as a
+  terminal state (alongside `completed` / `failed`).
+- `GET /api/runs/<run_id>/events` → **SSE** (`text/event-stream`): replays the run's full event
+  log, then tails it live; closes with an `event: done` frame once the run is terminal. Each
+  `data:` frame is one JSON object `{ts, event, ...}`. Event types: `run_created`,
+  `status {status, phase}`, `progress {done, total}`, `call_started` /
+  `call_finished {record_id, leg, task_type, task_id, success, latency_sec, ...skip flags}`,
+  `leg_disabled {leg, reason}`, `leg_health`, `stragglers_killed {record_ids}`,
+  `cancel_requested`. PREFER SSE for live updates (per-call activity cards by `record_id`:
+  started → finished/killed); keep 2 s polling of `GET /api/runs/<id>` as fallback and for
+  the verified/rejected lists. Unknown event types must be ignored gracefully.
 - Notable item fields (verified/rejected arrays): `title, price, currency, url, marketplace,
   availability, condition, seller, location, evidence, confidence, source_models, disputed,
   price_candidates, adjudication, price_corrected_from, live_check, reasons (rejected only)`.
