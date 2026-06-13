@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ============================================================================================
+# RETIRED 2026-06-12 — NOT ON ANY CODE PATH. Kept as a forensic fossil only.
+# The live Google leg is the agy-only wrapper in the llm-legs submodule (lib/legs/ask_gemini.sh).
+# The Gemini CLI this file drove reaches EOL ~2026-06-18; delete this file after that date.
+# ============================================================================================
 # Cross-vendor leg: Google Gemini, SUBSCRIPTION-ONLY (owner decision 2026-06-09: no API keys,
 # no per-call billing; if the leg dies, the pipeline degrades to 2 vendors — accepted).
 # Prompt as $1 or stdin; model's text to stdout.

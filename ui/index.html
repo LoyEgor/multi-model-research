@@ -74,7 +74,7 @@
   .history-toggle { display: none; }
   .history { overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px; margin: -2px; }
   .history-empty { padding: 18px 14px; border-radius: var(--r-md); background: var(--surface-2); color: var(--muted); font-size: 13px; }
-  .run-row { text-align: left; display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; padding: 12px 14px; border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-sm); transition: box-shadow .2s ease, background .2s ease; animation: float-in .4s ease both; }
+  .run-row { text-align: left; display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; padding: 12px 14px; border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-sm); transition: box-shadow .2s ease, background .2s ease; }
   .run-row:hover { box-shadow: var(--shadow-md); }
   .run-row.active { background: var(--accent-soft); }
   .run-row .dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; flex: none; }
@@ -88,45 +88,42 @@
   /* ---------- Main ---------- */
   main { min-width: 0; display: flex; flex-direction: column; gap: 18px; }
 
-  /* Composer — always usable; .compact hides the secondary controls (descriptions, sites) */
-  .composer { background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); padding: 10px; transition: box-shadow .3s ease; animation: float-in .45s ease both; }
+  /* Composer — one compact row of controls; .compact hides the sites input + effort hint */
+  .composer { background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); padding: 12px; transition: box-shadow .3s ease; }
   .composer:focus-within { box-shadow: var(--shadow-md); }
-  .composer form { display: flex; flex-direction: column; gap: 10px; padding: 8px; }
-  .composer-main { display: flex; gap: 8px; align-items: flex-start; }
-  .composer textarea { flex: 1; min-height: 76px; resize: vertical; border: 0; outline: 0; border-radius: var(--r-md); padding: 13px 16px; font: inherit; color: var(--ink); background: var(--surface-2); transition: background .25s ease, min-height .25s ease; }
-  .composer.compact textarea { min-height: 48px; resize: none; }
+  .composer form { display: flex; flex-direction: column; gap: 10px; padding: 4px; }
+  .composer textarea { width: 100%; min-height: 70px; resize: vertical; border: 0; outline: 0; border-radius: var(--r-md); padding: 13px 16px; font: inherit; color: var(--ink); background: var(--surface-2); transition: background .25s ease, min-height .25s ease; }
+  .composer.compact textarea { min-height: 46px; resize: none; }
   .composer textarea:focus { background: var(--sunken); }
   .composer textarea::placeholder { color: var(--muted); }
-  .collapse-btn { flex: none; width: 34px; height: 34px; margin-top: 7px; border-radius: 50%; background: var(--surface-2); color: var(--muted); display: grid; place-items: center; font-size: 13px; transition: transform .3s ease, background .2s ease, color .2s ease; }
-  .collapse-btn:hover { background: var(--accent-soft); color: var(--accent-ink); }
-  .composer.compact .collapse-btn { transform: rotate(180deg); }
 
-  /* Uniform spacing: outer padding == inner gap, so segments never look glued or lopsided */
-  .effort-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; padding: 5px; border-radius: calc(var(--r-md) + 5px); background: var(--track); }
-  .effort-opt input { position: absolute; opacity: 0; pointer-events: none; }
-  .effort-opt label { display: block; height: 100%; padding: 10px 14px; border-radius: var(--r-md); cursor: pointer; transition: background .25s ease, box-shadow .25s ease; }
-  .effort-opt label:hover { background: rgba(255, 255, 255, .55); }
-  .effort-opt .eo-name { font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 7px; }
-  .effort-opt .eo-name::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: transparent; transition: background .25s ease; margin-left: auto; }
-  .effort-opt .eo-desc { font-size: 12px; color: var(--muted); line-height: 1.35; margin-top: 3px; }
-  .composer.compact .eo-desc { display: none; }
-  .composer.compact .effort-opt label { padding: 8px 14px; }
-  .effort-opt input:checked + label { background: var(--surface); box-shadow: var(--shadow-sm); }
-  .effort-opt input:checked + label .eo-name { color: var(--accent-ink); }
-  .effort-opt input:checked + label .eo-name::after { background: var(--accent); }
-  .effort-opt input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .composer.compact .sites-wrap { display: none; }
-  .composer.compact .composer-row { justify-content: flex-end; }
-  .composer.compact .start-btn { padding: 10px 24px; }
-
-  .composer-row { display: flex; gap: 12px; align-items: center; }
-  .sites-wrap { flex: 1; display: flex; align-items: center; gap: 10px; background: var(--surface-2); border-radius: 999px; padding: 6px 8px 6px 18px; transition: background .25s ease; }
+  .composer-controls { display: flex; gap: 10px; align-items: center; }
+  .effort-select { flex: none; border: 0; border-radius: 999px; background: var(--sunken); color: var(--ink); font: inherit; font-weight: 600; font-size: 13px; padding: 10px 16px; cursor: pointer; transition: background .2s ease; }
+  .effort-select:hover { background: var(--track); }
+  .effort-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .sites-wrap { flex: 1; display: flex; align-items: center; gap: 8px; background: var(--surface-2); border-radius: 999px; padding: 4px 8px 4px 16px; transition: background .25s ease; min-width: 0; }
   .sites-wrap:focus-within { background: var(--sunken); }
   .sites-wrap .sw-label { font-size: 13px; color: var(--muted); white-space: nowrap; }
-  .sites-wrap input { flex: 1; border: 0; outline: 0; background: none; font: inherit; color: var(--ink); padding: 6px 0; min-width: 60px; }
-  .start-btn { padding: 13px 30px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm); transition: background .2s ease, opacity .2s ease; }
+  .sites-wrap input { flex: 1; border: 0; outline: 0; background: none; font: inherit; color: var(--ink); padding: 6px 0; min-width: 40px; }
+  .composer.compact .sites-wrap { display: none; }
+  .composer:not(.compact) .composer-controls { flex-wrap: wrap; }
+  .icon-btn { flex: none; width: 38px; height: 38px; border-radius: 50%; background: var(--surface-2); color: var(--muted); display: grid; place-items: center; font-size: 14px; transition: transform .3s ease, background .2s ease, color .2s ease; margin-left: auto; }
+  .icon-btn:hover { background: var(--accent-soft); color: var(--accent-ink); }
+  .composer.compact .icon-btn { transform: rotate(180deg); }
+  .composer.compact .icon-btn { margin-left: auto; }
+  .start-btn { flex: none; padding: 11px 26px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm); transition: background .2s ease, opacity .2s ease; }
   .start-btn:hover:not(:disabled) { background: var(--accent-dark); }
   .start-btn:disabled { opacity: .45; cursor: default; }
+  .effort-hint { font-size: 12px; color: var(--muted); padding: 0 4px; line-height: 1.4; }
+  .composer.compact .effort-hint { display: none; }
+  /* Vendor on/off toggles — turn a provider off to save its quota; the rest cover for it. */
+  .vendors { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 4px; }
+  .composer.compact .vendors { display: none; }
+  .vendors-label { font-size: 12px; color: var(--muted); }
+  .vendor-toggle { padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; background: var(--surface-2); color: var(--muted); transition: background .2s ease, color .2s ease; position: relative; }
+  .vendor-toggle.on { background: var(--accent-soft); color: var(--accent-ink); }
+  .vendor-toggle:not(.on) { text-decoration: line-through; }
+  .vendors-hint { font-size: 12px; color: var(--muted); }
 
   /* Empty state */
   .empty-state { text-align: center; padding: 70px 24px; color: var(--muted); animation: float-in .5s ease both; }
@@ -153,7 +150,10 @@
   .cancel-btn:disabled { opacity: .5; cursor: default; }
 
   /* Phase timeline */
-  .timeline { display: flex; flex-direction: column; gap: 12px; padding: 14px; border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-sm); animation: float-in .4s ease both; }
+  .timeline { display: flex; flex-direction: column; gap: 12px; padding: 14px 18px; border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-sm); }
+  .timeline-head { display: flex; align-items: center; gap: 12px; }
+  .timeline-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .timeline-head .cancel-btn { margin-left: auto; }
   .phase-row { display: flex; flex-wrap: wrap; gap: 8px; }
   .progress-track { height: 5px; border-radius: 999px; background: var(--track); overflow: hidden; }
   .progress-fill { height: 100%; border-radius: 999px; background: var(--accent); width: 0%; transition: width .6s cubic-bezier(.4, 0, .2, 1); }
@@ -188,7 +188,7 @@
   .report-card.caution { background: #fcf9f1; }
   .report-card.caution .rs-title { color: var(--warn); }
   .caution-tag { display: inline-block; padding: 4px 13px; border-radius: 999px; background: var(--warn-soft); color: var(--warn); font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; margin-bottom: 14px; }
-  .alt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; margin: 4px 0 12px; }
+  .alt-grid { display: grid; grid-template-columns: 1fr; gap: 10px; margin: 4px 0 12px; }
   .alt-card { position: relative; background: var(--surface-2); border-radius: var(--r-md); padding: 18px 18px 16px 56px; font-size: 13px; line-height: 1.5; transition: background .25s ease, box-shadow .25s ease; }
   .alt-card:hover { background: #fff; box-shadow: var(--shadow-sm); }
   .alt-card .alt-num { position: absolute; left: 16px; top: 16px; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; font-size: 12px; }
@@ -225,10 +225,17 @@
   .panel-note { color: var(--muted); font-size: 13px; padding: 2px 0 6px; }
 
   /* Item cards */
-  .item-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; }
-  .item { background: var(--surface-2); border-radius: var(--r-md); padding: 16px 18px; min-width: 0; display: flex; flex-direction: column; gap: 8px; transition: background .25s ease, box-shadow .25s ease; }
+  .item-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  /* Full-width row: a dedicated price block on the left so the price is never hard to find. */
+  .item { background: var(--surface-2); border-radius: var(--r-md); padding: 16px 18px; min-width: 0; display: grid; grid-template-columns: 132px 1fr; gap: 16px; align-items: start; transition: background .25s ease, box-shadow .25s ease; }
   .item:hover { background: #fff; box-shadow: var(--shadow-sm); }
-  .item .i-price { font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .item .i-priceblock { display: flex; flex-direction: column; gap: 2px; }
+  .item .i-price { font-size: 20px; font-weight: 650; letter-spacing: -.01em; line-height: 1.1; }
+  .item .i-price-usd { font-size: 13px; font-weight: 600; color: var(--good); }
+  .item .i-price-native { font-size: 12px; color: var(--muted); }
+  .item .i-body { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+  .item.parse-fail { grid-template-columns: 1fr; }
+  @media (max-width: 560px) { .item { grid-template-columns: 1fr; gap: 8px; } }
   .item .i-title { font-size: 13px; font-weight: 600; line-height: 1.4; }
   .item .i-meta { font-size: 12px; color: var(--muted); line-height: 1.45; }
   .item .i-link { font-size: 12px; overflow-wrap: anywhere; }
@@ -248,13 +255,27 @@
 
   /* Activity */
   .activity-list { display: flex; flex-direction: column; gap: 7px; max-height: 380px; overflow-y: auto; padding: 2px; }
-  .act-row { display: flex; align-items: center; gap: 11px; padding: 10px 14px; border-radius: var(--r-sm); background: var(--surface-2); font-size: 13px; animation: float-in .3s ease both; }
+  .act-row { display: flex; align-items: center; gap: 11px; padding: 10px 14px; border-radius: var(--r-sm); background: var(--surface-2); font-size: 13px; }
   .act-row .a-task { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .act-row .a-state { margin-left: auto; font-weight: 600; font-size: 12px; white-space: nowrap; }
   .act-row .a-state.ok { color: var(--good); }
   .act-row .a-state.fail { color: var(--bad); }
   .act-row .a-state.killed { color: var(--warn); }
   .act-row .a-state.run { color: var(--accent-ink); display: inline-flex; align-items: center; gap: 7px; }
+  /* Per-leg swimlanes: each vendor is a lane so concurrent work reads as parallel at a glance. */
+  .lanes { display: flex; flex-direction: column; gap: 12px; }
+  .lane { display: grid; grid-template-columns: 116px 1fr; gap: 12px; align-items: start; }
+  .lane-head { display: flex; flex-direction: column; gap: 4px; padding-top: 2px; }
+  .lane-head .lane-count { font-size: 12px; color: var(--muted); }
+  .lane-cells { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cell { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; background: var(--surface-2); color: var(--ink-2); }
+  .cell.ok { background: var(--good-soft); color: var(--good); }
+  .cell.fail { background: var(--bad-soft); color: var(--bad); }
+  .cell.killed, .cell.skipped { background: var(--warn-soft); color: var(--warn); }
+  .cell.run { background: var(--accent-soft); color: var(--accent-ink); }
+  .cell .cell-x { cursor: pointer; font-weight: 700; opacity: .65; margin-left: 2px; }
+  .cell .cell-x:hover { opacity: 1; }
+  .cell .qw { opacity: .6; font-style: italic; }
 
   /* Run details */
   .details-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 16px; }
@@ -266,6 +287,12 @@
   .task-row { background: var(--surface-2); border-radius: var(--r-sm); padding: 11px 14px; margin-bottom: 7px; font-size: 13px; }
   .task-row .t-query { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--accent-ink); }
   .task-row .t-focus { color: var(--ink-2); margin-top: 3px; line-height: 1.45; }
+  .scoreboard { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .scoreboard th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 6px 10px; }
+  .scoreboard td { padding: 8px 10px; border-top: 1px solid var(--track); }
+  .scoreboard td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .scoreboard .sb-low { color: var(--bad); font-weight: 600; }
+  .scoreboard .sb-ok { color: var(--good); font-weight: 600; }
 
   /* Toast */
   #toast { position: fixed; bottom: 26px; left: 50%; transform: translate(-50%, 0); background: var(--ink); color: #f8fafd; padding: 12px 22px; border-radius: 999px; font-size: 13px; font-weight: 500; box-shadow: var(--shadow-md); opacity: 0; pointer-events: none; z-index: 50; }
@@ -323,11 +350,9 @@
     .history { display: grid; grid-template-rows: 0fr; overflow: hidden; transition: grid-template-rows .4s ease; padding: 0; margin: 0; }
     .sidebar.open .history { grid-template-rows: 1fr; }
     .history > div { overflow: hidden; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 2px; }
-    .effort-grid { grid-template-columns: repeat(2, 1fr); }
-    .composer-row { flex-direction: column; align-items: stretch; }
-    .start-btn { width: 100%; }
+    .composer-controls { flex-wrap: wrap; }
+    .sites-wrap { order: 3; flex-basis: 100%; }
     .report-card, .report-card.hero { padding: 24px 22px; }
-    .cancel-btn { margin-left: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
@@ -356,35 +381,29 @@
   <main>
     <section class="composer" id="composer">
         <form id="runForm">
-          <div class="composer-main">
-            <textarea id="promptInput" rows="2" placeholder="Ask anything — three models will search, cross-check and verify…"></textarea>
-            <button class="collapse-btn" id="composerToggle" type="button" aria-expanded="true" title="Toggle options">⌄</button>
-          </div>
-          <div class="effort-grid" role="radiogroup" aria-label="Effort level">
-            <div class="effort-opt">
-              <input type="radio" name="effort" id="effort1" value="1">
-              <label for="effort1"><span class="eo-name">Quick</span><span class="eo-desc">3 tasks × 2 models, one rescue round</span></label>
-            </div>
-            <div class="effort-opt">
-              <input type="radio" name="effort" id="effort2" value="2" checked>
-              <label for="effort2"><span class="eo-name">Standard</span><span class="eo-desc">4 tasks × 2 models, balanced checking</span></label>
-            </div>
-            <div class="effort-opt">
-              <input type="radio" name="effort" id="effort3" value="3">
-              <label for="effort3"><span class="eo-name">Deep</span><span class="eo-desc">5 tasks, 2 rescue rounds, adversarial review</span></label>
-            </div>
-            <div class="effort-opt">
-              <input type="radio" name="effort" id="effort4" value="4">
-              <label for="effort4"><span class="eo-name">Max</span><span class="eo-desc">6 tasks at max reasoning, dual review</span></label>
-            </div>
-          </div>
-          <div class="composer-row">
+          <textarea id="promptInput" rows="2" placeholder="Ask anything — three models will search, cross-check and verify…"></textarea>
+          <div class="composer-controls">
+            <select id="effortSelect" class="effort-select" aria-label="Search depth" title="Search depth">
+              <option value="1">Quick</option>
+              <option value="2" selected>Standard</option>
+              <option value="3">Deep</option>
+              <option value="4">Max</option>
+            </select>
             <div class="sites-wrap">
-              <span class="sw-label">Limit to sites</span>
-              <input id="sitesInput" type="text" placeholder="olx.ua, prom.ua (optional)">
+              <span class="sw-label">Only</span>
+              <input id="sitesInput" type="text" placeholder="olx.ua, prom.ua">
             </div>
-            <button class="start-btn" id="startBtn" type="submit">Start research</button>
+            <button class="icon-btn" id="composerToggle" type="button" aria-expanded="true" title="More options">⌄</button>
+            <button class="start-btn" id="startBtn" type="submit">Search</button>
           </div>
+          <div class="vendors" id="vendors">
+            <span class="vendors-label">Models</span>
+            <button type="button" class="vendor-toggle on" data-vendor="codex" aria-pressed="true">GPT</button>
+            <button type="button" class="vendor-toggle on" data-vendor="gemini" aria-pressed="true">Gemini</button>
+            <button type="button" class="vendor-toggle on" data-vendor="claude" aria-pressed="true">Claude</button>
+            <span class="vendors-hint" id="vendorsHint"></span>
+          </div>
+          <div class="effort-hint" id="effortHint"></div>
         </form>
     </section>
 
@@ -410,10 +429,13 @@
           <button class="tool-btn" id="copyReportBtn" type="button">Copy markdown</button>
           <a class="tool-btn" id="rawReportLink" target="_blank" rel="noopener noreferrer">Raw .md</a>
         </span>
-        <button class="cancel-btn" id="cancelBtn" type="button" hidden>Cancel run</button>
       </div>
 
       <div class="timeline" id="timeline" hidden aria-label="Run phases">
+        <div class="timeline-head">
+          <span class="timeline-title">Progress</span>
+          <button class="cancel-btn" id="cancelBtn" type="button" hidden>Cancel this run</button>
+        </div>
         <div class="phase-row" id="phaseRow"></div>
         <div class="progress-track" id="progressTrack" hidden><div class="progress-fill" id="progressFill"></div></div>
       </div>
@@ -467,6 +489,13 @@
             <span class="chev">▼</span>
           </button>
           <div class="panel-body"><div class="panel-inner"><div class="panel-pad" id="detailsBody"></div></div></div>
+        </section>
+        <section class="panel" data-key="scoreboard" id="scoreboardPanel">
+          <button class="panel-head" type="button" aria-expanded="false">
+            <span class="panel-title">Model scoreboard <span class="count-chip">health</span></span>
+            <span class="chev">▼</span>
+          </button>
+          <div class="panel-body"><div class="panel-inner"><div class="panel-pad" id="scoreboardBody"></div></div></div>
         </section>
       </div>
     </section>
@@ -829,9 +858,16 @@ function highlightHistory() {
 function prefillFromRun(run) {
   promptInput.value = run.prompt || '';
   const cfg = run.config || {};
-  const radio = document.querySelector('input[name="effort"][value="' + (cfg.effort_level || 2) + '"]');
-  if (radio) radio.checked = true;
+  $('effortSelect').value = String(cfg.effort_level || 2);
+  syncEffortHint();
   $('sitesInput').value = (cfg.sites || []).join(', ');
+  const off = new Set(cfg.disabled_legs || []);
+  document.querySelectorAll('.vendor-toggle').forEach((b) => {
+    const on = !off.has(b.dataset.vendor);
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+  syncVendorsHint();
   savePrefs();
   syncStartBtn();
   expandComposer();
@@ -844,16 +880,18 @@ function closeMobileHistory() {
 }
 
 /* ---------------- phase timeline ---------------- */
-const PHASES = ['Decompose', 'Search', 'Verify', 'Rescue', 'Adjudicate', 'Synthesize', 'Review'];
+const PHASES = ['Decompose', 'Search', 'Verify', 'Rescue', 'Frontier', 'Adjudicate', 'Synthesize', 'Review', 'Fact-check'];
 function phaseIndex(phase) {
   const p = (phase || '').toLowerCase();
   if (/decomp/.test(p)) return 0;
   if (/search/.test(p)) return 1;
   if (/verif/.test(p)) return 2;
   if (/recheck|rescue/.test(p)) return 3;
-  if (/adjud/.test(p)) return 4;
-  if (/synth/.test(p)) return 5;
-  if (/review/.test(p)) return 6;
+  if (/frontier/.test(p)) return 4;
+  if (/adjud/.test(p)) return 5;
+  if (/synth/.test(p)) return 6;
+  if (/review/.test(p)) return 7;
+  if (/factcheck|fact-check/.test(p)) return 8;
   if (/complete|done|final/.test(p)) return PHASES.length;
   return -1;
 }
@@ -881,16 +919,32 @@ function modelChip(name) {
 function itemCard(item, rejected) {
   const card = el('article', 'item');
   if (item.parse_failed) {
-    card.appendChild(el('div', 'i-title', 'Model output could not be parsed'));
+    card.classList.add('parse-fail');
+    const body = el('div', 'i-body');
+    body.appendChild(el('div', 'i-title', 'Model output could not be parsed'));
     const badges = el('div', 'badge-row');
     badges.appendChild(el('span', 'mini bad', 'parse failed'));
     if (item.source_model) badges.appendChild(modelChip(item.source_model));
-    card.appendChild(badges);
-    if (item.record_id) card.appendChild(el('div', 'i-meta', item.record_id));
+    body.appendChild(badges);
+    if (item.record_id) body.appendChild(el('div', 'i-meta', item.record_id));
+    card.appendChild(body);
     return card;
   }
-  card.appendChild(el('div', 'i-price', fmtPrice(item.price, item.currency)));
-  card.appendChild(el('div', 'i-title', item.title || 'Untitled'));
+  // Dedicated price block (left): USD first when present, native price below.
+  const priceBlock = el('div', 'i-priceblock');
+  if (item.price_usd !== undefined && item.price_usd !== null) {
+    priceBlock.appendChild(el('div', 'i-price', fmtPrice(item.price_usd, 'USD')));
+    if (item.price !== null && item.price !== undefined && (item.currency || 'USD') !== 'USD') {
+      priceBlock.appendChild(el('div', 'i-price-native', fmtPrice(item.price, item.currency)));
+    }
+  } else {
+    priceBlock.appendChild(el('div', 'i-price', fmtPrice(item.price, item.currency)));
+  }
+  card.appendChild(priceBlock);
+
+  // Everything else goes into the body column (right of the price block).
+  const body = el('div', 'i-body');
+  body.appendChild(el('div', 'i-title', item.title || 'Untitled'));
 
   const badges = el('div', 'badge-row');
   if (item.disputed) {
@@ -900,10 +954,26 @@ function itemCard(item, rejected) {
   if (item.price_corrected_from !== undefined && item.price_corrected_from !== null) {
     badges.appendChild(el('span', 'mini info', 'price corrected from ' + fmtPrice(item.price_corrected_from)));
   }
+  if (item.variant_corrected && item.tier) {
+    badges.appendChild(el('span', 'mini info', 'tier from page: ' + item.tier));
+  }
   if (item.condition && item.condition !== 'unknown') {
     badges.appendChild(el('span', 'mini' + (item.condition === 'damaged' ? ' bad' : ''), item.condition));
   }
-  if (typeof item.confidence === 'number') {
+  if (item.trust && typeof item.trust.score === 'number') {
+    const s = item.trust.score;
+    const cls = s >= 0.66 ? ' good' : (s < 0.4 ? ' bad' : '');
+    const b = el('span', 'mini' + cls, 'trust ' + Math.round(s * 100) + '%');
+    if (item.trust.signals && item.trust.signals.length) b.title = item.trust.signals.join('; ');
+    badges.appendChild(b);
+  }
+  if (item.confidence_calibrated && typeof item.confidence_calibrated.score === 'number') {
+    const cc = item.confidence_calibrated;
+    const cls = cc.band === 'high' ? ' good' : (cc.band === 'low' ? ' bad' : '');
+    const b = el('span', 'mini' + cls, cc.band + ' confidence ' + Math.round(cc.score * 100) + '%');
+    if (cc.factors && cc.factors.length) b.title = cc.factors.join('; ');
+    badges.appendChild(b);
+  } else if (typeof item.confidence === 'number') {
     badges.appendChild(el('span', 'mini', Math.round(item.confidence * 100) + '% conf'));
   }
   const check = item.live_check || item.url_check;
@@ -912,24 +982,25 @@ function itemCard(item, rejected) {
   }
   (item.source_models || (item.source_model ? [item.source_model] : [])).forEach((mName) => badges.appendChild(modelChip(mName)));
   if (rejected) (item.reasons || []).forEach((r) => badges.appendChild(el('span', 'mini bad', r)));
-  if (badges.children.length) card.appendChild(badges);
+  if (badges.children.length) body.appendChild(badges);
 
   if (item.url && safeHref(item.url)) {
     const a = el('a', 'i-link', prettyUrl(item.url));
     a.href = item.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    card.appendChild(a);
+    body.appendChild(a);
   }
   const meta = [item.marketplace, item.location, item.availability].filter(Boolean).join(' · ');
-  if (meta) card.appendChild(el('div', 'i-meta', meta));
-  if (item.seller) card.appendChild(el('div', 'i-meta', 'Seller: ' + item.seller));
-  if (item.shipping) card.appendChild(el('div', 'i-meta', 'Shipping: ' + item.shipping));
-  if (item.adjudication) card.appendChild(el('div', 'i-arbiter', 'Arbiter: ' + item.adjudication));
+  if (meta) body.appendChild(el('div', 'i-meta', meta));
+  if (item.seller) body.appendChild(el('div', 'i-meta', 'Seller: ' + item.seller));
+  if (item.shipping) body.appendChild(el('div', 'i-meta', 'Shipping: ' + item.shipping));
+  if (item.adjudication) body.appendChild(el('div', 'i-arbiter', 'Arbiter: ' + item.adjudication));
   if (item.evidence) {
     const det = el('details');
     det.appendChild(el('summary', null, 'Evidence'));
     det.appendChild(el('p', null, item.evidence));
-    card.appendChild(det);
+    body.appendChild(det);
   }
+  card.appendChild(body);
   return card;
 }
 function renderItems(node, items, rejected, emptyMsg) {
@@ -939,6 +1010,14 @@ function renderItems(node, items, rejected, emptyMsg) {
     return;
   }
   items.forEach((it) => node.appendChild(itemCard(it, rejected)));
+}
+// Skip a rebuild when the data hasn't changed — prevents the list flashing/re-laying-out on
+// every 2s poll and every SSE tick (the "jumping" the owner reported).
+const _sigs = {};
+function unchanged(key, sig) {
+  if (_sigs[key] === sig) return true;
+  _sigs[key] = sig;
+  return false;
 }
 
 /* verified: sort / filter toolbar */
@@ -950,6 +1029,8 @@ function renderVerified() {
   if (state.verifiedSort === 'price') arr.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
   else if (state.verifiedSort === 'confidence') arr.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
   const emptyMsg = items.length && !arr.length ? 'No disputed items in this run.' : undefined;
+  const sig = state.current + '|' + state.verifiedSort + '|' + state.disputedOnly + '|' + JSON.stringify(arr.map((i) => [i.url, i.price, i.disputed]));
+  if (unchanged('verified', sig)) return;
   renderItems($('verifiedList'), arr, false, emptyMsg);
 }
 $('verifiedTools').addEventListener('click', (e) => {
@@ -971,9 +1052,19 @@ const REASON_LABELS = {
   http_410: 'Dead link — 410 gone',
   parse_failed: 'Model output unparseable',
   timeout: 'Verification timed out',
+  content_mismatch: 'Live page sells something else',
+  listing_inactive: 'Listing no longer active',
+  off_intent: 'Not what was asked for',
+  wrong_tier: 'Wrong tier / variant',
+  not_below_official: 'Not below the official price',
+  off_site: 'Off the allowed sites',
+  out_of_stock: 'Out of stock / sold',
+  missing_price: 'No price found',
 };
 function renderRejected(items) {
   const node = $('rejectedList');
+  const sig = state.current + '|' + JSON.stringify(items.map((i) => [i.url, i.price, (i.reasons || [])[0]]));
+  if (unchanged('rejected', sig)) return;
   node.replaceChildren();
   if (!items.length) {
     node.appendChild(el('div', 'panel-note', 'Nothing rejected.'));
@@ -1014,10 +1105,18 @@ function renderDetails(detail) {
   const grid = el('div', 'details-grid');
   if (cfg.effort) grid.appendChild(kv('Effort', cfg.effort + (cfg.effort_level ? ` (level ${cfg.effort_level})` : '')));
   if (cfg.sites && cfg.sites.length) grid.appendChild(kv('Sites', cfg.sites.join(', ')));
+  if (cfg.disabled_legs && cfg.disabled_legs.length) {
+    grid.appendChild(kv('Models off', cfg.disabled_legs.map((v) => VENDOR_NAMES[v] || v).join(', '), true));
+  }
   if (cfg.task_count) grid.appendChild(kv('Tasks', String(cfg.task_count)));
   if (cfg.recheck_rounds !== undefined) grid.appendChild(kv('Rescue rounds', String(cfg.recheck_rounds)));
   if (cfg.review_legs && cfg.review_legs.length) grid.appendChild(kv('Review legs', cfg.review_legs.join(', ')));
   if (run.recheck_dropped) grid.appendChild(kv('Rescue budget skipped', String(run.recheck_dropped), true));
+  if (run.final_check) {
+    const fc = run.final_check;
+    const v = fc.ok === true ? 'confirmed' : (fc.ok === false ? ('FAILED — ' + (fc.reason || '')) : 'not re-checkable');
+    grid.appendChild(kv('Top-pick re-check', v, fc.ok === false));
+  }
   if (run.disputed_count) grid.appendChild(kv('Disputed items', String(run.disputed_count)));
   if (run.created_at) grid.appendChild(kv('Started', fmtDate(run.created_at)));
   if (run.updated_at) grid.appendChild(kv('Updated', fmtDate(run.updated_at)));
@@ -1046,6 +1145,40 @@ function renderDetails(detail) {
   }
 }
 
+/* ---------------- model scoreboard (health indicator, not routing) ---------------- */
+async function renderScoreboard() {
+  const body = $('scoreboardBody');
+  if (state.mock) { body.replaceChildren(el('div', 'panel-note', 'Scoreboard needs the live backend.')); return; }
+  let data;
+  try { data = await (await fetch('/api/scoreboard')).json(); }
+  catch (e) { body.replaceChildren(el('div', 'panel-note', 'Scoreboard unavailable.')); return; }
+  const legs = data.legs || [];
+  body.replaceChildren();
+  if (!legs.length) { body.appendChild(el('div', 'panel-note', 'No model stats yet.')); return; }
+  const table = el('table', 'scoreboard');
+  const head = el('tr');
+  ['Model', 'Calls', 'Success', 'Parse-fail', 'No-src', 'Avg s', 'Today', 'Daily left'].forEach((h) => head.appendChild(el('th', null, h)));
+  table.appendChild(head);
+  legs.forEach((lg) => {
+    const tr = el('tr');
+    tr.appendChild(el('td', null, lg.leg));
+    tr.appendChild(el('td', 'num', String(lg.calls)));
+    const sr = el('td', 'num', lg.success_rate == null ? '—' : Math.round(lg.success_rate * 100) + '%');
+    if (lg.success_rate != null) sr.classList.add(lg.success_rate >= 0.8 ? 'sb-ok' : 'sb-low');
+    tr.appendChild(sr);
+    tr.appendChild(el('td', 'num', lg.parse_fail_rate == null ? '—' : Math.round(lg.parse_fail_rate * 100) + '%'));
+    tr.appendChild(el('td', 'num', lg.no_sources_rate == null ? '—' : Math.round(lg.no_sources_rate * 100) + '%'));
+    tr.appendChild(el('td', 'num', lg.avg_latency_sec == null ? '—' : Math.round(lg.avg_latency_sec)));
+    tr.appendChild(el('td', 'num', String(lg.today_calls)));
+    const left = el('td', 'num', lg.daily_remaining == null ? '—' : String(lg.daily_remaining));
+    if (lg.daily_remaining != null && lg.daily_cap && lg.daily_remaining < lg.daily_cap * 0.15) left.classList.add('sb-low');
+    tr.appendChild(left);
+    table.appendChild(tr);
+  });
+  body.appendChild(table);
+  body.appendChild(el('div', 'panel-note', 'Health indicator only — not used for routing. Updated ' + (data.generated_at || '').slice(11, 19) + ' UTC.'));
+}
+
 /* ---------------- activity (SSE) ---------------- */
 function activityUpsert(recordId, patch) {
   if (!recordId) return;
@@ -1054,57 +1187,80 @@ function activityUpsert(recordId, patch) {
   renderActivity();
 }
 function renderLegSummary() {
+  // The per-leg swimlanes already show each leg's progress; this strip only flags DOWN legs
+  // (incl. ones disabled before they ran a single call).
   const ls = $('legSummary');
   ls.replaceChildren();
-  const legs = new Map();
-  state.activity.forEach((a) => {
-    const leg = a.leg || '?';
-    const s = legs.get(leg) || { total: 0, ok: 0, fail: 0 };
-    s.total++;
-    if (a.state === 'ok') s.ok++;
-    if (a.state === 'fail' || a.state === 'killed') s.fail++;
-    legs.set(leg, s);
-  });
-  legs.forEach((s, leg) => {
-    const chip = el('span', 'leg-chip' + (state.degraded.has(leg) ? ' down' : ''));
-    chip.appendChild(modelChip(leg));
-    chip.appendChild(el('span', null, `${s.ok}/${s.total} done` + (s.fail ? ` · ${s.fail} failed` : '') + (state.degraded.has(leg) ? ' · disabled' : '')));
-    ls.appendChild(chip);
-  });
-  state.degraded.forEach((leg) => {
-    if (legs.has(leg)) return;
+  [...state.degraded].sort().forEach((leg) => {
     const chip = el('span', 'leg-chip down');
     chip.appendChild(modelChip(leg));
-    chip.appendChild(el('span', null, 'disabled'));
+    chip.appendChild(el('span', null, 'disabled — coverage may be incomplete'));
     ls.appendChild(chip);
   });
+}
+const LANE_ORDER = ['codex', 'gemini', 'claude'];
+async function cancelCall(recordId) {
+  if (!state.current || state.mock) return;
+  try { await fetch(`/api/runs/${encodeURIComponent(state.current)}/calls/${encodeURIComponent(recordId)}/cancel`, { method: 'POST' }); }
+  catch (e) { toast('Could not cancel call'); }
+}
+function activityCell(id, a) {
+  const cell = el('span', 'cell ' + (a.state || 'run'));
+  cell.appendChild(el('span', null, [a.task_type, a.task_id].filter(Boolean).join(' ') || id));
+  if (a.state === 'ok') cell.appendChild(el('span', null, '✓' + (a.latency ? ` ${Math.round(a.latency)}s` : '')));
+  else if (a.state === 'fail') cell.appendChild(el('span', null, '✗' + (a.latency ? ` ${Math.round(a.latency)}s` : '')));
+  else if (a.state === 'killed') cell.appendChild(el('span', null, '◌ killed'));
+  else if (a.state === 'skipped') cell.appendChild(el('span', null, 'skipped'));
+  else {
+    cell.appendChild(el('span', 'spinner'));
+    if (a.queue_wait && a.queue_wait > 1) cell.appendChild(el('span', 'qw', `queued ${Math.round(a.queue_wait)}s`));
+    const x = el('span', 'cell-x', '✕');
+    x.title = 'Cancel this call';
+    x.addEventListener('click', () => cancelCall(id));
+    cell.appendChild(x);
+  }
+  return cell;
 }
 function renderActivity() {
   const panel = $('activityPanel');
   const list = $('activityList');
-  const entries = [...state.activity.entries()].reverse().slice(0, 80);
+  const entries = [...state.activity.entries()];
   const running = state.detail && state.detail.run && state.detail.run.status === 'running';
   panel.hidden = !entries.length && !running;
   $('activityCount').textContent = String(state.activity.size);
+  const sig = JSON.stringify(entries.map(([id, a]) => [id, a.state, a.latency, a.queue_wait])) + '|' + [...state.degraded].sort().join(',');
+  if (unchanged('activity', sig)) return;
   renderLegSummary();
   list.replaceChildren();
   if (!entries.length) {
     list.appendChild(el('div', 'panel-note', 'Per-call activity will appear here while the run streams events.'));
     return;
   }
+  const byLeg = new Map();
   entries.forEach(([id, a]) => {
-    const row = el('div', 'act-row');
-    row.appendChild(modelChip(a.leg || '?'));
-    row.appendChild(el('span', 'a-task', [a.task_type, a.task_id].filter(Boolean).join(' · ') || id));
-    let st;
-    if (a.state === 'ok') st = el('span', 'a-state ok', '✓ done' + (a.latency ? ` · ${Math.round(a.latency)}s` : ''));
-    else if (a.state === 'fail') st = el('span', 'a-state fail', '✗ failed' + (a.latency ? ` · ${Math.round(a.latency)}s` : ''));
-    else if (a.state === 'killed') st = el('span', 'a-state killed', '◌ killed (straggler)');
-    else if (a.skipped) st = el('span', 'a-state killed', 'skipped');
-    else { st = el('span', 'a-state run'); st.appendChild(el('span', 'spinner')); st.appendChild(document.createTextNode('running')); }
-    row.appendChild(st);
-    list.appendChild(row);
+    const leg = a.leg || '?';
+    if (!byLeg.has(leg)) byLeg.set(leg, []);
+    byLeg.get(leg).push([id, a]);
   });
+  const legs = [...byLeg.keys()].sort((x, y) => {
+    const ix = LANE_ORDER.indexOf(x), iy = LANE_ORDER.indexOf(y);
+    return (ix < 0 ? 99 : ix) - (iy < 0 ? 99 : iy);
+  });
+  const lanes = el('div', 'lanes');
+  legs.forEach((leg) => {
+    const calls = byLeg.get(leg);
+    const done = calls.filter(([, a]) => a.state === 'ok').length;
+    const lane = el('div', 'lane' + (state.degraded.has(leg) ? ' down' : ''));
+    const head = el('div', 'lane-head');
+    head.appendChild(modelChip(leg));
+    head.appendChild(el('span', 'lane-count', `${done}/${calls.length} done` + (state.degraded.has(leg) ? ' · down' : '')));
+    lane.appendChild(head);
+    const cells = el('div', 'lane-cells');
+    calls.forEach(([id, a]) => cells.appendChild(activityCell(id, a)));
+    lane.appendChild(cells);
+    lanes.appendChild(lane);
+  });
+  list.appendChild(lanes);
 }
 function handleEvent(f) {
   if (!f || typeof f !== 'object') return;
@@ -1124,10 +1280,14 @@ function handleEvent(f) {
       const skipped = Object.keys(f).some((k) => /skip/i.test(k) && f[k]);
       activityUpsert(f.record_id, {
         leg: f.leg, task_type: f.task_type, task_id: f.task_id,
-        state: f.success ? 'ok' : 'fail', latency: f.latency_sec, skipped,
+        state: skipped ? 'skipped' : (f.success ? 'ok' : (f.dropped_as_straggler ? 'killed' : 'fail')),
+        latency: f.latency_sec, queue_wait: f.queue_wait_sec, skipped,
       });
       break;
     }
+    case 'call_cancel_requested':
+      activityUpsert(f.record_id, { state: 'killed' });
+      break;
     case 'stragglers_killed':
       (f.record_ids || []).forEach((id) => activityUpsert(id, { state: 'killed' }));
       break;
@@ -1416,20 +1576,54 @@ async function selectRun(runId, { fresh = false } = {}) {
 /* ---------------- form ---------------- */
 const form = $('runForm');
 const promptInput = $('promptInput');
+const EFFORT_HINTS = {
+  '1': 'Quick — 3 tasks × 2 models, one rescue round. Fastest, shallowest.',
+  '2': 'Standard — 4 tasks × 2 models, balanced cross-checking.',
+  '3': 'Deep — 5 tasks, 2 rescue rounds, cross-vendor adversarial review, Opus adjudication.',
+  '4': 'Max — 6 tasks at max reasoning, dual review, both models retry every failure.',
+};
+const VENDOR_NAMES = { codex: 'GPT', gemini: 'Gemini', claude: 'Claude' };
+function disabledVendors() {
+  return [...document.querySelectorAll('.vendor-toggle')].filter((b) => !b.classList.contains('on')).map((b) => b.dataset.vendor);
+}
+function syncVendorsHint() {
+  const off = disabledVendors();
+  const on = [...document.querySelectorAll('.vendor-toggle.on')].map((b) => VENDOR_NAMES[b.dataset.vendor]);
+  $('vendorsHint').textContent = off.length ? `${off.map((v) => VENDOR_NAMES[v]).join(' + ')} off — ${on.join(' + ')} cover everything` : '';
+}
+function syncEffortHint() {
+  $('effortHint').textContent = EFFORT_HINTS[$('effortSelect').value] || '';
+}
 function savePrefs() {
-  const effort = (document.querySelector('input[name="effort"]:checked') || {}).value || '2';
-  try { localStorage.setItem('prefs', JSON.stringify({ effort, sites: $('sitesInput').value })); } catch (e) {}
+  try { localStorage.setItem('prefs', JSON.stringify({ effort: $('effortSelect').value, sites: $('sitesInput').value, disabled: disabledVendors() })); } catch (e) {}
 }
 function loadPrefs() {
   let p = null;
   try { p = JSON.parse(localStorage.getItem('prefs') || 'null'); } catch (e) {}
   if (!p) return;
-  const radio = document.querySelector('input[name="effort"][value="' + p.effort + '"]');
-  if (radio) radio.checked = true;
+  if (p.effort) $('effortSelect').value = p.effort;
   if (p.sites) $('sitesInput').value = p.sites;
+  const off = new Set(p.disabled || []);
+  document.querySelectorAll('.vendor-toggle').forEach((b) => {
+    const on = !off.has(b.dataset.vendor);
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+  syncEffortHint();
+  syncVendorsHint();
 }
-document.querySelectorAll('input[name="effort"]').forEach((r) => r.addEventListener('change', savePrefs));
+$('effortSelect').addEventListener('change', () => { savePrefs(); syncEffortHint(); });
 $('sitesInput').addEventListener('input', savePrefs);
+document.querySelectorAll('.vendor-toggle').forEach((btn) => btn.addEventListener('click', () => {
+  const on = btn.classList.contains('on');
+  // Never let the user turn the LAST model off — at least one must stay on.
+  if (on && document.querySelectorAll('.vendor-toggle.on').length <= 1) {
+    toast('At least one model must stay on'); return;
+  }
+  btn.classList.toggle('on', !on);
+  btn.setAttribute('aria-pressed', String(!on));
+  savePrefs(); syncVendorsHint();
+}));
 function syncStartBtn() { $('startBtn').disabled = state.submitting || !promptInput.value.trim(); }
 promptInput.addEventListener('input', syncStartBtn);
 promptInput.addEventListener('keydown', (e) => {
@@ -1442,12 +1636,12 @@ form.addEventListener('submit', async (e) => {
   if (state.mock) { toast('Mock mode — backend is not running, cannot start a run'); return; }
   state.submitting = true;
   syncStartBtn();
-  const effort = Number((document.querySelector('input[name="effort"]:checked') || {}).value || 2);
+  const effort = Number($('effortSelect').value || 2);
   try {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim() }),
+      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim(), disabled: disabledVendors() }),
     });
     if (!res.ok) throw new Error('http ' + res.status);
     const data = await res.json();
@@ -1497,6 +1691,7 @@ document.addEventListener('click', (e) => {
   panel.classList.toggle('open', open);
   head.setAttribute('aria-expanded', String(open));
   if (key) { open ? state.openPanels.add(key) : state.openPanels.delete(key); }
+  if (key === 'scoreboard' && open) renderScoreboard();
 });
 $('historySearchInput').addEventListener('input', (e) => {
   state.histFilter = e.target.value;
@@ -1523,6 +1718,7 @@ document.addEventListener('visibilitychange', () => {
 /* ---------------- boot ---------------- */
 (async function boot() {
   loadPrefs();
+  syncEffortHint();
   syncStartBtn();
   await loadHistory();
   const stored = localStorage.getItem('currentRun');
