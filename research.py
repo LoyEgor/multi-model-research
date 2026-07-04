@@ -32,6 +32,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
 DATA_DIR = ROOT / "data"
@@ -45,12 +52,20 @@ DAILY_CAPS = {
     "codex": env_int("RESEARCH_CODEX_DAILY_CAP", 400),
     "claude": env_int("RESEARCH_CLAUDE_DAILY_CAP", 80),
 }
+# Hold back this many of Claude's remaining daily calls from SEARCH, so one run's discovery can't
+# eat the allowance the thin judge/arbiter seats (adjudication, review, synthesis) still need later
+# in the day. Claude is the scarce leg; the free codex/gemini legs carry the bulk of the search.
+CLAUDE_SEARCH_RESERVE = max(0, env_int("RESEARCH_CLAUDE_SEARCH_RESERVE", 8))
 RAW_TIMEOUT_SEC = max(60, env_int("RESEARCH_MODEL_TIMEOUT_SEC", 900))
 URL_TIMEOUT_SEC = max(2, env_int("RESEARCH_URL_TIMEOUT_SEC", 12))
 MAX_PRIMARY_WORKERS = max(2, env_int("RESEARCH_MAX_PRIMARY_WORKERS", 6))
 MAX_VERIFY_WORKERS = max(2, env_int("RESEARCH_MAX_VERIFY_WORKERS", 8))
 # A run with no heartbeat for longer than one full model call + slack is dead, not "running".
 STALE_AFTER_SEC = RAW_TIMEOUT_SEC + 600
+# Wall-clock budget guard. Each effort profile sets time_budget_sec (TOTAL run cap). Search/rescue/
+# coverage/frontier rounds stop once only SYNTHESIS_RESERVE_SEC remains, so the value-delivering
+# synthesis/review/fact-check always get to run inside the budget. Keeps deep/max well under 90 min.
+SYNTHESIS_RESERVE_SEC = max(120, env_int("RESEARCH_SYNTHESIS_RESERVE_SEC", 900))
 ACTIVE_RUNS: set[str] = set()
 
 # Per-run circuit breaker: after N consecutive call failures a leg is disabled for the REST OF
@@ -186,14 +201,19 @@ def daily_call_counts(day: str | None = None) -> dict[str, int]:
     return counts
 
 
-def paced_budget(leg: str, requested: int) -> tuple[int, int]:
-    """Clamp a leg's per-run budget to the remaining daily allowance. Returns (budget, remaining)."""
+def paced_budget(leg: str, requested: int, reserve: int = 0, counts: dict | None = None) -> tuple[int, int]:
+    """Clamp a leg's per-run budget to the remaining daily allowance. `reserve` withholds that many
+    of the day's remaining calls from THIS budget (used to keep some Claude allowance for the
+    non-search judge seats). Pass `counts` (from one daily_call_counts() call) to price several legs
+    without re-reading the log per leg. Returns (budget, remaining), remaining = true daily remaining
+    BEFORE the reserve."""
     cap = DAILY_CAPS.get(leg)
     if not cap:
         return requested, -1
-    used = daily_call_counts().get(leg, 0)
+    used = (counts if counts is not None else daily_call_counts()).get(leg, 0)
     remaining = max(0, cap - used)
-    return min(requested, remaining), remaining
+    grantable = max(0, remaining - reserve)
+    return min(requested, grantable), remaining
 
 
 # Live subprocess registry per run: lets a fan-out phase kill its stragglers (and only its own
@@ -306,11 +326,66 @@ def clear_user_disabled(run_id: str) -> None:
     with CANCEL_LOCK:
         USER_DISABLED.pop(run_id, None)
 
-# Effort scales breadth (tasks), depth (recheck rounds/items) and verification layers (cross-vendor
-# adversarial review of the draft, Claude adjudication of disputes). The search legs (codex/gemini)
-# NEVER downgrade — flagship only, tier guards in lib/legs/ask_*.sh stay in force. The Claude seat is
-# tiered by COST: sonnet at low effort, opus at high effort. Opus is the HARD ceiling (owner
-# decision 2026-06-11): never Fable/Mythos-class models — the wrapper blocks them outright.
+
+# Per-vendor tier/effort the owner can dial (UI per-run, not persisted; CLI/API/env for headless).
+# ONE setting per vendor, applied to EVERY role that vendor plays this run — search AND the judge
+# seats share one codex effort and one Claude tier. WHO plays which role is decided by the effort
+# scheme, not here. Defaults are the strongest tier; the owner only dials down to experiment.
+VENDOR_TIER_DEFAULTS = {"codex": "xhigh", "gemini": "high", "claude": "opus"}
+CODEX_EFFORTS = ("medium", "high", "xhigh")
+CLAUDE_TIERS = ("sonnet", "opus")  # Opus is the hard ceiling — fable/mythos are blocked in the leg.
+GEMINI_TIERS = {"high": "Gemini 3.1 Pro (High)", "low": "Gemini 3.1 Pro (Low)"}
+_VENDOR_TIER_ENV = {"codex": "RESEARCH_CODEX_TIER", "gemini": "RESEARCH_GEMINI_TIER",
+                    "claude": "RESEARCH_CLAUDE_TIER"}
+
+
+def normalize_vendor_tiers(raw: object) -> dict:
+    """Clamp a per-vendor tier/effort override to the allowed set, falling back to the max default.
+    Precedence: passed-in (UI/API/CLI) > env > default. Unknown values are ignored, not errored."""
+    tiers = dict(VENDOR_TIER_DEFAULTS)
+    allowed = {"codex": CODEX_EFFORTS, "gemini": tuple(GEMINI_TIERS), "claude": CLAUDE_TIERS}
+    raw = raw if isinstance(raw, dict) else {}
+    for vendor, options in allowed.items():
+        env_val = str(os.environ.get(_VENDOR_TIER_ENV[vendor]) or "").strip().lower()
+        if env_val in options:
+            tiers[vendor] = env_val
+        val = str(raw.get(vendor) or "").strip().lower()
+        if val in options:
+            tiers[vendor] = val
+    return tiers
+
+
+# Vendors' Gemini model label for a run (agy has no per-call model flag we pass positionally, so
+# call_model reads it here by run_id — mirrors the USER_DISABLED run-scoped store).
+RUN_GEMINI_MODEL: dict[str, str] = {}
+
+
+def set_run_gemini_model(run_id: str, label: str | None) -> None:
+    with CANCEL_LOCK:
+        if label:
+            RUN_GEMINI_MODEL[run_id] = label
+        else:
+            RUN_GEMINI_MODEL.pop(run_id, None)
+
+
+def run_gemini_model(run_id: str) -> str | None:
+    with CANCEL_LOCK:
+        return RUN_GEMINI_MODEL.get(run_id)
+
+
+def clear_run_gemini_model(run_id: str) -> None:
+    with CANCEL_LOCK:
+        RUN_GEMINI_MODEL.pop(run_id, None)
+
+# ALL frontier families (codex/gemini/claude) search at EVERY level — they run in parallel, so a
+# third strong leg adds breadth without adding wall-clock. Effort scales by BREADTH (tasks) and the
+# number of PASSES (recheck / coverage / frontier rounds, variants) and by verification layers
+# (cross-vendor review, Claude adjudication), NOT by model tier: search never downgrades — flagship
+# only, guards in lib/legs/ask_*.sh stay in force. claude_search_model = the tier Claude searches at
+# (opus); the separate judge/arbiter seat tier is claude_model. Any role's model can be overridden
+# via config["roles"] (see resolve_roles). Opus is the HARD ceiling (owner decision 2026-06-11):
+# never Fable/Mythos-class — the wrapper blocks them outright. Per-run daily pacing still trims the
+# Claude search budget when the day's allowance runs low (paced_budget), degrading to codex+gemini.
 # review_legs: vendors that adversarially review the codex draft, one round each, in order.
 EFFORT_PROFILES = {
     1: {
@@ -321,18 +396,21 @@ EFFORT_PROFILES = {
         "recheck_legs": 1,
         "review_legs": [],
         "adjudicate_disputes": True,
-        "claude_model": "sonnet",
-        "search_effort": "medium",
-        "judge_effort": "medium",
         "search_timeout_sec": 420,
         "recheck_timeout_sec": 300,
         "straggler_grace_sec": 90,
+        "time_budget_sec": 1500,
         "gemini_call_budget": 6,
-        "search_legs": ["codex", "gemini"],
-        "claude_search_budget": 0,
+        "search_legs": ["codex", "gemini", "claude"],
+        "claude_search_budget": 3,
         "query_variants_per_task": 1,
         "frontier_rounds": 0,
         "final_factcheck": False,
+        "structured_decompose": True,
+        "differentiate_legs": False,
+        "angle_variants_per_task": 0,
+        "coverage_rounds": 0,
+        "adjudicate_samples": 1,
     },
     2: {
         "effort": "standard",
@@ -342,60 +420,69 @@ EFFORT_PROFILES = {
         "recheck_legs": 1,
         "review_legs": [],
         "adjudicate_disputes": True,
-        "claude_model": "sonnet",
-        "search_effort": "medium",
-        "judge_effort": "xhigh",
         "search_timeout_sec": 480,
         "recheck_timeout_sec": 360,
         "straggler_grace_sec": 120,
+        "time_budget_sec": 2400,
         "gemini_call_budget": 9,
-        "search_legs": ["codex", "gemini"],
-        "claude_search_budget": 0,
+        "search_legs": ["codex", "gemini", "claude"],
+        "claude_search_budget": 4,
         "query_variants_per_task": 1,
         "frontier_rounds": 0,
         "final_factcheck": False,
+        "structured_decompose": True,
+        "differentiate_legs": False,
+        "angle_variants_per_task": 0,
+        "coverage_rounds": 0,
+        "adjudicate_samples": 1,
     },
     3: {
         "effort": "deep",
         "task_count": 5,
-        "recheck_rounds": 2,
-        "max_recheck_items": 8,
+        "recheck_rounds": 1,
+        "max_recheck_items": 6,
         "recheck_legs": 1,
         "review_legs": ["gemini"],
         "adjudicate_disputes": True,
-        "claude_model": "opus",
-        "search_effort": "medium",
-        "judge_effort": "xhigh",
         "search_timeout_sec": 600,
         "recheck_timeout_sec": 480,
         "straggler_grace_sec": 240,
+        "time_budget_sec": 4200,
         "gemini_call_budget": 12,
         "search_legs": ["codex", "gemini", "claude"],
-        "claude_search_budget": 6,
-        "query_variants_per_task": 2,
+        "claude_search_budget": 8,
+        "query_variants_per_task": 1,
         "frontier_rounds": 1,
         "final_factcheck": True,
+        "structured_decompose": True,
+        "differentiate_legs": True,
+        "angle_variants_per_task": 1,
+        "coverage_rounds": 1,
+        "adjudicate_samples": 3,
     },
     4: {
         "effort": "max",
         "task_count": 6,
-        "recheck_rounds": 2,
-        "max_recheck_items": 12,
+        "recheck_rounds": 1,
+        "max_recheck_items": 8,
         "recheck_legs": 2,
         "review_legs": ["gemini", "claude"],
         "adjudicate_disputes": True,
-        "claude_model": "opus",
-        "search_effort": "xhigh",
-        "judge_effort": "xhigh",
         "search_timeout_sec": 900,
         "recheck_timeout_sec": 600,
         "straggler_grace_sec": 360,
+        "time_budget_sec": 5100,
         "gemini_call_budget": 16,
         "search_legs": ["codex", "gemini", "claude"],
-        "claude_search_budget": 10,
-        "query_variants_per_task": 3,
+        "claude_search_budget": 12,
+        "query_variants_per_task": 2,
         "frontier_rounds": 2,
         "final_factcheck": True,
+        "structured_decompose": True,
+        "differentiate_legs": True,
+        "angle_variants_per_task": 2,
+        "coverage_rounds": 1,
+        "adjudicate_samples": 3,
     },
 }
 # Once this fraction of a phase's parallel calls has returned, the remaining stragglers get a
@@ -462,11 +549,15 @@ def normalize_vendors(values: object) -> list[str]:
     return out
 
 
-def make_config(effort: object = None, sites: object = None, disabled: object = None) -> dict:
+def make_config(effort: object = None, sites: object = None, disabled: object = None,
+                vendor_tiers: object = None, excluded_sites: object = None) -> dict:
     level = parse_effort(effort)
     config = dict(EFFORT_PROFILES[level])
     config["effort_level"] = level
     config["sites"] = normalize_sites(sites)
+    # Blocklist (inverse of the sites scope): domains the user never wants back. An explicit scope
+    # wins on overlap, so the two fields can never contradict each other.
+    config["excluded_sites"] = [d for d in normalize_sites(excluded_sites) if d not in config["sites"]]
 
     # Vendor on/off (owner saves a provider's quota): drop disabled vendors from every role.
     # At least one vendor must remain — if the user disables all three, ignore the request.
@@ -486,6 +577,15 @@ def make_config(effort: object = None, sites: object = None, disabled: object = 
         config["task_count"] = min(6, max(3, env_int("RESEARCH_MAX_TASKS", config["task_count"])))
     if os.environ.get("RESEARCH_MAX_RECHECK_ITEMS") is not None:
         config["max_recheck_items"] = max(0, env_int("RESEARCH_MAX_RECHECK_ITEMS", config["max_recheck_items"]))
+
+    # Per-vendor tier/effort: ONE setting per vendor, applied to every role it plays. Overwrites the
+    # profile so search and the judge seats share one codex effort and one Claude tier; gemini's tier
+    # is carried and set as AGY_MODEL per call. Default max; the owner dials down only to experiment.
+    tiers = normalize_vendor_tiers(vendor_tiers)
+    config["vendor_tiers"] = tiers
+    config["search_effort"] = config["judge_effort"] = tiers["codex"]
+    config["claude_model"] = config["claude_search_model"] = tiers["claude"]
+    config["gemini_model"] = GEMINI_TIERS[tiers["gemini"]]
     return config
 
 
@@ -521,6 +621,7 @@ FINDING_FIELDS = [
     "availability",
     "condition",
     "tier",
+    "price_basis",
     "seller",
     "location",
     "shipping",
@@ -578,6 +679,92 @@ def to_usd(price: object, currency: object) -> float | None:
     if not rate:
         return None
     return round(float(price) / rate, 2)
+
+
+# Pricing BASIS: the axis a price lives on. A subscription's monthly fee, a one-off purchase, a
+# per-token API rate and a free tier are NOT comparable numbers — comparing them silently is the
+# "cheapest = free" / "per-token beats monthly" bug. We carry the basis on every intent + finding,
+# normalize what we can to a common monthly-USD axis, and TAG (never drop) what we can't.
+PRICE_BASES = {"one_time", "subscription_monthly", "subscription_yearly", "usage_metered",
+               "per_seat_monthly", "rental_monthly", "free", "unknown"}
+_BASIS_CLASS = {
+    "one_time": "one_time",
+    "subscription_monthly": "recurring", "subscription_yearly": "recurring",
+    "per_seat_monthly": "recurring", "rental_monthly": "recurring",
+    "usage_metered": "metered", "free": "free", "unknown": "unknown",
+}
+_PERIOD_TO_MONTHLY = {"subscription_monthly": 1.0, "subscription_yearly": 1 / 12.0,
+                      "per_seat_monthly": 1.0, "rental_monthly": 1.0}
+_BASIS_SYNONYMS = {  # substring -> canon; longest key wins so "per 1k tokens" beats "per"
+    "per month": "subscription_monthly", "monthly": "subscription_monthly", "/mo": "subscription_monthly",
+    "per mo": "subscription_monthly", "a month": "subscription_monthly",
+    "per year": "subscription_yearly", "yearly": "subscription_yearly", "annual": "subscription_yearly",
+    "/yr": "subscription_yearly", "per annum": "subscription_yearly", "a year": "subscription_yearly",
+    "per token": "usage_metered", "per 1k tokens": "usage_metered", "per 1m tokens": "usage_metered",
+    "per request": "usage_metered", "per api call": "usage_metered", "metered": "usage_metered",
+    "usage-based": "usage_metered", "usage based": "usage_metered", "pay as you go": "usage_metered",
+    "pay-as-you-go": "usage_metered", "per gb": "usage_metered",
+    "per seat": "per_seat_monthly", "per user": "per_seat_monthly",
+    "one time": "one_time", "one-time": "one_time", "once": "one_time", "lifetime": "one_time",
+    "perpetual": "one_time", "outright": "one_time",
+    "free": "free", "$0": "free", "no cost": "free", "gratis": "free",
+}
+# Longest-first so "per 1k tokens" wins over "per"; precomputed once (canon_basis runs per finding).
+_BASIS_SYNONYM_KEYS = sorted(_BASIS_SYNONYMS, key=len, reverse=True)
+
+
+def canon_basis(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return "unknown"
+    if text in PRICE_BASES:
+        return text
+    for key in _BASIS_SYNONYM_KEYS:
+        if key in text:
+            return _BASIS_SYNONYMS[key]
+    return "unknown"
+
+
+def basis_class(basis: object) -> str:
+    return _BASIS_CLASS.get(canon_basis(basis), "unknown")
+
+
+def to_monthly_usd(price_usd: object, basis: object, intent: dict | None) -> float | None:
+    """Put a USD price on a common axis: USD per month. Returns None when the basis has no monthly
+    equivalent (one_time / free / unknown, or metered with no usage assumption) — that None is what
+    makes such an offer deliberately incomparable to a subscription."""
+    if price_usd is None:
+        return None
+    b = canon_basis(basis)
+    if b in _PERIOD_TO_MONTHLY:
+        return round(float(price_usd) * _PERIOD_TO_MONTHLY[b], 4)  # per_seat priced at 1 seat
+    if b == "usage_metered":
+        units = (intent or {}).get("monthly_usage_units")
+        return round(float(price_usd) * float(units), 4) if units else None
+    return None
+
+
+def set_monthly_usd(finding: dict) -> None:
+    """Refresh the monthly-normalized USD (derived from price_usd + basis) so recurring cards show a
+    consistent ~$/mo. Call anywhere price_usd/currency/basis is finalized. Metered needs an intent
+    usage assumption, so it stays None here and is filled later by intent_rejection when available."""
+    finding["price_usd_monthly"] = to_monthly_usd(finding.get("price_usd"), finding.get("price_basis"), None)
+
+
+def parse_count(value: object) -> float | None:
+    """Parse a plain quantity (e.g. monthly_usage_units) — NOT a price, so grouping commas mean
+    thousands ('1,000,000' -> 1000000), not decimals. Returns a positive float or None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    digits = re.sub(r"[,\s_]", "", str(value))
+    match = re.search(r"\d+(?:\.\d+)?", digits)
+    if not match:
+        return None
+    number = float(match.group())
+    return number if number > 0 else None
+
 
 OUT_OF_STOCK_RE = re.compile(
     r"(out\s*of\s*stock|sold|unavailable|not\s+available|"
@@ -751,6 +938,8 @@ def normalize_finding(item: dict, source_model: str, task_id: str, record_id: st
     finding["price_usd"] = to_usd(finding["price"], finding["currency"])
     if finding.get("tier") is not None:
         finding["tier"] = str(finding["tier"]).strip().lower() or None
+    finding["price_basis"] = canon_basis(finding.get("price_basis"))
+    set_monthly_usd(finding)  # consistent ~$/mo for every recurring finding, not only priced-out ones
 
     if finding.get("url") is not None:
         finding["url"] = str(finding["url"]).strip() or None
@@ -815,6 +1004,11 @@ def merge_finding(existing: dict, incoming: dict) -> dict:
         if existing.get(field) in (None, "") and incoming.get(field) not in (None, ""):
             existing[field] = incoming[field]
 
+    # price_basis defaults to the non-empty "unknown", so the loop above never upgrades it — a leg
+    # that identified the basis should win over one that didn't.
+    if basis_class(existing.get("price_basis")) == "unknown" and basis_class(incoming.get("price_basis")) != "unknown":
+        existing["price_basis"] = incoming["price_basis"]
+
     # "Cheaper" is decided in USD (comparable across currencies), then native price/currency
     # follow the chosen candidate.
     if incoming.get("price") is not None:
@@ -824,6 +1018,7 @@ def merge_finding(existing: dict, incoming: dict) -> dict:
             existing["price"] = incoming["price"]
             existing["currency"] = incoming.get("currency")
             existing["price_usd"] = inc_usd
+            set_monthly_usd(existing)  # cheapest candidate changed the price; keep ~$/mo in step
 
     evidences = []
     for evidence in (existing.get("evidence"), incoming.get("evidence")):
@@ -995,6 +1190,7 @@ def apply_live_check(item: dict, intent: dict | None = None) -> None:
     item["price"] = live_price
     item["currency"] = live_cur
     item["price_usd"] = live_usd
+    set_monthly_usd(item)  # live page overrode the price; keep ~$/mo in step
     item["disputed"] = False  # resolved by verified fact, not by vote
 
 
@@ -1034,7 +1230,8 @@ def verify_url(url: object, timeout: float = URL_TIMEOUT_SEC) -> dict:
     return {"ok": False, "reason": last_reason, "status": last_status}
 
 
-def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[str] | None = None, intent: dict | None = None) -> list[str]:
+def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[str] | None = None,
+                      intent: dict | None = None, excluded_sites: list[str] | None = None) -> list[str]:
     if finding.get("parse_failed"):
         return ["parse_failed"]
 
@@ -1045,6 +1242,13 @@ def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[
         reasons.append("off_site")
     elif url_check and not url_check.get("ok"):
         reasons.append(url_check.get("reason") or "url_unverified")
+
+    # User-blocked domain (independent of the URL-liveness chain, so an off_site item on a blocked
+    # host is still tagged blocked). url_in_sites does exact + subdomain matching. The `not in` guard
+    # avoids a duplicate when check_one already short-circuited with reason "excluded_site".
+    if (finding.get("url") and excluded_sites and url_in_sites(finding.get("url"), excluded_sites)
+            and "excluded_site" not in reasons):
+        reasons.append("excluded_site")
 
     if finding.get("listing_inactive"):
         reasons.append("listing_inactive")
@@ -1073,7 +1277,8 @@ def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[
 # content_mismatch is final (the live page sells something else).
 NON_RESCUABLE_REASONS = {
     "parse_failed", "off_site", "out_of_stock", "adjudicated_reject", "listing_inactive",
-    "off_intent", "wrong_tier", "not_below_official", "content_mismatch",
+    "off_intent", "wrong_tier", "not_below_official", "content_mismatch", "free_excluded",
+    "excluded_site",
 }
 SEARCH_LEGS = ("codex", "gemini")
 
@@ -1087,18 +1292,83 @@ def sort_by_price(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda x: (x.get("price") is None, x.get("price") or 10**18, str(x.get("title") or "")))
 
 
+def finding_dedupe_key(item: dict) -> str:
+    """Stable identity for the live feed: prefer the URL, then the call record id (for url-less
+    parse failures), then title+price+currency. MUST match the frontend liveKey() so the backend
+    de-dupe and the UI de-dupe agree across rescue/frontier rounds."""
+    return item.get("url") or item.get("record_id") or f"{item.get('title')}|{item.get('price')}|{item.get('currency')}"
+
+
+def finding_settled_payload(item: dict, verdict: str, stage: str | None) -> dict:
+    """Compact, card-renderable snapshot of one finding for the live SSE feed. Kept lean (scalars +
+    two tiny checks) so streaming these never bloats events.jsonl. url_check is the raw URL
+    reachability; live_check is the live-page result — kept separate so the UI badge matches the
+    final card (which prefers live_check over url_check) instead of conflating the two."""
+    uc = item.get("url_check") or {}
+    lc = item.get("live_check") or {}
+    return {
+        "stage": stage,
+        "verdict": verdict,
+        "record_id": item.get("record_id"),
+        "url": item.get("url"),
+        "title": item.get("title"),
+        "price": item.get("price"),
+        "currency": item.get("currency"),
+        "price_usd": item.get("price_usd"),
+        "price_usd_monthly": item.get("price_usd_monthly"),
+        "price_basis": item.get("price_basis"),
+        "basis_flag": item.get("basis_flag"),
+        "basis_note": item.get("basis_note"),
+        "marketplace": item.get("marketplace"),
+        "availability": item.get("availability"),
+        "disputed": bool(item.get("disputed")),
+        "parse_failed": bool(item.get("parse_failed")),
+        "reasons": item.get("reasons") or [],
+        "source_models": item.get("source_models") or ([item["source_model"]] if item.get("source_model") else []),
+        "url_check": {"ok": bool(uc.get("ok")), "reason": uc.get("reason")} if uc else None,
+        "live_check": {"ok": bool(lc.get("ok")), "reason": lc.get("reason")} if lc else None,
+    }
+
+
 def verify_findings(
     findings: list[dict],
     parse_rejections: list[dict] | None = None,
     sites: list[str] | None = None,
     intent: dict | None = None,
+    run_dir: Path | None = None,
+    stage: str | None = None,
+    emitted: dict | None = None,
+    excluded_sites: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     unique = dedupe_findings(findings)
     verified: list[dict] = []
     rejected: list[dict] = list(parse_rejections or [])
 
+    def emit_settled(item: dict, verdict: str) -> None:
+        # Each round re-verifies the ACCUMULATED findings, so without a guard the same item would
+        # re-stream every round. `emitted` (shared across a run's rounds) makes us emit only on
+        # first sight or a real change — bounding events.jsonl and the SSE replay.
+        if run_dir is None:
+            return
+        check = item.get("live_check") or item.get("url_check") or {}
+        sig = (verdict, item.get("price_usd"), item.get("price"), bool(check.get("ok")),
+               len(item.get("source_models") or ([item["source_model"]] if item.get("source_model") else [])))
+        if emitted is not None:
+            if emitted.get(finding_dedupe_key(item)) == sig:
+                return
+            emitted[finding_dedupe_key(item)] = sig
+        emit_event(run_dir, "finding_settled", **finding_settled_payload(item, verdict, stage))
+
+    # Parse failures land in verification.json, so the live feed must carry them too or the live
+    # rejected panel/count would disagree with the poll fallback (rows flickering in and out).
+    for pr in (parse_rejections or []):
+        emit_settled(pr, "rejected")
+
     def check_one(finding: dict) -> tuple[dict, dict]:
         item = dict(finding)
+        # A user-blocked domain is rejected regardless of liveness — skip the network round-trip.
+        if excluded_sites and item.get("url") and url_in_sites(item.get("url"), excluded_sites):
+            return item, {"ok": False, "reason": "excluded_site"}
         url_check = verify_url(item.get("url"))
         if url_check.get("ok"):
             apply_live_check(item, intent)
@@ -1109,14 +1379,28 @@ def verify_findings(
         for future in concurrent.futures.as_completed(futures):
             item, url_check = future.result()
             item["url_check"] = url_check
-            reasons = rejection_reasons(item, url_check, sites, intent)
+            reasons = rejection_reasons(item, url_check, sites, intent, excluded_sites)
             if reasons:
                 item["reasons"] = reasons
                 rejected.append(item)
+                verdict = "rejected"
             else:
                 verified.append(item)
+                verdict = "verified"
+            # Stream each result the moment it settles so the UI fills in live, tagged by the stage.
+            emit_settled(item, verdict)
 
     return sort_by_usd(verified), sort_by_usd(rejected)
+
+
+def record_stage_results(run_dir: Path, stage: str, verified: list[dict], rejected: list[dict]) -> None:
+    """After a phase: persist the cumulative verified/rejected (so the 2s poll fallback and a
+    mid-run reload stay progressive) and emit a stage_summary the UI uses for the per-stage yield
+    view ("rescue 1 took us from 5 → 9 verified"). Counts match the persisted lists (and the live
+    finding_settled stream, which now carries parse failures too) so the live view and the poll
+    fallback never disagree."""
+    write_json(run_dir / "verification.json", {"stage": stage, "verified": verified, "rejected": rejected})
+    emit_event(run_dir, "stage_summary", stage=stage, verified_total=len(verified), rejected_total=len(rejected))
 
 
 def sort_by_usd(items: list[dict]) -> list[dict]:
@@ -1137,24 +1421,77 @@ def build_decompose_prompt(user_prompt: str, config: dict) -> str:
             "stores/providers — and put those venues into preferred_sites per task."
         )
     )
+    excluded = config.get("excluded_sites") or []
+    if excluded:
+        site_rule += (f"\nNEVER plan tasks that target these user-BLOCKED domains and never list them "
+                      f"in preferred_sites: {', '.join(excluded)}.")
+    n = config["task_count"]
+    structured = bool(config.get("structured_decompose"))
+    n_angle = int(config.get("angle_variants_per_task") or 0)
+
+    # §1.2 Least-to-most: when on, tasks form a (source_class x angle) coverage grid so different
+    # source classes are each owned by their own task; otherwise free-form tasks (legacy behaviour).
+    if structured:
+        task_rule = (
+            f"Produce a COVERAGE GRID, not free-form tasks: up to {n} independent web-search tasks so that\n"
+            "DIFFERENT source-CLASSES are each covered by their own task. For EACH task set:\n"
+            "- \"source_class\": one of official_store | big_marketplace | classifieds | refurb_used |\n"
+            "  forums_telegram | regional — pick the classes this subject plausibly has, one task each.\n"
+            "- \"angle\": one line naming the angle (e.g. \"exact SKU on official store\", \"used/refurb units\").\n"
+            "Do NOT give two tasks the same (source_class, angle)."
+        )
+    else:
+        task_rule = (
+            f"Create up to {n} independent web-search tasks for finding current purchasable offers.\n"
+            "Each task must be useful if run independently by another model; cover different venues."
+        )
+
+    # §3.1 Angle variants (gated): a SEPARATE field from surface query_variants.
+    angle_rule = (
+        f"\nALSO give {n_angle} \"angle_variants\" per task: queries approaching the SAME subject from\n"
+        "ORTHOGONAL angles — equivalent/compatible model, bundle/lot wording, regional/slang names,\n"
+        "use-case framing. These are NOT surface synonyms; ground them in how this product CLASS is\n"
+        "actually sold. ALWAYS keep query_variants[0] as the exact literal-SKU match."
+        if n_angle > 0 else ""
+    )
+
+    grid_schema = ',\n      "source_class": "big_marketplace", "angle": "what angle this task takes"' if structured else ""
+    angle_schema = ',\n      "angle_variants": ["orthogonal-angle query 1"]' if n_angle > 0 else ""
+
     return f"""You are the thin planning brain for a multi-model offer research system.
 The subject can be ANYTHING purchasable or rentable: a product, a service, a subscription plan,
-an account, real estate, a vehicle. First reason about what the request actually involves
-(which tiers/variants/sellers exist, where such offers are listed), then split the work so
-different angles and venues are covered by independent tasks.
+an account, real estate, a vehicle.
 Return ONLY valid JSON. No Markdown.
 
 User request:
 {user_prompt}
 
-Create {config["task_count"]} independent web-search tasks for finding current purchasable offers.
+FIRST, before emitting tasks, silently self-ask and RESOLVE (do NOT ask the user — proceed with the
+most likely reading; this only enriches the plan):
+- The canonical product/model/edition this maps to, plus its real-world ALIASES, transliterations
+  (latin↔cyrillic, e.g. "макбук"), SKU/model codes (e.g. A2681), and common misspellings.
+- Which tiers / variants / pack sizes exist, and which one the user means.
+- The implied region / currency / language.
+- Whether the request is genuinely ambiguous: if two readings would MATERIALLY change
+  subject_keywords, set intent.ambiguous=true and list the competing readings in intent.alternatives.
+- The PRICING BASIS the user shops on: paid once (one_time), a recurring subscription (monthly /
+  yearly), metered by usage (per token / per request / per GB), per seat, or a rental. If the user
+  says "cheapest subscription / plan / paid tier", they want a PAID recurring offering — a FREE tier
+  is NOT a valid answer. If they gave a reference price, note ITS basis too (e.g. an official
+  per-token API price is a different basis than a monthly subscription and must not be compared raw).
+Use the resolved aliases when writing queries and subject_keywords.
+
+THEN classify the request into intent.complexity = single_sku | comparison | broad_category |
+multi_constraint. For a trivial single_sku lookup you MAY return as few as 2 tasks; for broad or
+multi_constraint use the full {n}. NEVER exceed {n} tasks.
+
+{task_rule}
 {site_rule}
-Each task must be useful if run independently by another model.
 Write plain queries WITHOUT search operators like site: — put domains in preferred_sites instead.
 For each task ALSO give 2-3 "query_variants": alternate SURFACE phrasings of the SAME query that
 beat search engines' phrase-adjacency (a query "macbook air m2" misses a listing titled "Apple
-MacBook Air 2022 M2"). Vary: word order, synonyms, transliteration (latin↔cyrillic, e.g. "макбук"),
-model/SKU codes (e.g. A2681), year/spec reorderings. They search the SAME thing, not a new angle.
+MacBook Air 2022 M2"). Vary: word order, synonyms, transliteration, model/SKU codes, year/spec
+reorderings. They search the SAME thing, not a new angle.{angle_rule}
 
 ALSO extract an "intent" object that the verifier and judge will enforce:
 - subject_keywords: words/phrases that a RELEVANT result's title MUST contain (the actual thing
@@ -1166,18 +1503,30 @@ ALSO extract an "intent" object that the verifier and judge will enforce:
 - official_price / official_currency: the official/reference price the user wants to BEAT (they
   said "cheaper than $100" → 100, "USD"); offers at-or-above this are rejected. null if none.
 - cheaper_than_official: true if the user explicitly wants STRICTLY BELOW the official price.
+- price_basis: the pricing dimension of the request — one of one_time | subscription_monthly |
+  subscription_yearly | usage_metered | per_seat_monthly | rental_monthly | unknown. Use unknown only
+  if truly indeterminate.
+- official_price_basis: if official_price is on a DIFFERENT basis than price_basis (e.g. the
+  reference is per-token but the user shops per month), name that basis here; else repeat price_basis.
+- free_ok: true if a $0 / free option is acceptable; FALSE when the user explicitly wants something
+  PAID ("cheapest subscription", "cheapest paid plan") — then a free offer must never be the answer.
+- monthly_usage_units: if the request implies a usage volume that lets a per-token/metered price be
+  converted to a monthly cost (e.g. "~1M tokens/month"), put that NUMBER here; else null.
+- usage_unit: what monthly_usage_units counts ("tokens", "requests", "gb"); else null.
 
 Schema:
 {{
   "tasks": [
     {{"id": "task-1", "query": "specific search query", "focus": "what to verify",
-      "query_variants": ["alt phrasing 1", "alt phrasing 2"],
+      "query_variants": ["alt phrasing 1", "alt phrasing 2"]{angle_schema}{grid_schema},
       "preferred_sites": ["olx.ua", "prom.ua"]}}
   ],
   "intent": {{
     "subject_keywords": ["..."], "exclude_keywords": ["..."],
     "required_tier": null, "official_price": null, "official_currency": null,
-    "cheaper_than_official": false
+    "cheaper_than_official": false, "price_basis": "unknown", "official_price_basis": "unknown",
+    "free_ok": true, "monthly_usage_units": null, "usage_unit": null,
+    "complexity": "single_sku", "ambiguous": false, "alternatives": []
   }}
 }}
 """
@@ -1249,26 +1598,39 @@ def coerce_tasks(payload: object, user_prompt: str, config: dict) -> list[dict]:
         preferred = [site for site in (normalize_site(s) for s in preferred) if site]
         if run_sites:
             preferred = [site for site in preferred if site in run_sites] or list(run_sites)
-        raw_variants = raw.get("query_variants") or []
-        if not isinstance(raw_variants, list):
-            raw_variants = [str(raw_variants)]
-        variants, seen_v = [], {query.lower()}
-        for v in raw_variants:
-            v = str(v or "").strip()
-            if v and v.lower() not in seen_v:
-                seen_v.add(v.lower())
-                variants.append(v)
-        tasks.append(
-            {
-                "id": str(raw.get("id") or f"task-{idx}"),
-                "query": query,
-                "query_variants": variants[:4],
-                "focus": str(raw.get("focus") or "Find current purchasable offers with verified URLs."),
-                "preferred_sites": preferred,
-            }
-        )
+        def clean_variants(key: str) -> list[str]:
+            raw_v = raw.get(key) or []
+            if not isinstance(raw_v, list):
+                raw_v = [str(raw_v)]
+            out, seen = [], {query.lower()}
+            for v in raw_v:
+                v = str(v or "").strip()
+                if v and v.lower() not in seen:
+                    seen.add(v.lower())
+                    out.append(v)
+            return out
 
-    return tasks if len(tasks) >= 3 else fallback_tasks(user_prompt, config)
+        task = {
+            "id": str(raw.get("id") or f"task-{idx}"),
+            "query": query,
+            "query_variants": clean_variants("query_variants")[:4],
+            "focus": str(raw.get("focus") or "Find current purchasable offers with verified URLs."),
+            "preferred_sites": preferred,
+        }
+        # Structured-decompose / angle-expansion fields (effort >=3). Preserved when the brain emits
+        # them; harmless and ignored downstream when the effort profile keeps those features off.
+        angle_variants = clean_variants("angle_variants")[:3]
+        if angle_variants:
+            task["angle_variants"] = angle_variants
+        if raw.get("source_class"):
+            task["source_class"] = str(raw.get("source_class")).strip().lower()
+        if raw.get("angle"):
+            task["angle"] = str(raw.get("angle")).strip()
+        tasks.append(task)
+
+    # Floor of 2 (not 3): the complexity classifier may legitimately emit a 2-task plan for a
+    # trivial single-SKU lookup; only fall back when the brain returned a degenerate result.
+    return tasks if len(tasks) >= 2 else fallback_tasks(user_prompt, config)
 
 
 # Ordered tier ladder for subscription/account-style products; index = rank (higher = stronger).
@@ -1342,6 +1704,9 @@ def default_intent() -> dict:
     return {
         "subject_keywords": [], "exclude_keywords": [],
         "required_tier": None, "official_price_usd": None, "cheaper_than_official": False,
+        "ambiguous": False, "alternatives": [], "complexity": None,
+        "price_basis": "unknown", "official_price_basis": "unknown", "free_ok": True,
+        "monthly_usage_units": None, "usage_unit": None, "official_price_monthly_usd": None,
     }
 
 
@@ -1362,12 +1727,37 @@ def coerce_intent(payload: object) -> dict:
     intent["cheaper_than_official"] = bool(raw.get("cheaper_than_official"))
     official = parse_price(raw.get("official_price"))
     intent["official_price_usd"] = to_usd(official, raw.get("official_currency") or "USD") if official else None
+    # Pricing basis (the axis the user shops on / the reference price lives on) + free/usage knobs.
+    intent["price_basis"] = canon_basis(raw.get("price_basis"))
+    ob = canon_basis(raw.get("official_price_basis"))
+    intent["official_price_basis"] = ob if ob != "unknown" else intent["price_basis"]
+    intent["free_ok"] = raw.get("free_ok") is not False  # explicit false only; null/missing => True
+    intent["monthly_usage_units"] = parse_count(raw.get("monthly_usage_units"))
+    intent["usage_unit"] = str(raw.get("usage_unit") or "").strip().lower() or None
+    intent["official_price_monthly_usd"] = (
+        to_monthly_usd(intent["official_price_usd"], intent["official_price_basis"], intent)
+        if intent["official_price_usd"] else None
+    )
+    intent["ambiguous"] = bool(raw.get("ambiguous"))
+    intent["alternatives"] = strlist(raw.get("alternatives"))[:4]
+    complexity = str(raw.get("complexity") or "").strip().lower()
+    intent["complexity"] = complexity if complexity in {"single_sku", "comparison", "broad_category", "multi_constraint"} else None
     return intent
+
+
+def _flag_incomparable_basis(finding: dict, intent: dict) -> None:
+    finding["basis_flag"] = "incomparable_basis"
+    finding["basis_note"] = (
+        f"offer is {canon_basis(finding.get('price_basis'))}, target price is "
+        f"{canon_basis(intent.get('official_price_basis'))} — not directly comparable")
 
 
 def intent_rejection(finding: dict, intent: dict | None) -> str | None:
     """Reject findings that don't match what the user actually asked for: wrong product
-    (exclude keyword / no subject keyword), wrong tier, or not below the official price."""
+    (exclude keyword / no subject keyword), wrong tier, a free tier when a PAID one was asked for,
+    or a price at/above the official reference ON THE SAME PRICING BASIS. Prices on a different,
+    non-normalizable basis are TAGGED incomparable_basis and KEPT, never dropped. May mutate the
+    finding (basis_flag / basis_note / price_usd_monthly) — it runs on a mutable per-item copy."""
     if not intent:
         return None
     text = " ".join(str(finding.get(f) or "") for f in ("title", "evidence", "marketplace")).lower()
@@ -1384,10 +1774,35 @@ def intent_rejection(finding: dict, intent: dict | None) -> str | None:
         # is told the required tier so it can flag tier-unknown items rather than drop them.
         if ft is not None and ft < req_rank:
             return "wrong_tier"
+
+    # Free exclusion: when the user wants a PAID offering, a free/$0 tier is not a valid "cheapest".
+    # parse_price maps 0 -> None, so free is detected via the reported basis, not the price number.
+    if not intent.get("free_ok", True) and canon_basis(finding.get("price_basis")) == "free":
+        return "free_excluded"
+
     ceiling = intent.get("official_price_usd")
     if intent.get("cheaper_than_official") and ceiling and finding.get("price_usd") is not None:
-        if finding["price_usd"] >= ceiling:
-            return "not_below_official"
+        f_usd = finding["price_usd"]
+        f_cls = basis_class(finding.get("price_basis"))
+        ceil_cls = basis_class(intent.get("official_price_basis"))  # compare on the CEILING's axis
+        # Unknown basis on either side: keep the legacy raw-USD comparison (back-compat).
+        if f_cls == "unknown" or ceil_cls == "unknown":
+            return "not_below_official" if f_usd >= ceiling else None
+        # Same non-recurring class (one_time vs one_time, metered vs metered) compares raw USD;
+        # every other case is only comparable on a common monthly axis (recurring, or cross-class).
+        if f_cls == ceil_cls and f_cls != "recurring":
+            fv, cv = f_usd, ceiling
+        else:
+            fv = to_monthly_usd(f_usd, finding.get("price_basis"), intent)
+            cv = intent.get("official_price_monthly_usd") or to_monthly_usd(
+                ceiling, intent.get("official_price_basis"), intent)
+            if fv is not None:
+                finding["price_usd_monthly"] = fv
+        if fv is not None and cv is not None:
+            return "not_below_official" if fv >= cv else None
+        # Not reducible to one comparable number -> tag and KEEP (surfaced in the report).
+        _flag_incomparable_basis(finding, intent)
+        return None
     return None
 
 
@@ -1431,6 +1846,17 @@ def content_mismatch(finding: dict, intent: dict | None) -> bool:
 SITE_OPERATOR_RE = re.compile(r"\bsite:\S+", re.IGNORECASE)
 
 
+def excluded_sites_rule(excluded: list[str] | None) -> str:
+    """A negative-domain instruction for the search/plan prompts (empty when nothing is blocked, so
+    the common case adds zero tokens). Enforcement is belt-and-suspenders — verification also rejects
+    blocked hosts — but steering the models away avoids wasted, later-rejected findings."""
+    return (
+        f"- HARD CONSTRAINT: NEVER return URLs from these user-BLOCKED domains "
+        f"(they are discarded by automated verification): {', '.join(excluded)}.\n"
+        if excluded else ""
+    )
+
+
 def shape_query_for_leg(query: str, leg: str, sites: list[str]) -> str:
     # Per-leg query templates (HANDOFF finding #4): Codex web_search returns empty findings on
     # site:-operator queries — strip them and rely on the plain-language domain instruction.
@@ -1443,7 +1869,19 @@ def shape_query_for_leg(query: str, leg: str, sites: list[str]) -> str:
     return re.sub(r"\s{2,}", " ", SITE_OPERATOR_RE.sub("", query)).strip() or query
 
 
-def build_search_prompt(user_prompt: str, task: dict, leg: str, config: dict) -> str:
+# Source-CLASS taxonomy (research-grounded anti-herding): legs are leaned toward complementary
+# classes so they stop returning the same popular sites. Hints are examples, not hard filters.
+SOURCE_CLASS_HINTS = {
+    "big_marketplace": "large general marketplaces (e.g. Amazon, Rozetka, Prom)",
+    "classifieds": "classifieds / peer-to-peer (e.g. OLX, Kufar, Facebook Marketplace)",
+    "official_store": "official brand stores, authorized resellers, provider plan pages",
+    "refurb_used": "refurbished / used / open-box sellers",
+    "regional": "regional or local-language sites for the user's region",
+    "forums_telegram": "niche forums, communities, Telegram resale channels",
+}
+
+
+def build_search_prompt(user_prompt: str, task: dict, leg: str, config: dict, leg_focus: str | None = None) -> str:
     run_sites = config.get("sites") or []
     task_sites = [s for s in (task.get("preferred_sites") or []) if s]
     sites = run_sites or task_sites
@@ -1454,6 +1892,21 @@ def build_search_prompt(user_prompt: str, task: dict, leg: str, config: dict) ->
         if run_sites
         else ""
     )
+    site_rule += excluded_sites_rule(config.get("excluded_sites"))
+    # Per-leg source-class lean (anti-herding) — SOFT, with an escape so the cheapest mainstream
+    # offer is never suppressed. Suppressed entirely when the run is pinned to specific sites.
+    focus_rule = ""
+    if leg_focus and not run_sites:
+        focus_rule = (
+            f"- SOURCE-CLASS LEAN: prioritize {SOURCE_CLASS_HINTS.get(leg_focus, leg_focus)} this round. "
+            f"Other models cover other source classes, so look beyond the obvious top-2 marketplaces — "
+            f"but DO still return a clearly better/cheaper offer from ANY source if you find one.\n"
+        )
+    if task.get("_angle"):
+        focus_rule += (
+            "- ORTHOGONAL ANGLE: this query approaches the subject from a different framing; explore "
+            "that angle, but every result must still be the SAME thing the user actually wants.\n"
+        )
     return f"""You are a web research worker for current offers of ANY kind — a product, a
 service, a subscription, an account, real estate, a vehicle: anything purchasable OR rentable.
 Work independently. Do not assume another model will fill gaps.
@@ -1468,7 +1921,7 @@ Focus: {task.get("focus")}
 Preferred sites: {", ".join(sites) or "none"}
 
 Rules:
-{site_rule}
+{site_rule}{focus_rule}
 - Return direct listing/offer URLs (a product page, a rental listing, a provider's plan page),
   not category or search pages when avoidable.
 - Unknown fields must be null. Do not invent prices, stock, location, shipping, or URLs.
@@ -1481,6 +1934,10 @@ Rules:
   not the cheapest bundled option. If the user asked for a minimum tier, return that tier's price.
 - A price far below market with no explanation is a scam signal — still report the item, but say
   so in evidence and lower confidence. The user wants working, honestly-described items.
+- Report the PRICE BASIS in "price_basis": one_time | subscription_monthly | subscription_yearly |
+  usage_metered | per_seat_monthly | rental_monthly | free. A $0 / "Free" offer MUST be reported with
+  price_basis="free" (leave price null) — do not silently omit it. Do not compare a monthly price to
+  a yearly or per-token one; just report each offer's OWN basis and its native price.
 - Include only current offers that look relevant to the original request.
 
 Schema:
@@ -1495,6 +1952,7 @@ Schema:
       "availability": "in stock / available / out of stock / sold / unknown",
       "condition": "new / used-good / damaged / for parts / unknown",
       "tier": "the specific variant this price is for, or null",
+      "price_basis": "one_time | subscription_monthly | subscription_yearly | usage_metered | per_seat_monthly | rental_monthly | free",
       "seller": "trust signals: rating, reviews, account age, or null",
       "location": "city or region or null",
       "shipping": "shipping details or null",
@@ -1507,10 +1965,12 @@ Schema:
 """
 
 
-def build_frontier_prompt(user_prompt: str, ceiling_usd: float, run_sites: list[str], intent: dict | None) -> str:
+def build_frontier_prompt(user_prompt: str, ceiling_usd: float, run_sites: list[str], intent: dict | None,
+                          excluded: list[str] | None = None) -> str:
     """Targeted search for offers STRICTLY cheaper than the current best credible price — the
     frontier round pushes the price floor down or proves nothing cheaper-and-credible exists."""
     site_rule = (f"- HARD CONSTRAINT: only URLs on these domains: {', '.join(run_sites)}.\n" if run_sites else "")
+    site_rule += excluded_sites_rule(excluded)
     subj = ", ".join((intent or {}).get("subject_keywords") or []) or "the requested item"
     return f"""You are a price-FRONTIER research worker. The best credible offer found so far is
 about ${ceiling_usd:.2f} USD. Find CURRENTLY AVAILABLE, credible offers for the SAME thing
@@ -1524,19 +1984,24 @@ Rules:
 {site_rule}- Every returned offer MUST be plausibly below ${ceiling_usd:.2f} USD (convert from native currency).
 - It must be the SAME thing the user wants (right product/tier), working and honestly described —
   a cheaper price on a damaged / for-parts / wrong-tier / scam-flavored item does NOT count.
+- Only offers on the SAME pricing basis as the target count as cheaper. Convert period
+  (yearly→monthly) or usage before claiming an offer is cheaper; never present a one-time price as
+  cheaper than a subscription. Report each offer's price_basis.
 - Return direct listing/offer URLs with native price + currency code. Unknown fields null.
 - If there is genuinely nothing credible below ${ceiling_usd:.2f}, return an empty findings array.
 
 Schema:
 {{"findings": [{{"title": "...", "price": 0, "currency": "USD", "url": "https://...",
-  "marketplace": "...", "availability": "...", "condition": "...", "tier": null,
+  "marketplace": "...", "availability": "...", "condition": "...", "tier": null, "price_basis": null,
   "seller": "...", "location": null, "shipping": null, "evidence": "...", "confidence": 0.0}}]}}
 """
 
 
 def credible_floor_usd(verified: list[dict]) -> float | None:
-    """Lowest USD price among non-disputed verified findings — the current frontier."""
-    prices = [v.get("price_usd") for v in verified if v.get("price_usd") is not None and not v.get("disputed")]
+    """Lowest USD price among non-disputed verified findings — the current frontier. Skips items
+    tagged incomparable_basis (a different pricing axis must not set a bogus 'cheapest' floor)."""
+    prices = [v.get("price_usd") for v in verified
+              if v.get("price_usd") is not None and not v.get("disputed") and not v.get("basis_flag")]
     return min(prices) if prices else None
 
 
@@ -1656,13 +2121,74 @@ def apply_confidence(verified: list[dict]) -> None:
 def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: dict, intent: dict | None, round_no: int) -> list[dict]:
     """One frontier sweep: each search leg hunts strictly below the ceiling."""
     search_legs = config.get("search_legs") or ["codex", "gemini"]
-    fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent)
+    fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent, config.get("excluded_sites"))
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(search_legs))) as executor:
         futures = [
             executor.submit(call_model, leg, fp, run_dir, "frontier", f"frontier-{round_no}",
-                            timeout, config["search_effort"], "sonnet" if leg == "claude" else None)
+                            timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
             for leg in search_legs
+        ]
+        return collect_with_straggler_drop(futures, run_dir, config)
+
+
+def covered_source_classes(verified: list[dict], tasks: list[dict]) -> set[str]:
+    """Which source-classes already produced a credible verified finding (via task_id -> task)."""
+    by_id = {t["id"]: t.get("source_class") for t in tasks if t.get("source_class")}
+    covered = set()
+    for f in verified:
+        sc = by_id.get(str(f.get("task_id") or "").split("#")[0])
+        if sc:
+            covered.add(sc)
+    return covered
+
+
+def build_coverage_prompt(user_prompt: str, source_class: str, avoid_hosts: list[str],
+                          run_sites: list[str], intent: dict | None, excluded: list[str] | None = None) -> str:
+    """Targeted search of ONE source-class that earlier rounds left empty — chases UNCOVERED space
+    (distinct from rescue, which recovers rejected items, and frontier, which chases a lower price)."""
+    subj = ", ".join((intent or {}).get("subject_keywords") or []) or "the requested item"
+    site_rule = (f"- HARD CONSTRAINT: only URLs on these domains: {', '.join(run_sites)}.\n" if run_sites else "")
+    site_rule += excluded_sites_rule(excluded)
+    avoid_rule = (f"- These hosts are already saturated; look ELSEWHERE, do not just re-return them: "
+                  f"{', '.join(avoid_hosts)}.\n" if avoid_hosts and not run_sites else "")
+    return f"""You are a COVERAGE-GAP research worker. Earlier rounds found NOTHING credible from one
+class of sources. Find CURRENTLY AVAILABLE, credible offers for the SAME thing ({subj}) SPECIFICALLY
+from: {SOURCE_CLASS_HINTS.get(source_class, source_class)}.
+Use live web results. Return ONLY valid JSON. No Markdown.
+
+Original user request:
+{user_prompt}
+
+Rules:
+{site_rule}{avoid_rule}- It must be the SAME thing the user wants (right product/tier), working and honestly described.
+- Return direct listing/offer URLs with native price + currency code. Unknown fields null.
+- If this source class genuinely has nothing credible, return an empty findings array (do NOT pad).
+
+Schema:
+{{"findings": [{{"title": "...", "price": 0, "currency": "USD", "url": "https://...",
+  "marketplace": "...", "availability": "...", "condition": "...", "tier": null,
+  "seller": "...", "location": null, "shipping": null, "evidence": "...", "confidence": 0.0}}]}}
+"""
+
+
+def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: list[str],
+                       run_dir: Path, config: dict, intent: dict | None) -> list[dict]:
+    """One coverage sweep: each empty source-class gets a targeted search, round-robin across legs
+    (negative-space exploration — cross-check still happens at verify, so no need for all legs)."""
+    search_legs = config.get("search_legs") or ["codex", "gemini"]
+    run_sites = config.get("sites") or []
+    timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
+    jobs = [(search_legs[i % len(search_legs)], sc) for i, sc in enumerate(missing_classes)]
+    if not jobs:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
+        futures = [
+            executor.submit(call_model, leg,
+                            build_coverage_prompt(prompt, sc, avoid_hosts, run_sites, intent, config.get("excluded_sites")),
+                            run_dir, "coverage", f"coverage-{sc}",
+                            timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
+            for leg, sc in jobs
         ]
         return collect_with_straggler_drop(futures, run_dir, config)
 
@@ -1689,6 +2215,9 @@ def build_recheck_prompt(user_prompt: str, rejected_item: dict, config: dict) ->
         if sites
         else ""
     )
+    excluded = config.get("excluded_sites") or []
+    if excluded:
+        site_rule += f"\n- HARD CONSTRAINT: do NOT recover the item on these user-BLOCKED domains: {', '.join(excluded)}."
     return f"""You are the second-pass verifier for an offer research system.
 Return ONLY valid JSON. No Markdown.
 
@@ -1758,6 +2287,52 @@ def diversify(items: list[dict], cap_fraction: float = 0.5, min_per_host: int = 
     return lead + overflow
 
 
+# Maximal Marginal Relevance (Carbonell & Goldstein 1998): order the shortlist by
+# λ·relevance − (1−λ)·max_similarity_to_already_picked, so near-duplicates (same host/seller/
+# region/condition/price-band) stop crowding out credible alternatives. λ high → price/trust stay
+# dominant; it only re-orders/demotes near-dups, never promotes an irrelevant cheaper item.
+# Exact listing-ID dupes are already removed upstream by dedupe_findings; MMR adds same-host/near-dup
+# spreading on top of that. Deterministic, stdlib-only.
+MMR_LAMBDA = env_float("RESEARCH_MMR_LAMBDA", 0.7)
+_MMR_WEIGHTS = {"host": 0.6, "seller": 0.2, "loc": 0.1, "cond": 0.05, "band": 0.05}
+
+
+def _mmr_features(item: dict) -> dict:
+    price = item.get("price_usd")
+    return {
+        "host": host_of(item.get("url")) or None,
+        "seller": (str(item.get("seller") or "").strip().lower()[:40] or None),
+        "loc": (str(item.get("location") or "").strip().lower() or None),
+        "cond": (str(item.get("condition") or "").strip().lower() or None),
+        "band": None if price is None else round(math.log10(price + 1) * 3),  # coarse log price band
+    }
+
+
+def _mmr_sim(fa: dict, fb: dict) -> float:
+    return sum(w for k, w in _MMR_WEIGHTS.items() if fa.get(k) is not None and fa.get(k) == fb.get(k))
+
+
+def mmr_order(items: list[dict], lam: float = MMR_LAMBDA) -> list[dict]:
+    """items must already be in best-first relevance order (e.g. trust_rank_key sorted)."""
+    n = len(items)
+    if n <= 2:
+        return list(items)
+    feats = [_mmr_features(it) for it in items]
+    rel = [1.0 - i / n for i in range(n)]  # rank position is the relevance proxy
+    selected: list[int] = []
+    remaining = list(range(n))
+    while remaining:
+        best_i, best_score = remaining[0], -1e18
+        for i in remaining:
+            sim = max((_mmr_sim(feats[i], feats[j]) for j in selected), default=0.0)
+            score = lam * rel[i] - (1.0 - lam) * sim
+            if score > best_score:
+                best_score, best_i = score, i
+        selected.append(best_i)
+        remaining.remove(best_i)
+    return [items[i] for i in selected]
+
+
 def build_synthesis_prompt(
     user_prompt: str,
     tasks: list[dict],
@@ -1769,7 +2344,7 @@ def build_synthesis_prompt(
 ) -> str:
     unconfirmed = [item for item in rejected if is_rescuable(item)]
     dead = [item for item in rejected if not is_rescuable(item)]
-    ordered = diversify(sorted(verified, key=trust_rank_key))
+    ordered = mmr_order(sorted(verified, key=trust_rank_key))
     requested_sites = config.get("sites") or [s for t in tasks for s in (t.get("preferred_sites") or [])]
     found_hosts = host_distribution(verified)
     zero_result_sites = sorted(set(requested_sites) - set(found_hosts))
@@ -1803,6 +2378,16 @@ Ranking rules:
 - Prices are in price_usd (USD, comparable). Show USD; you may also show the native price/currency.
 - If intent.cheaper_than_official with an official_price_usd, every option you recommend MUST be
   strictly below it; never present the official price as a find.
+- PRICING BASIS: intent.price_basis says whether the user shops one_time / subscription
+  (monthly|yearly) / usage-metered / per-seat. Compare like with like — each finding carries
+  price_basis and, when computable, price_usd_monthly. NEVER call a smaller number the winner if it
+  is on a DIFFERENT basis (e.g. a one-time purchase vs a monthly subscription, or a per-token rate
+  vs a monthly plan); say plainly they are not directly comparable.
+- Findings tagged basis_flag="incomparable_basis" could not be normalized to the user's basis (see
+  basis_note): present them in a separate note explaining WHY; do not rank them against comparable
+  offers or call them the cheapest.
+- If intent.free_ok is false, a free / $0 offer is NOT a valid "cheapest" answer — exclude it from
+  the recommendation and mention it only as context.
 - Rank by fit × seller TRUST × price. Each finding carries trust.score (0..1) and trust.signals
   (established account, has reviews, business seller, far-below-market, damaged, scam wording,
   disputed). A higher-trust slightly-pricier listing beats a low-trust cheaper one; never lead
@@ -1822,7 +2407,7 @@ Also include:
   ones in a separate "Unverified — check manually" section with URLs and what to verify.
 - If degraded_legs is set, one of the search models failed — state it as a Markdown blockquote AT
   THE VERY TOP (`> WARNING: ...`). Never present this warning as the best pick or first section.
-- Each finding carries confidence_calibrated {score, band: high/medium/low, factors} combining
+- Each finding carries confidence_calibrated {{score, band: high/medium/low, factors}} combining
   cross-model agreement, live verification, seller trust and the model's own confidence. State the
   confidence of your top pick honestly (e.g. "high confidence — 3 models agree, live-verified,
   trusted seller" or "low — single source, not live-verified"); prefer a high-confidence option
@@ -1973,6 +2558,10 @@ def call_model(
         env["CODEX_EFFORT"] = effort
     if leg == "claude" and claude_model:
         env["CLAUDE_MODEL"] = claude_model
+    if leg == "gemini":
+        gemini_label = run_gemini_model(run_id)
+        if gemini_label:
+            env["AGY_MODEL"] = gemini_label
     # Isolate any file the leg's agent might write (agy's --print is agentic and its --sandbox is
     # only "terminal restrictions", NOT a write guard) into a throwaway per-call scratch dir,
     # never the project root. The audit log must still land in the real data/ dir, so pin it.
@@ -2154,6 +2743,8 @@ def init_run(prompt: str, config: dict) -> Path:
                 "enabled_legs": config.get("enabled_legs") or list(ALL_VENDORS),
                 "disabled_legs": config.get("disabled_legs") or [],
                 "sites": config.get("sites") or [],
+                "excluded_sites": config.get("excluded_sites") or [],
+                "vendor_tiers": config.get("vendor_tiers") or {},
             },
             "created_at": utc_now(),
             "updated_at": utc_now(),
@@ -2337,10 +2928,10 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
     return records
 
 
-def task_query_set(task: dict, n: int) -> list[dict]:
-    """Expand a task into up to n surface-form query variants (base query first). Each variant is
-    a task-shaped dict with its own query + a distinct id so the activity view can tell them apart;
-    results union back together via listing-ID dedupe. n=1 → just the base query (no expansion)."""
+def task_query_set(task: dict, n: int, n_angle: int = 0) -> list[dict]:
+    """Expand a task into up to n surface-form query variants (base query first), plus up to n_angle
+    ORTHOGONAL-ANGLE variants (effort-gated). Each variant is a task-shaped dict with a distinct id;
+    results union back via listing-ID dedupe. n=1, n_angle=0 → just the base query (no expansion)."""
     queries, seen = [str(task.get("query") or "").strip()], set()
     seen.add(queries[0].lower())
     for v in (task.get("query_variants") or []):
@@ -2348,23 +2939,46 @@ def task_query_set(task: dict, n: int) -> list[dict]:
         if v and v.lower() not in seen:
             seen.add(v.lower())
             queries.append(v)
-    queries = [q for q in queries if q][:max(1, n)]
-    return [
+    surface = [q for q in queries if q][:max(1, n)]
+    out = [
         {**task, "query": q, "id": task["id"] if i == 0 else f'{task["id"]}#v{i + 1}'}
-        for i, q in enumerate(queries)
+        for i, q in enumerate(surface)
     ]
+    if n_angle > 0:
+        angles = []
+        for v in (task.get("angle_variants") or []):
+            v = str(v or "").strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                angles.append(v)
+        for j, q in enumerate(angles[:n_angle], start=1):
+            out.append({**task, "query": q, "id": f'{task["id"]}#a{j}', "_angle": True})
+    return out
 
 
 def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: dict) -> list[dict]:
-    # Three families search in parallel when the effort profile enables Claude (effort 3-4).
-    # Claude searches on SONNET (cheap; Opus is reserved for the judge/arbiter seat) and runs
-    # under its own tight concurrency + per-run budget, so the capped pool isn't drained.
-    # Each task is also expanded into query variants (beats search phrase-adjacency; effort-gated)
-    # — results union via listing-ID dedupe. Leg budgets + straggler drop bound the extra fan-out.
+    # All three families search in parallel at every level. Claude searches at the per-profile
+    # claude_search_model tier (opus) under its own tight concurrency + per-run budget, so the
+    # capped daily pool isn't drained (paced_budget trims it, drop-from-search removes Claude when
+    # the day is starved). Each task is also expanded into query variants (beats search
+    # phrase-adjacency; effort-gated) — results union via listing-ID dedupe. Leg budgets +
+    # straggler drop bound the extra fan-out.
     search_legs = config.get("search_legs") or ["codex", "gemini"]
     n_variants = config.get("query_variants_per_task", 1)
-    expanded = [tv for task in tasks for tv in task_query_set(task, n_variants)]
-    jobs = [(leg, tv) for tv in expanded for leg in search_legs]
+    n_angle = int(config.get("angle_variants_per_task") or 0)
+    expanded = [tv for task in tasks for tv in task_query_set(task, n_variants, n_angle)]
+    # Anti-herding (effort >=3): every leg still searches every task (cross-check preserved), but
+    # each gets a DIFFERENT source-class lean via rotation so legs explore complementary negative
+    # space instead of all returning the same popular sites. SOFT lean (return strong offers from
+    # anywhere), and big_marketplace stays in the rotation, so the cheapest mainstream offer is never
+    # suppressed. off (effort 1-2) -> leg_focus=None -> byte-for-byte the old identical-prompt behaviour.
+    differentiate = bool(config.get("differentiate_legs"))
+    classes = list(SOURCE_CLASS_HINTS)
+    jobs = [
+        (leg, tv, (classes[(l_idx + t_idx) % len(classes)] if differentiate else None))
+        for t_idx, tv in enumerate(expanded)
+        for l_idx, leg in enumerate(search_legs)
+    ]
 
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
@@ -2372,15 +2986,15 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
             executor.submit(
                 call_model,
                 leg,
-                build_search_prompt(prompt, tv, leg, config),
+                build_search_prompt(prompt, tv, leg, config, leg_focus=focus),
                 run_dir,
                 "search",
                 tv["id"],
                 timeout,
                 config["search_effort"],
-                "sonnet" if leg == "claude" else None,
+                config.get("claude_search_model") if leg == "claude" else None,
             )
-            for leg, tv in jobs
+            for leg, tv, focus in jobs
         ]
         return collect_with_straggler_drop(futures, run_dir, config)
 
@@ -2440,12 +3054,31 @@ def run_rechecks(
                 task_id,
                 timeout,
                 config["search_effort"],
-                "sonnet" if leg == "claude" else None,
+                config.get("claude_search_model") if leg == "claude" else None,
             )
             for leg, item, task_id in jobs
         ]
         records = collect_with_straggler_drop(futures, run_dir, config)
     return records, dropped
+
+
+def aggregate_adjudications(verdicts: list[dict]) -> dict | None:
+    """Self-consistency aggregate over N arbiter samples: majority action (accept wins ties — the
+    arbiter only rejects on clear evidence), median accepted price, modal currency."""
+    if not verdicts:
+        return None
+    actions = [v.get("action") for v in verdicts]
+    action = "reject" if actions.count("reject") > actions.count("accept") else "accept"
+    chosen = [v for v in verdicts if v.get("action") == action]
+    out: dict = {"action": action, "reason": (chosen[0].get("reason") if chosen else None)}
+    if action == "accept":
+        prices = sorted(p for p in (parse_price(v.get("price")) for v in chosen) if p is not None)
+        if prices:
+            out["price"] = prices[len(prices) // 2]  # median resists a single outlier sample
+            curs = [str(v.get("currency")) for v in chosen if v.get("currency")]
+            if curs:
+                out["currency"] = max(set(curs), key=curs.count)
+    return out
 
 
 def adjudicate_disputes(prompt: str, verified: list[dict], rejected: list[dict], run_dir: Path, config: dict) -> tuple[list[dict], list[dict]]:
@@ -2454,22 +3087,38 @@ def adjudicate_disputes(prompt: str, verified: list[dict], rejected: list[dict],
     if not disputed:
         return verified, rejected
 
-    def adjudicate_one(idx: int, item: dict) -> tuple[dict, dict]:
+    n_samples = max(1, int(config.get("adjudicate_samples") or 1))
+
+    def adjudicate_one(idx: int, item: dict) -> tuple[dict, dict | None]:
         adj_prompt = build_adjudication_prompt(prompt, item, config)
         arbiter = arbiter_vendor(config)  # prefer Claude, else any enabled vendor
-        record = call_model(
-            arbiter, adj_prompt, run_dir, "adjudicate", f"dispute-{idx}",
-            timeout=600, claude_model=vendor_claude_model(arbiter, config),
-        )
-        # Reserve: if the native pool is exhausted/down, fall back to Claude-via-agy (separate
-        # quota pool) — only when Claude itself wasn't disabled by the user for this run.
-        if not record["success"] and "claude" in (config.get("enabled_legs") or []):
-            reserve = call_agy_claude(adj_prompt, run_dir, "adjudicate", f"dispute-{idx}-agy")
-            if reserve["success"]:
-                record = reserve
-        return item, record
+        # Self-consistency (effort >=3): independent samples + majority vote on which price the
+        # evidence supports. Fenced to dispute resolution ONLY (a single canonical answer exists) —
+        # never to discovery, where a majority vote would amplify herding. n_samples=1 == old behaviour.
+        verdicts: list[dict] = []
+        for s in range(n_samples):
+            sp = adj_prompt if n_samples == 1 else adj_prompt + f"\n(Independent assessment {s + 1} of {n_samples}.)"
+            tag = f"dispute-{idx}" if n_samples == 1 else f"dispute-{idx}-s{s + 1}"
+            record = call_model(
+                arbiter, sp, run_dir, "adjudicate", tag,
+                timeout=600, claude_model=vendor_claude_model(arbiter, config),
+            )
+            # Reserve: if the native pool is exhausted/down, fall back to Claude-via-agy (separate
+            # quota pool) — only when Claude itself wasn't disabled by the user for this run.
+            if not record["success"] and "claude" in (config.get("enabled_legs") or []):
+                reserve = call_agy_claude(sp, run_dir, "adjudicate", f"{tag}-agy")
+                if reserve["success"]:
+                    record = reserve
+            if record["success"]:
+                try:
+                    v = extract_json(record["stdout"])
+                    if isinstance(v, dict) and v.get("action") in ("accept", "reject"):
+                        verdicts.append(v)
+                except ValueError:
+                    pass
+        return item, aggregate_adjudications(verdicts)
 
-    results: list[tuple[dict, dict]] = []
+    results: list[tuple[dict, dict | None]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(disputed))) as executor:
         futures = [executor.submit(adjudicate_one, idx, item) for idx, item in enumerate(disputed, start=1)]
         for future in concurrent.futures.as_completed(futures):
@@ -2477,15 +3126,9 @@ def adjudicate_disputes(prompt: str, verified: list[dict], rejected: list[dict],
             update_run(run_dir, progress={"done": len(results), "total": len(disputed)})
 
     to_reject: list[str] = []
-    for item, record in results:
-        if not record["success"]:
-            continue  # arbiter unavailable -> the item stays flagged disputed in the report
-        try:
-            verdict = extract_json(record["stdout"])
-        except ValueError:
-            continue
-        if not isinstance(verdict, dict):
-            continue
+    for item, verdict in results:
+        if not verdict:
+            continue  # arbiter unavailable / no parsable verdict -> item stays flagged disputed
         if verdict.get("action") == "reject":
             item["adjudication"] = verdict.get("reason")
             to_reject.append(item.get("record_id"))
@@ -2494,7 +3137,11 @@ def adjudicate_disputes(prompt: str, verified: list[dict], rejected: list[dict],
             if price is not None:
                 item["price"] = price
                 if verdict.get("currency"):
-                    item["currency"] = str(verdict["currency"])
+                    item["currency"] = canon_currency(verdict["currency"]) or item.get("currency")
+                # The adjudicated price is the new truth — recompute the derived USD fields, or
+                # sort_by_usd / credible_floor_usd / synthesis rank it by its stale pre-verdict USD.
+                item["price_usd"] = to_usd(item["price"], item.get("currency"))
+                set_monthly_usd(item)
             item["disputed"] = False
             item["adjudication"] = verdict.get("reason")
 
@@ -2545,26 +3192,53 @@ def factcheck_top_pick(prompt: str, verified: list[dict], run_dir: Path, config:
             return verdict
 
     # Independent-vendor confirmation (best-effort): a search leg that is healthy re-reads the page.
+    # Chain-of-Verification (factored): derive DISCRETE verification questions and have the vendor
+    # answer EACH from the live page (not from memory) — the factored form is the load-bearing part
+    # of CoVe (independent sub-checks beat one joint "is it still good?" judgment).
     legs = [lg for lg in (config.get("search_legs") or ["codex", "gemini"]) if not leg_disabled(run_dir.name, lg)]
     if legs:
         leg = legs[0]
-        fp = (f"Open this exact URL and confirm the offer still matches the recommendation.\n"
+        req_tier = (intent or {}).get("required_tier")
+        tier_q = f"4. tier_ok: does the page's tier/variant match the required '{req_tier}'?\n" if req_tier else "4. tier_ok: (no tier requirement — return true)\n"
+        fp = (f"Open this exact URL and RE-READ the live page to fact-check a recommendation. Use ONLY "
+              f"what the page shows now, not prior knowledge.\n"
               f"URL: {url}\nUser wants: {prompt}\n"
-              f"Recommended price: ~{top.get('price_usd')} USD ({top.get('price')} {top.get('currency')}).\n"
-              f"Answer ONLY JSON: {{\"confirmed\": true|false, \"reason\": \"one line\"}}. "
-              f"confirmed=false if the page is gone/sold, a different product, a different tier, or a very different price.")
+              f"Recommended: ~{top.get('price_usd')} USD ({top.get('price')} {top.get('currency')}).\n"
+              f"Answer EACH question independently from the page:\n"
+              f"1. live: is the listing currently active / in stock (not sold, removed, or expired)?\n"
+              f"2. same_item: is the page selling the SAME thing the user wants (right product, not a "
+              f"different or re-listed item)?\n"
+              f"3. price_ok: is the page's current price within ~15% of the recommended price?\n"
+              f"{tier_q}"
+              f"Return ONLY JSON: {{\"live\": bool, \"same_item\": bool, \"price_ok\": bool, "
+              f"\"tier_ok\": bool, \"reason\": \"one line\"}}. Be conservative: if the page won't load "
+              f"or a fact is unclear, set THAT field false.")
         rec = call_model(leg, fp, run_dir, "factcheck", "top-pick", timeout=300,
-                         effort="medium", claude_model="sonnet" if leg == "claude" else None, bypass_breaker=True)
+                         effort=config["judge_effort"], claude_model=config.get("claude_search_model") if leg == "claude" else None, bypass_breaker=True)
         if rec["success"]:
             try:
                 ans = extract_json(rec.get("stdout") or "")
-                if isinstance(ans, dict) and "confirmed" in ans:
-                    verdict["vendor_confirmed"] = bool(ans["confirmed"])
-                    verdict["vendor_reason"] = str(ans.get("reason") or "")[:200]
-                    if ans["confirmed"] is False:
-                        verdict.update(ok=False, reason="vendor_refuted: " + verdict["vendor_reason"])
             except ValueError:
-                pass
+                ans = None
+            if isinstance(ans, dict):
+                keys = ("live", "same_item", "price_ok", "tier_ok")
+                if any(k in ans for k in keys):
+                    # Conservative on a PARTIAL answer: a missing key is a failed check (matches the
+                    # prompt's "if unclear, set THAT field false"), so a real refutation that drops a
+                    # key is never silently lost.
+                    checks = {k: bool(ans.get(k)) for k in keys}
+                    confirmed = all(checks.values())
+                    verdict["vendor_checks"] = checks
+                elif "confirmed" in ans:  # tolerate a model that answers in the old joint form
+                    confirmed = bool(ans["confirmed"])
+                else:
+                    confirmed = None
+                if confirmed is not None:
+                    verdict["vendor_confirmed"] = confirmed
+                    verdict["vendor_reason"] = str(ans.get("reason") or "")[:200]
+                    if confirmed is False:
+                        failed = ",".join(k for k in keys if not ans.get(k)) or "joint"
+                        verdict.update(ok=False, reason=f"vendor_refuted ({failed}): " + verdict["vendor_reason"])
     return verdict
 
 
@@ -2681,23 +3355,36 @@ def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], reje
 def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
     run_id = run_dir.name
     sites = config.get("sites") or []
+    excluded = config.get("excluded_sites") or []
     all_parsed_records: list[dict] = []
     verified: list[dict] = []
     rejected: list[dict] = []
+    emitted_findings: dict = {}  # shared across rounds so a finding streams once (not every re-verify)
     ACTIVE_RUNS.add(run_id)
     init_leg_health(run_id)
     set_user_disabled(run_id, config.get("disabled_legs") or [])
+    set_run_gemini_model(run_id, config.get("gemini_model"))
     requested_budgets = {"gemini": config["gemini_call_budget"]}
     if "claude" in (config.get("search_legs") or []):
         requested_budgets["claude"] = config.get("claude_search_budget", 0)
     # Quota-aware pacing: clamp each leg's per-run budget to its remaining daily allowance so a
     # single run can't exhaust the day's quota. Surfaced in run.json for the UI/scoreboard.
     leg_budgets, pacing = {}, {}
+    today_counts = daily_call_counts()  # read the log once, price every leg from the same snapshot
     for leg, requested in requested_budgets.items():
-        budget, remaining = paced_budget(leg, requested)
+        reserve = CLAUDE_SEARCH_RESERVE if leg == "claude" else 0
+        budget, remaining = paced_budget(leg, requested, reserve=reserve, counts=today_counts)
         leg_budgets[leg] = budget
         pacing[leg] = {"requested": requested, "granted": budget, "daily_remaining": remaining,
                        "daily_cap": DAILY_CAPS.get(leg)}
+    # Starved-day degradation: if Claude's search budget paced down to 0, drop it from THIS run's
+    # search legs (recheck/coverage/frontier read search_legs too) instead of burning job slots on
+    # skipped_by_budget calls. Claude still adjudicates disputes — arbiter_vendor is independent of
+    # search_legs. The trimmed config is local to this run; run.json keeps the requested profile.
+    if "claude" in (config.get("search_legs") or []) and leg_budgets.get("claude", 0) <= 0:
+        config = dict(config)
+        config["search_legs"] = [l for l in config["search_legs"] if l != "claude"]
+        pacing.setdefault("claude", {})["dropped_from_search"] = True
     init_leg_budget(run_id, leg_budgets)
     update_run(run_dir, pacing=pacing)
 
@@ -2720,8 +3407,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         check_cancel()
 
         update_run(run_dir, phase="verifying", progress=None)
-        verified, rejected = verify_findings(findings, parse_rejections, sites, intent)
-        write_json(run_dir / "verification.json", {"stage": "primary", "verified": verified, "rejected": rejected})
+        verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="primary", emitted=emitted_findings)
+        record_stage_results(run_dir, "primary", verified, rejected)
         check_cancel()
 
         rescue_attempts: dict[str, set[str]] = {}
@@ -2737,12 +3424,38 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             all_parsed_records.extend(recheck_parsed)
             findings = findings + recheck_findings
             parse_rejections = parse_rejections + recheck_parse_rejections
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"rescue {round_no}", emitted=emitted_findings)
+            record_stage_results(run_dir, f"rescue {round_no}", verified, rejected)
             check_cancel()
         if recheck_dropped:
             # No silent caps: the report and UI must show how many candidates the budget skipped.
             update_run(run_dir, recheck_dropped=recheck_dropped)
         check_cancel()
+
+        # Coverage-gap rounds (effort >=3): search the (structured) source-classes that produced
+        # nothing credible, steering away from saturated hosts. Distinct from rescue (recovers
+        # rejected) and frontier (chases cheaper). Stops when no class is empty, a round adds no new
+        # verified listing, or the budget runs out. Only ADDS candidates that pass the same gate.
+        for round_no in range(1, config.get("coverage_rounds", 0) + 1):
+            all_classes = {t.get("source_class") for t in tasks if t.get("source_class")}
+            missing = sorted(all_classes - covered_source_classes(verified, tasks))
+            if not missing:
+                break
+            update_run(run_dir, phase=f"coverage_{round_no}", progress=None)
+            avoid_hosts = [h for h, _ in sorted(host_distribution(verified).items(), key=lambda kv: -kv[1])[:3]]
+            coverage_records = run_coverage_round(prompt, missing, avoid_hosts, run_dir, config, intent)
+            if not coverage_records:
+                break
+            c_findings, c_parse_rej, c_parsed = parse_model_records(coverage_records)
+            all_parsed_records.extend(c_parsed)
+            findings = findings + c_findings
+            parse_rejections = parse_rejections + c_parse_rej
+            prev_keys = {dedupe_key(v) for v in verified}
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"coverage {round_no}", emitted=emitted_findings)
+            record_stage_results(run_dir, f"coverage {round_no}", verified, rejected)
+            check_cancel()
+            if not ({dedupe_key(v) for v in verified} - prev_keys):  # novelty-exhausted: stop
+                break
 
         # Frontier rounds: push strictly below the current best credible price until a round finds
         # nothing cheaper-and-credible (dry) or the round budget is spent. Effort-gated.
@@ -2758,7 +3471,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             all_parsed_records.extend(f_parsed)
             findings = findings + f_findings
             parse_rejections = parse_rejections + f_parse_rej
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"frontier {round_no}", emitted=emitted_findings)
+            record_stage_results(run_dir, f"frontier {round_no}", verified, rejected)
             new_floor = credible_floor_usd(verified)
             check_cancel()
             if new_floor is None or new_floor >= ceiling:  # dry round — nothing credible cheaper
@@ -2767,6 +3481,9 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         if config["adjudicate_disputes"] and any(item.get("disputed") for item in verified):
             update_run(run_dir, phase="adjudicating", progress=None)
             verified, rejected = adjudicate_disputes(prompt, verified, rejected, run_dir, config)
+            # Adjudication can move disputed items between buckets; persist + summarize so the yield
+            # strip's last pill and the poll fallback match the final counts (not the pre-adjudicate ones).
+            record_stage_results(run_dir, "adjudicate", verified, rejected)
             check_cancel()
 
         apply_trust(verified)  # structured seller/source trust for ranking + the UI
@@ -2822,12 +3539,32 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             final_path=str((run_dir / "final.md").relative_to(ROOT)),
         )
     except Exception as exc:
+        # A crash in a LATE phase (synthesis/review/factcheck) must not throw away the whole run's
+        # paid work. Salvage whatever survived verification into a partial report, exactly like the
+        # cancel path — but still record status=failed + traceback so the bug stays visible.
         update_run(run_dir, status="failed", phase="failed", error=str(exc), traceback=traceback.format_exc())
-        (run_dir / "final.md").write_text(f"# Research failed\n\n{exc}\n", encoding="utf-8")
+        try:
+            if verified or rejected:
+                report = fallback_report(prompt, verified, rejected, disabled_legs(run_id))
+                report = (f"> ⚠ This run hit an error during finalization and could not produce a "
+                          f"fully synthesized report ({exc}). The verified results below are partial "
+                          f"but were collected before the failure.\n\n" + report)
+            else:
+                report = f"# Research failed\n\n{exc}\n"
+            (run_dir / "final.md").write_text(report, encoding="utf-8")
+            update_run(
+                run_dir,
+                verified_count=len(verified),
+                rejected_count=len(rejected),
+                final_path=str((run_dir / "final.md").relative_to(ROOT)),
+            )
+        except Exception:
+            (run_dir / "final.md").write_text(f"# Research failed\n\n{exc}\n", encoding="utf-8")
     finally:
         ACTIVE_RUNS.discard(run_id)
         clear_cancel(run_id)
         clear_user_disabled(run_id)
+        clear_run_gemini_model(run_id)
         clear_leg_health(run_id)
         clear_leg_budget(run_id)
         clear_run_registry(run_id)
@@ -3095,8 +3832,13 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
                 if events_path.exists():
                     with events_path.open("rb") as f:
                         f.seek(pos)
-                        chunk = f.read()
-                        pos = f.tell()
+                        raw = f.read()
+                    # Consume only up to the last newline so a concurrently-appended (still partial)
+                    # line is never split into two invalid-JSON frames the client would drop.
+                    nl = raw.rfind(b"\n")
+                    if nl != -1:
+                        chunk = raw[: nl + 1]
+                        pos += nl + 1
                 if chunk:
                     for line in chunk.decode("utf-8", errors="replace").splitlines():
                         if line.strip():
@@ -3145,7 +3887,9 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
             if not prompt:
                 self.send_json(400, {"error": "prompt_required"})
                 return
-            config = make_config(payload.get("effort"), payload.get("sites"), payload.get("disabled"))
+            config = make_config(payload.get("effort"), payload.get("sites"), payload.get("disabled"),
+                                 vendor_tiers=payload.get("vendor_tiers"),
+                                 excluded_sites=payload.get("excluded_sites"))
             run_id = start_background_run(prompt, config)
             self.send_json(202, {"run_id": run_id})
         except json.JSONDecodeError:
@@ -3190,6 +3934,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Turn a vendor OFF for this run to save its quota: gpt/codex, gemini, or claude "
              "(repeatable or comma-separated). The remaining vendor(s) do everything.",
     )
+    parser.add_argument(
+        "--exclude-site",
+        action="append",
+        default=None,
+        help="Block a whole domain from results, the inverse of --site (repeatable or "
+             "comma-separated). An explicit --site wins over --exclude-site on the same domain.",
+    )
+    parser.add_argument("--codex-tier", default=None, choices=CODEX_EFFORTS,
+                        help="Codex reasoning effort for every role it plays (default: xhigh).")
+    parser.add_argument("--gemini-tier", default=None, choices=tuple(GEMINI_TIERS),
+                        help="Gemini tier for every role it plays (default: high).")
+    parser.add_argument("--claude-tier", default=None, choices=CLAUDE_TIERS,
+                        help="Claude tier for every role it plays (default: opus).")
     parser.add_argument("--serve", action="store_true", help="Start the local Web UI.")
     parser.add_argument("--host", default="127.0.0.1", help="Host for --serve.")
     parser.add_argument("--port", type=int, default=8765, help="Port for --serve.")
@@ -3213,8 +3970,11 @@ def main(argv: list[str] | None = None) -> int:
     if not prompt:
         parser.error("prompt is required unless --serve or --list-runs is used")
 
+    cli_tiers = {"codex": args.codex_tier, "gemini": args.gemini_tier, "claude": args.claude_tier}
     config = make_config(args.effort, ",".join(args.site) if args.site else None,
-                         ",".join(args.disable) if args.disable else None)
+                         ",".join(args.disable) if args.disable else None,
+                         vendor_tiers={k: v for k, v in cli_tiers.items() if v},
+                         excluded_sites=",".join(args.exclude_site) if args.exclude_site else None)
     run_dir = run_research(prompt, config)
     meta = read_json(run_dir / "run.json", {}) or {}
     print(f"run_id: {run_dir.name}")

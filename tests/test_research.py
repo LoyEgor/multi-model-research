@@ -245,7 +245,12 @@ class ResearchTests(unittest.TestCase):
         default = research.make_config(None, None)
         self.assertEqual(default["effort"], "standard")
         self.assertEqual(default["sites"], [])
-        self.assertEqual(default["claude_model"], "sonnet")
+        # Per-vendor tiers default to the strongest tier, applied to every role that vendor plays.
+        self.assertEqual(default["claude_model"], "opus")
+        self.assertEqual(default["claude_search_model"], "opus")
+        self.assertEqual(default["search_effort"], "xhigh")
+        self.assertEqual(default["judge_effort"], "xhigh")
+        self.assertEqual(default["gemini_model"], "Gemini 3.1 Pro (High)")
 
         named = research.make_config("3", None)
         self.assertEqual(named["effort"], "deep")
@@ -394,6 +399,109 @@ class ResearchTests(unittest.TestCase):
         self.assertIsNone(research.intent_rejection({"title": "macbook", "tier": "max_20x", "price_usd": 80}, intent))
         # no intent → never rejects
         self.assertIsNone(research.intent_rejection({"title": "anything"}, None))
+
+    def test_canon_basis_and_class(self):
+        self.assertEqual(research.canon_basis("$9.99/mo"), "subscription_monthly")
+        self.assertEqual(research.canon_basis("billed annually"), "subscription_yearly")
+        self.assertEqual(research.canon_basis("per 1k tokens"), "usage_metered")
+        self.assertEqual(research.canon_basis("lifetime license"), "one_time")
+        self.assertEqual(research.canon_basis("Free"), "free")
+        self.assertEqual(research.canon_basis("garbage"), "unknown")
+        self.assertEqual(research.basis_class("subscription_yearly"), "recurring")
+        self.assertEqual(research.basis_class("usage_metered"), "metered")
+        self.assertEqual(research.basis_class("one_time"), "one_time")
+
+    def test_to_monthly_usd(self):
+        self.assertEqual(research.to_monthly_usd(240, "subscription_yearly", None), 20.0)
+        self.assertEqual(research.to_monthly_usd(20, "subscription_monthly", None), 20.0)
+        self.assertIsNone(research.to_monthly_usd(999, "one_time", None))
+        self.assertEqual(research.to_monthly_usd(0.002, "usage_metered", {"monthly_usage_units": 1_000_000}), 2000.0)
+        self.assertIsNone(research.to_monthly_usd(0.002, "usage_metered", None))
+
+    def test_coerce_intent_price_basis(self):
+        intent = research.coerce_intent({"intent": {
+            "subject_keywords": ["claude"], "price_basis": "per month", "official_price": "240",
+            "official_currency": "USD", "official_price_basis": "per year", "free_ok": False,
+            "cheaper_than_official": True, "monthly_usage_units": "1000000", "usage_unit": "tokens"}})
+        self.assertEqual(intent["price_basis"], "subscription_monthly")
+        self.assertEqual(intent["official_price_basis"], "subscription_yearly")
+        self.assertFalse(intent["free_ok"])
+        self.assertEqual(intent["monthly_usage_units"], 1_000_000.0)
+        self.assertEqual(intent["official_price_monthly_usd"], 20.0)  # $240/yr -> $20/mo
+        # defaults when omitted
+        d = research.coerce_intent({"intent": {"subject_keywords": ["x"]}})
+        self.assertTrue(d["free_ok"])
+        self.assertEqual(d["price_basis"], "unknown")
+
+    def test_intent_rejection_free_excluded(self):
+        intent = {"subject_keywords": ["claude"], "free_ok": False}
+        self.assertEqual(research.intent_rejection({"title": "claude free tier", "price_basis": "free"}, intent), "free_excluded")
+        # free_ok True (default) → a free tier is not excluded on that basis
+        self.assertIsNone(research.intent_rejection({"title": "claude free tier", "price_basis": "free"}, {"subject_keywords": ["claude"]}))
+
+    def test_intent_rejection_incomparable_basis_kept(self):
+        # Owner's flagship case: official price is per-token, the offer is a monthly subscription.
+        intent = {"subject_keywords": ["claude"], "cheaper_than_official": True,
+                  "official_price_usd": 0.002, "price_basis": "subscription_monthly",
+                  "official_price_basis": "usage_metered"}  # no monthly_usage_units -> not normalizable
+        f = {"title": "claude pro", "price_basis": "subscription_monthly", "price_usd": 20}
+        self.assertIsNone(research.intent_rejection(f, intent))  # NOT rejected as not_below_official
+        self.assertEqual(f["basis_flag"], "incomparable_basis")
+
+    def test_intent_rejection_annual_vs_monthly_normalized(self):
+        intent = {"subject_keywords": ["claude"], "cheaper_than_official": True,
+                  "official_price_usd": 20, "price_basis": "subscription_monthly",
+                  "official_price_basis": "subscription_monthly", "official_price_monthly_usd": 20}
+        over = {"title": "claude", "price_basis": "subscription_yearly", "price_usd": 240}  # $20/mo
+        self.assertEqual(research.intent_rejection(over, intent), "not_below_official")
+        under = {"title": "claude", "price_basis": "subscription_yearly", "price_usd": 120}  # $10/mo
+        self.assertIsNone(research.intent_rejection(under, intent))
+        self.assertEqual(under["price_usd_monthly"], 10.0)
+
+    def test_intent_rejection_unknown_basis_backcompat(self):
+        # No basis on either side → legacy raw-USD comparison, unchanged.
+        intent = {"subject_keywords": ["macbook"], "cheaper_than_official": True, "official_price_usd": 100}
+        self.assertEqual(research.intent_rejection({"title": "macbook", "price_usd": 120}, intent), "not_below_official")
+        self.assertIsNone(research.intent_rejection({"title": "macbook", "price_usd": 80}, intent))
+
+    def test_free_excluded_non_rescuable(self):
+        self.assertIn("free_excluded", research.NON_RESCUABLE_REASONS)
+        self.assertFalse(research.is_rescuable({"reasons": ["free_excluded"]}))
+
+    def test_merge_finding_upgrades_unknown_basis(self):
+        a = research.normalize_finding({"title": "x", "price": 10, "currency": "USD"}, "codex", "t", "r1")
+        b = research.normalize_finding({"title": "x", "price": 10, "currency": "USD", "price_basis": "subscription_monthly"}, "gemini", "t", "r2")
+        self.assertEqual(a["price_basis"], "unknown")
+        merged = research.merge_finding(a, b)
+        self.assertEqual(merged["price_basis"], "subscription_monthly")
+
+    def test_credible_floor_skips_incomparable(self):
+        verified = [
+            {"price_usd": 50, "basis_flag": "incomparable_basis"},
+            {"price_usd": 90},
+        ]
+        self.assertEqual(research.credible_floor_usd(verified), 90)
+
+    def test_parse_count(self):
+        # A usage quantity, NOT a price: grouping commas mean thousands, not decimals.
+        self.assertEqual(research.parse_count("1,000,000"), 1_000_000.0)
+        self.assertEqual(research.parse_count("1000000"), 1_000_000.0)
+        self.assertEqual(research.parse_count(500000), 500000.0)
+        self.assertIsNone(research.parse_count(0))
+        self.assertIsNone(research.parse_count("free"))
+        self.assertIsNone(research.parse_count(None))
+
+    def test_coerce_intent_usage_units_grouped(self):
+        # Regression: a comma-grouped usage count must parse (parse_price would have dropped it).
+        intent = research.coerce_intent({"intent": {"subject_keywords": ["x"], "monthly_usage_units": "1,500,000"}})
+        self.assertEqual(intent["monthly_usage_units"], 1_500_000.0)
+
+    def test_normalize_finding_sets_monthly_for_recurring(self):
+        # price_usd_monthly is populated for every recurring finding, not only priced-out ones.
+        yearly = research.normalize_finding({"title": "x", "price": 240, "currency": "USD", "price_basis": "subscription_yearly"}, "codex", "t", "r")
+        self.assertEqual(yearly["price_usd_monthly"], 20.0)
+        once = research.normalize_finding({"title": "x", "price": 999, "currency": "USD", "price_basis": "one_time"}, "codex", "t", "r")
+        self.assertIsNone(once["price_usd_monthly"])
 
     def test_tier_ranking(self):
         self.assertLess(research.tier_rank("pro"), research.tier_rank("max_5x"))
@@ -586,6 +694,95 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("olx.ua", p)
         self.assertIn("macbook air m2", p)
 
+    def test_build_synthesis_prompt_renders_literal_braces(self):
+        # Regression: a literal "{score, band: ...}" in the f-string was evaluated as an
+        # expression (NameError: name 'score' is not defined), crashing every run at synthesis.
+        finding = {"title": "x", "url": "https://e", "price_usd": 10, "trust": {"score": 0.9}}
+        p = research.build_synthesis_prompt(
+            "find cheapest x", [], [finding], [],
+            {"sites": [], "judge_effort": "xhigh"}, None, {"subject_keywords": ["x"]},
+        )
+        self.assertIn("{score, band: high/medium/low, factors}", p)
+
+    def test_no_undefined_names_in_fstrings(self):
+        # Guards EVERY prompt builder against the unescaped-brace bug class: a literal "{...}"
+        # left in an f-string is silently parsed as an expression and blows up at runtime only
+        # when that branch executes. Catch it statically across the whole module instead.
+        import ast
+        import builtins as _builtins
+        from pathlib import Path
+
+        src = (Path(research.__file__)).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        scope_builtins = set(dir(_builtins))
+
+        module_names = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                module_names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module_names.update(a.asname or a.name for a in node.names)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                module_names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.If, ast.Try, ast.With)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        module_names.add(sub.id)
+                    elif isinstance(sub, ast.Import):
+                        module_names.update((a.asname or a.name).split(".")[0] for a in sub.names)
+                    elif isinstance(sub, ast.ImportFrom):
+                        module_names.update(a.asname or a.name for a in sub.names)
+
+        def bound_names(fn):
+            names = set()
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    names.add(n.id)
+                elif isinstance(n, ast.arg):
+                    names.add(n.arg)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(n.name)
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, ast.Import):
+                    names.update((a.asname or a.name).split(".")[0] for a in n.names)
+                elif isinstance(n, ast.ImportFrom):
+                    names.update(a.asname or a.name for a in n.names)
+            return names
+
+        # Parent map so a name in an f-string can see ALL enclosing function scopes (closures),
+        # not just its innermost function — otherwise a closure variable reads as "undefined".
+        parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+
+        def enclosing_funcs(node):
+            out, p = [], parents.get(node)
+            while p is not None:
+                if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append(p)
+                p = parents.get(p)
+            return out
+
+        fn_locals, offenders = {}, []
+        for js in ast.walk(tree):
+            if not isinstance(js, ast.JoinedStr):
+                continue
+            for fv in js.values:
+                if not isinstance(fv, ast.FormattedValue):
+                    continue
+                for nm in ast.walk(fv.value):
+                    if not (isinstance(nm, ast.Name) and isinstance(nm.ctx, ast.Load)):
+                        continue
+                    funcs = enclosing_funcs(nm)
+                    scope = set(module_names) | scope_builtins
+                    for fn in funcs:
+                        if fn not in fn_locals:
+                            fn_locals[fn] = bound_names(fn)
+                        scope |= fn_locals[fn]
+                    if nm.id not in scope:
+                        where = funcs[0].name if funcs else "<module>"
+                        offenders.append(f"line {nm.lineno}: undefined name '{nm.id}' in f-string (in {where})")
+        self.assertEqual(offenders, [], "unescaped-brace bug(s) in f-string(s):\n" + "\n".join(offenders))
+
     def test_run_frontier_round_fans_out_legs(self):
         import tempfile
         from unittest import mock
@@ -606,9 +803,9 @@ class ResearchTests(unittest.TestCase):
 
     def test_query_variants_parsed_and_gated(self):
         cfg = research.make_config("deep", None)
-        self.assertEqual(cfg["query_variants_per_task"], 2)
+        self.assertEqual(cfg["query_variants_per_task"], 1)
         self.assertEqual(research.make_config("quick", None)["query_variants_per_task"], 1)
-        self.assertEqual(research.make_config("max", None)["query_variants_per_task"], 3)
+        self.assertEqual(research.make_config("max", None)["query_variants_per_task"], 2)
         payload = {"tasks": [
             {"id": "task-1", "query": "macbook air m2",
              "query_variants": ["Apple MacBook Air 2022 M2", "макбук аір м2", "macbook air m2"]},
@@ -640,7 +837,7 @@ class ResearchTests(unittest.TestCase):
             return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
 
         tasks = [{"id": "task-1", "query": "q1", "query_variants": ["q1b", "q1c"], "preferred_sites": []}]
-        cfg = research.make_config("deep", None)  # 2 query variants, search_legs codex+gemini+claude
+        cfg = research.make_config("max", None)  # 2 query variants, search_legs codex+gemini+claude
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = research.Path(tmp)
             with mock.patch.object(research, "call_model", side_effect=fake_call):
@@ -743,14 +940,17 @@ class ResearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = research.Path(tmp)
             attempts: dict[str, set[str]] = {}
-            config = research.make_config("standard", None)
+            config = research.make_config("standard", None)  # search_legs codex+gemini+claude
             with mock.patch.object(research, "call_model", side_effect=fake_call):
+                # A codex-sourced item is rescued by the OTHER families first, then codex, one leg/round.
                 records, dropped = research.run_rechecks("p", [item], run_dir, config, 1, attempts)
                 self.assertEqual(calls, ["gemini"])
                 records, dropped = research.run_rechecks("p", [item], run_dir, config, 2, attempts)
-                self.assertEqual(calls, ["gemini", "codex"])
+                self.assertEqual(calls, ["gemini", "claude"])
                 records, dropped = research.run_rechecks("p", [item], run_dir, config, 3, attempts)
-                self.assertEqual(calls, ["gemini", "codex"])
+                self.assertEqual(calls, ["gemini", "claude", "codex"])
+                records, dropped = research.run_rechecks("p", [item], run_dir, config, 4, attempts)
+                self.assertEqual(calls, ["gemini", "claude", "codex"])  # all legs exhausted
                 self.assertEqual(records, [])
 
     def test_rescue_max_effort_uses_both_legs_and_counts_drops(self):
@@ -772,18 +972,86 @@ class ResearchTests(unittest.TestCase):
             config = research.make_config("max", None)
             with mock.patch.object(research, "call_model", side_effect=fake_call):
                 records, dropped = research.run_rechecks("p", items, run_dir, config, 1, {})
-        self.assertEqual(dropped, 2)  # 14 candidates, max profile caps at 12 per round
-        self.assertEqual(len(records), 24)  # recheck_legs=2 per item
+        self.assertEqual(dropped, 6)  # 14 candidates, max profile caps at 8 per round
+        self.assertEqual(len(records), 16)  # 8 items × recheck_legs=2 per item
         # max effort searches with 3 legs; a codex-sourced item is rescued by the 2 OTHER families.
         first_item_legs = {leg for leg, task_id in calls if task_id.startswith("recheck-1-1-")}
         self.assertEqual(first_item_legs, {"gemini", "claude"})
 
-    def test_claude_search_leg_gated_by_effort(self):
-        self.assertEqual(research.make_config("standard", None)["search_legs"], ["codex", "gemini"])
-        deep = research.make_config("deep", None)
-        self.assertIn("claude", deep["search_legs"])
-        self.assertGreater(deep["claude_search_budget"], 0)
-        self.assertEqual(research.make_config("max", None)["search_legs"], ["codex", "gemini", "claude"])
+    def test_all_frontier_legs_search_at_every_level(self):
+        # All three frontier families search at every level (they run in parallel), with a Claude
+        # search budget that grows toward the deeper tiers.
+        budgets = []
+        for name in ("quick", "standard", "deep", "max"):
+            cfg = research.make_config(name, None)
+            self.assertEqual(cfg["search_legs"], ["codex", "gemini", "claude"])
+            self.assertGreater(cfg["claude_search_budget"], 0)
+            budgets.append(cfg["claude_search_budget"])
+        self.assertEqual(budgets, sorted(budgets))  # non-decreasing with effort
+
+    def test_vendor_tiers_default_max(self):
+        cfg = research.make_config("deep", None)
+        self.assertEqual(cfg["vendor_tiers"], {"codex": "xhigh", "gemini": "high", "claude": "opus"})
+        self.assertEqual(cfg["search_effort"], "xhigh")
+        self.assertEqual(cfg["judge_effort"], "xhigh")
+        self.assertEqual(cfg["claude_model"], "opus")
+        self.assertEqual(cfg["claude_search_model"], "opus")
+        self.assertEqual(cfg["gemini_model"], "Gemini 3.1 Pro (High)")
+
+    def test_vendor_tiers_override_applies_to_every_role(self):
+        cfg = research.make_config("deep", None,
+                                   vendor_tiers={"codex": "medium", "claude": "sonnet", "gemini": "low"})
+        # One tier per vendor, applied to search AND judge seats alike.
+        self.assertEqual(cfg["search_effort"], "medium")
+        self.assertEqual(cfg["judge_effort"], "medium")
+        self.assertEqual(cfg["claude_model"], "sonnet")
+        self.assertEqual(cfg["claude_search_model"], "sonnet")
+        self.assertEqual(cfg["gemini_model"], "Gemini 3.1 Pro (Low)")
+
+    def test_vendor_tiers_invalid_values_fall_back_to_default(self):
+        cfg = research.make_config("quick", None,
+                                   vendor_tiers={"codex": "ultra", "claude": "fable", "gemini": "turbo"})
+        # Unknown/over-ceiling tiers are ignored, not errored — fall back to the max default.
+        self.assertEqual(cfg["vendor_tiers"], {"codex": "xhigh", "gemini": "high", "claude": "opus"})
+
+    def test_make_config_excluded_sites(self):
+        cfg = research.make_config("max", "https://www.OLX.ua/list, prom.ua", excluded_sites="olx.ua, rozetka.com.ua")
+        self.assertEqual(cfg["sites"], ["olx.ua", "prom.ua"])
+        # olx.ua is in scope -> dropped from the blocklist (scope wins); rozetka stays, normalized.
+        self.assertEqual(cfg["excluded_sites"], ["rozetka.com.ua"])
+        # blocklist alone, no scope
+        self.assertEqual(research.make_config("quick", None, excluded_sites="ebay.com")["excluded_sites"], ["ebay.com"])
+
+    def test_excluded_site_rejection(self):
+        ex = ["rozetka.com.ua"]
+        r = research.rejection_reasons({"title": "x", "price": 1, "url": "https://rozetka.com.ua/p1/", "availability": "available"},
+                                       {"ok": True}, None, None, ex)
+        self.assertIn("excluded_site", r)
+        self.assertEqual(r.count("excluded_site"), 1)  # no duplicate
+        # subdomain is caught too
+        sub = research.rejection_reasons({"title": "x", "price": 1, "url": "https://m.rozetka.com.ua/p1/", "availability": "available"},
+                                         {"ok": True}, None, None, ex)
+        self.assertIn("excluded_site", sub)
+        # an allowed domain is not flagged
+        ok = research.rejection_reasons({"title": "x", "price": 1, "url": "https://olx.ua/d/1", "availability": "available"},
+                                        {"ok": True}, None, None, ex)
+        self.assertNotIn("excluded_site", ok)
+
+    def test_excluded_site_non_rescuable(self):
+        self.assertIn("excluded_site", research.NON_RESCUABLE_REASONS)
+        self.assertFalse(research.is_rescuable({"reasons": ["excluded_site"]}))
+
+    def test_search_and_decompose_prompts_carry_blocklist(self):
+        cfg = research.make_config(3, excluded_sites="rozetka.com.ua")
+        task = {"id": "t1", "query": "q", "focus": "f", "preferred_sites": []}
+        sp = research.build_search_prompt("p", task, "codex", cfg)
+        self.assertIn("BLOCKED", sp)
+        self.assertIn("rozetka.com.ua", sp)
+        # no blocklist -> no BLOCKED line (zero added tokens for the common case)
+        self.assertNotIn("BLOCKED", research.build_search_prompt("p", task, "codex", research.make_config(3)))
+        dp = research.build_decompose_prompt("find x", cfg)
+        self.assertIn("rozetka.com.ua", dp)
+        self.assertNotIn("rozetka.com.ua", research.build_decompose_prompt("find x", research.make_config(3)))
 
     def test_call_model_records_queue_wait(self):
         import tempfile
@@ -990,6 +1258,96 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(lines[1]["phase"], "decomposing")
         self.assertEqual(lines[2]["done"], 1)
 
+    def test_verify_findings_streams_finding_settled_events(self):
+        import tempfile
+        from unittest import mock
+
+        findings = [
+            {"title": "Good", "url": "https://ok.example/1", "price": 10, "currency": "USD",
+             "availability": "available", "source_model": "gemini"},
+            {"title": "Dead", "url": "https://dead.example/2", "price": 20, "currency": "USD",
+             "availability": "available", "source_model": "codex"},
+        ]
+
+        def fake_verify_url(url):
+            return {"ok": True} if "ok.example" in (url or "") else {"ok": False, "reason": "http_404"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            with mock.patch.object(research, "verify_url", side_effect=fake_verify_url), \
+                 mock.patch.object(research, "apply_live_check", lambda item, intent=None: None):
+                verified, rejected = research.verify_findings(
+                    findings, [], None, None, run_dir=run_dir, stage="primary")
+            rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(len(rejected), 1)
+        settled = [r for r in rows if r["event"] == "finding_settled"]
+        self.assertEqual(len(settled), 2)
+        by_verdict = {r["verdict"]: r for r in settled}
+        self.assertEqual(by_verdict["verified"]["url"], "https://ok.example/1")
+        self.assertEqual(by_verdict["verified"]["stage"], "primary")
+        self.assertEqual(by_verdict["rejected"]["url"], "https://dead.example/2")
+        self.assertIn("http_404", by_verdict["rejected"]["reasons"])
+
+    def test_verify_findings_silent_without_run_dir(self):
+        # Back-compat: callers without a run_dir (and the unit tests) must not require an events file.
+        from unittest import mock
+        with mock.patch.object(research, "verify_url", lambda url: {"ok": False, "reason": "x"}):
+            verified, rejected = research.verify_findings(
+                [{"title": "A", "url": "https://e/1", "price": 1, "availability": "available"}])
+        self.assertEqual(verified, [])
+        self.assertEqual(len(rejected), 1)
+
+    def test_record_stage_results_persists_and_summarizes(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            verified = [{"title": "v", "url": "https://e/v"}]
+            rejected = [{"title": "r", "url": "https://e/r"}, {"parse_failed": True, "reasons": ["parse_failed"]}]
+            research.record_stage_results(run_dir, "rescue 1", verified, rejected)
+            saved = research.json.loads((run_dir / "verification.json").read_text())
+            rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+
+        self.assertEqual(saved["stage"], "rescue 1")
+        self.assertEqual(len(saved["verified"]), 1)
+        summary = [r for r in rows if r["event"] == "stage_summary"][-1]
+        self.assertEqual(summary["stage"], "rescue 1")
+        self.assertEqual(summary["verified_total"], 1)
+        # Counts match the persisted lists (and the live stream, which carries parse failures) so the
+        # live view never disagrees with the poll fallback.
+        self.assertEqual(summary["rejected_total"], 2)
+
+    def test_verify_findings_streams_parse_failures_and_dedupes(self):
+        import tempfile
+        from unittest import mock
+
+        good = {"title": "Good", "url": "https://ok.example/1", "price": 10, "currency": "USD",
+                "availability": "available", "source_model": "gemini"}
+        parse_rej = [{"parse_failed": True, "source_model": "codex", "task_id": "t1",
+                      "record_id": "rec-1", "reasons": ["parse_failed"]}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            emitted = {}
+            with mock.patch.object(research, "verify_url", lambda url: {"ok": True}), \
+                 mock.patch.object(research, "apply_live_check", lambda item, intent=None: None):
+                # Round 1: 1 finding + 1 parse failure -> 2 finding_settled events.
+                research.verify_findings([good], parse_rej, None, None,
+                                         run_dir=run_dir, stage="primary", emitted=emitted)
+                # Round 2: re-verify the SAME cumulative set -> nothing changed -> no new events.
+                research.verify_findings([good], parse_rej, None, None,
+                                         run_dir=run_dir, stage="rescue 1", emitted=emitted)
+            rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+
+        settled = [r for r in rows if r["event"] == "finding_settled"]
+        self.assertEqual(len(settled), 2, "re-verifying the same findings must not re-emit")
+        self.assertTrue(any(s.get("parse_failed") and s["verdict"] == "rejected" for s in settled),
+                        "parse failures must be streamed so the live view matches the poll")
+        # First-seen stage wins (no re-emit in round 2), so both carry the primary stage.
+        self.assertTrue(all(s["stage"] == "primary" for s in settled))
+
     def test_cancel_flow(self):
         import subprocess
         import tempfile
@@ -1060,6 +1418,113 @@ class ResearchTests(unittest.TestCase):
 
         sold = {"title": "A", "price": 1, "url": "https://example.com", "availability": "sold"}
         self.assertIn("out_of_stock", research.rejection_reasons(sold, {"ok": True}))
+
+    # ---- researched best-practice adoption (all effort-gated; effort 1-2 must stay unchanged) ----
+
+    def test_effort_1_2_run_fewer_passes(self):
+        # Model TIER is max everywhere now (all frontier families search at every level); the levels
+        # differ by NUMBER OF PASSES/breadth, not by weaker models. The light tiers keep the extra
+        # passes OFF so quick/standard stay fast.
+        for lvl in (1, 2):
+            p = research.EFFORT_PROFILES[lvl]
+            self.assertFalse(p["differentiate_legs"])
+            self.assertEqual(p["angle_variants_per_task"], 0)
+            self.assertEqual(p["coverage_rounds"], 0)
+            self.assertEqual(p["frontier_rounds"], 0)
+            self.assertEqual(p["adjudicate_samples"], 1)
+        for lvl in (3, 4):
+            p = research.EFFORT_PROFILES[lvl]
+            self.assertTrue(p["differentiate_legs"])
+            self.assertGreaterEqual(p["angle_variants_per_task"], 1)
+            self.assertGreaterEqual(p["coverage_rounds"], 1)
+            self.assertGreaterEqual(p["frontier_rounds"], 1)
+            self.assertEqual(p["adjudicate_samples"], 3)
+        # Structured decompose and the full frontier search roster are on at EVERY level now.
+        for lvl in (1, 2, 3, 4):
+            p = research.EFFORT_PROFILES[lvl]
+            self.assertTrue(p["structured_decompose"])
+            self.assertEqual(p["search_legs"], ["codex", "gemini", "claude"])
+
+    def test_mmr_order_demotes_same_host_crowding(self):
+        items = [
+            {"url": "https://a.com/1", "title": "1", "price_usd": 10},
+            {"url": "https://a.com/2", "title": "2", "price_usd": 11},
+            {"url": "https://a.com/3", "title": "3", "price_usd": 12},
+            {"url": "https://a.com/4", "title": "4", "price_usd": 13},
+            {"url": "https://b.com/1", "title": "5", "price_usd": 14},  # lone different host, last by relevance
+        ]
+        out = research.mmr_order(items, lam=0.7)
+        self.assertEqual(out[0]["url"], "https://a.com/1")  # top relevance still wins
+        b_pos = next(i for i, it in enumerate(out) if it["url"] == "https://b.com/1")
+        self.assertLess(b_pos, 4, "MMR should pull the lone different-host item out of last place")
+
+    def test_aggregate_adjudications_majority_and_median(self):
+        accept = lambda p: {"action": "accept", "price": p, "currency": "USD", "reason": "ok"}
+        self.assertEqual(research.aggregate_adjudications([]), None)
+        v = research.aggregate_adjudications([accept(100), accept(110), {"action": "reject", "reason": "x"}])
+        self.assertEqual(v["action"], "accept")
+        self.assertEqual(v["price"], 110)  # median of [100, 110]
+        r = research.aggregate_adjudications([{"action": "reject"}, {"action": "reject"}, accept(100)])
+        self.assertEqual(r["action"], "reject")
+
+    def test_coerce_tasks_preserves_structured_fields_and_floor_2(self):
+        cfg = research.make_config(3)
+        payload = {"tasks": [
+            {"id": "task-1", "query": "x", "source_class": "Official_Store", "angle": "exact SKU",
+             "angle_variants": ["x bundle", "x lot"]},
+            {"id": "task-2", "query": "y", "source_class": "classifieds"},
+        ]}
+        tasks = research.coerce_tasks(payload, "x", cfg)
+        self.assertEqual(len(tasks), 2)  # floor is 2, not 3 (single-SKU plans allowed)
+        self.assertEqual(tasks[0]["source_class"], "official_store")
+        self.assertEqual(tasks[0]["angle_variants"], ["x bundle", "x lot"])
+
+    def test_task_query_set_angle_variants_gated(self):
+        task = {"id": "task-1", "query": "base", "query_variants": ["v2"], "angle_variants": ["angle1", "angle2"]}
+        self.assertEqual(len(research.task_query_set(task, 2, 0)), 2)  # angles off
+        expanded = research.task_query_set(task, 2, 2)
+        self.assertEqual(len(expanded), 4)  # 2 surface + 2 angle
+        self.assertTrue(any(tv.get("_angle") for tv in expanded))
+
+    def test_coerce_intent_self_ask_fields(self):
+        intent = research.coerce_intent({"intent": {
+            "subject_keywords": ["x"], "ambiguous": True,
+            "alternatives": ["reading A", "reading B"], "complexity": "single_sku"}})
+        self.assertTrue(intent["ambiguous"])
+        self.assertEqual(intent["complexity"], "single_sku")
+        self.assertEqual(intent["alternatives"], ["reading a", "reading b"])
+        # unknown complexity is dropped
+        self.assertIsNone(research.coerce_intent({"intent": {"complexity": "bogus"}})["complexity"])
+
+    def test_decompose_prompt_gated_sections(self):
+        quick = research.build_decompose_prompt("find x", research.make_config(1))
+        deep = research.build_decompose_prompt("find x", research.make_config(3))
+        for p in (quick, deep):
+            self.assertIn("self-ask", p)        # §1.1 always on
+            self.assertIn("complexity", p)      # §1.3 always on
+            self.assertIn("COVERAGE GRID", p)   # structured decompose now on at every level
+            self.assertIn("source_class", p)
+        self.assertNotIn("angle_variants", quick)  # angle variants still gated to deep/max
+        self.assertIn("angle_variants", deep)
+
+    def test_search_prompt_leg_focus_and_angle(self):
+        cfg = research.make_config(3)
+        task = {"id": "t1", "query": "q", "focus": "f", "preferred_sites": []}
+        base = research.build_search_prompt("p", task, "codex", cfg)
+        self.assertNotIn("SOURCE-CLASS LEAN", base)
+        leaned = research.build_search_prompt("p", task, "codex", cfg, leg_focus="classifieds")
+        self.assertIn("SOURCE-CLASS LEAN", leaned)
+        angled = research.build_search_prompt("p", {**task, "_angle": True}, "codex", cfg, leg_focus="regional")
+        self.assertIn("ORTHOGONAL ANGLE", angled)
+        # pinned-site runs suppress the soft lean (hard domain constraint already steers)
+        pinned = research.build_search_prompt("p", task, "codex", research.make_config(3, sites="olx.ua"), leg_focus="classifieds")
+        self.assertNotIn("SOURCE-CLASS LEAN", pinned)
+
+    def test_covered_source_classes_maps_via_task_id(self):
+        tasks = [{"id": "task-1", "source_class": "official_store"},
+                 {"id": "task-2", "source_class": "classifieds"}]
+        verified = [{"task_id": "task-1#v2"}, {"task_id": "task-1"}]
+        self.assertEqual(research.covered_source_classes(verified, tasks), {"official_store"})
 
 
 if __name__ == "__main__":

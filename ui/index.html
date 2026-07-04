@@ -123,6 +123,9 @@
   .vendor-toggle { padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; background: var(--surface-2); color: var(--muted); transition: background .2s ease, color .2s ease; position: relative; }
   .vendor-toggle.on { background: var(--accent-soft); color: var(--accent-ink); }
   .vendor-toggle:not(.on) { text-decoration: line-through; }
+  .tier-select { border: 0; border-radius: 999px; background: var(--sunken); color: var(--muted); font: inherit; font-size: 12px; font-weight: 600; padding: 4px 8px; cursor: pointer; margin-right: 2px; }
+  .tier-select:hover { background: var(--track); color: var(--ink); }
+  .tier-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .vendors-hint { font-size: 12px; color: var(--muted); }
 
   /* Empty state */
@@ -252,6 +255,28 @@
   .item details[open] summary::before { transform: rotate(90deg); }
   .item summary:hover { color: var(--accent-ink); }
   .item details p { margin: 7px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+  /* Live results: stage tag + a one-shot flash when a finding streams in. */
+  .mini.stage-badge { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+  @keyframes new-flash { 0% { box-shadow: inset 3px 0 0 var(--accent), 0 0 0 1px var(--accent-soft); background: var(--accent-soft); } 100% { box-shadow: none; } }
+  .item.is-new { animation: new-flash 1.4s ease-out both; }
+  /* Per-stage yield: which phase produced how many verified results, live. */
+  .stage-yield { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+  .stage-yield:empty { display: none; }
+  .stage-pill { display: inline-flex; align-items: baseline; gap: 6px; padding: 4px 11px; border-radius: 999px; background: var(--surface-2); font-size: 12px; font-weight: 500; color: var(--ink-2); }
+  .stage-pill .sp-name { font-weight: 600; color: var(--ink); text-transform: capitalize; }
+  .stage-pill .sp-delta { color: var(--good); font-weight: 600; }
+  .stage-pill .sp-delta.zero { color: var(--muted); }
+  .stage-pill.active { background: var(--accent-soft); color: var(--accent-ink); }
+  /* Live preview shown in the content area while synthesis is still pending. */
+  .live-preview .lp-head { display: flex; align-items: center; gap: 9px; margin-bottom: 16px; }
+  .live-preview .lp-head .spinner { flex: none; }
+  .live-preview .lp-title { font-family: var(--display); font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .live-preview .lp-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .live-preview .lp-row { display: flex; align-items: baseline; gap: 10px; padding: 9px 0; border-top: 1px solid var(--sunken); }
+  .live-preview .lp-row:first-of-type { border-top: 0; }
+  .live-preview .lp-price { font-weight: 650; font-size: 14px; white-space: nowrap; }
+  .live-preview .lp-name { color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; flex: 1; }
+  .live-preview .lp-stage { font-size: 11px; color: var(--accent-ink); background: var(--accent-soft); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 
   /* Activity */
   .activity-list { display: flex; flex-direction: column; gap: 7px; max-height: 380px; overflow-y: auto; padding: 2px; }
@@ -319,6 +344,24 @@
   .rej-group summary::after { content: "▾"; margin-left: auto; color: var(--muted); font-size: 11px; transition: transform .3s ease; }
   .rej-group[open] summary::after { transform: rotate(180deg); }
   .rej-group .item-grid { margin-top: 10px; }
+  /* Verified grouped by site — reuses the rej-group collapsible look with a per-site action row. */
+  .site-group { margin-bottom: 12px; }
+  .site-group:last-child { margin-bottom: 0; }
+  .site-group > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 11px 16px; border-radius: var(--r-sm); background: var(--surface-2); font-weight: 600; font-size: 13px; color: var(--ink-2); transition: background .2s ease; }
+  .site-group > summary::-webkit-details-marker { display: none; }
+  .site-group > summary:hover { background: var(--sunken); }
+  .site-group .sg-host { font-weight: 600; }
+  .site-group .sg-cheapest { color: var(--muted); font-weight: 500; }
+  .site-group .sg-actions { margin-left: auto; display: flex; gap: 6px; }
+  .sg-btn { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--sunken); color: var(--muted); transition: background .2s ease, color .2s ease; }
+  .sg-btn:hover { background: var(--track); color: var(--ink); }
+  .sg-btn.block:hover { background: var(--warn-soft); color: var(--warn); }
+  .site-group .item-grid { margin-top: 10px; }
+  /* Blocked-sites chip strip in the composer */
+  .blocked-sites { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 4px; }
+  .blocked-sites .bs-label { font-size: 12px; color: var(--muted); }
+  .blocked-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--warn-soft); color: var(--warn); }
+  .blocked-chip button { background: none; border: 0; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
 
   /* Per-leg summary in activity */
   .leg-summary { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; }
@@ -399,10 +442,24 @@
           <div class="vendors" id="vendors">
             <span class="vendors-label">Models</span>
             <button type="button" class="vendor-toggle on" data-vendor="codex" aria-pressed="true">GPT</button>
+            <select id="tierCodex" class="tier-select" aria-label="GPT reasoning effort" title="GPT reasoning effort (this run only)">
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh" selected>xhigh</option>
+            </select>
             <button type="button" class="vendor-toggle on" data-vendor="gemini" aria-pressed="true">Gemini</button>
+            <select id="tierGemini" class="tier-select" aria-label="Gemini tier" title="Gemini tier (this run only)">
+              <option value="high" selected>High</option>
+              <option value="low">Low</option>
+            </select>
             <button type="button" class="vendor-toggle on" data-vendor="claude" aria-pressed="true">Claude</button>
+            <select id="tierClaude" class="tier-select" aria-label="Claude tier" title="Claude tier (this run only)">
+              <option value="sonnet">Sonnet</option>
+              <option value="opus" selected>Opus</option>
+            </select>
             <span class="vendors-hint" id="vendorsHint"></span>
           </div>
+          <div class="blocked-sites" id="blockedSites" hidden></div>
           <div class="effort-hint" id="effortHint"></div>
         </form>
     </section>
@@ -456,12 +513,14 @@
             <span class="chev">▼</span>
           </button>
           <div class="panel-body"><div class="panel-inner"><div class="panel-pad">
+            <div class="stage-yield" id="stageYield"></div>
             <div class="list-tools" id="verifiedTools" hidden>
               <span class="tool-label">Sort</span>
               <button class="tool-btn on" data-sort="default" type="button">Original</button>
               <button class="tool-btn" data-sort="price" type="button">Price ↑</button>
               <button class="tool-btn" data-sort="confidence" type="button">Confidence ↓</button>
               <button class="tool-btn" id="disputedOnlyBtn" type="button">Disputed only</button>
+              <button class="tool-btn on" id="groupSiteBtn" type="button">Group by site</button>
             </div>
             <div class="item-grid" id="verifiedList"></div>
           </div></div></div>
@@ -523,11 +582,17 @@ const state = {
   submitting: false,
   verifiedSort: 'default',
   disputedOnly: false,
+  groupBySite: true,
+  excludedSites: [],
   elapsedTimer: null,
   elapsedRunId: null,
   histFilter: '',
   lastStatusRun: null,
   lastStatus: null,
+  liveItems: new Map(),      // dedupe-key -> streamed finding (carries _stage / _seq / _new)
+  liveStages: [],            // [{stage, verified_total, rejected_total}] from stage_summary
+  liveSeq: 0,                // arrival counter -> stable "discovery order" for the live list
+  liveDirty: false,          // a finding_settled arrived; coalesce renders to one frame
 };
 const $ = (id) => document.getElementById(id);
 const TERMINAL = ['completed', 'failed', 'cancelled'];
@@ -880,18 +945,19 @@ function closeMobileHistory() {
 }
 
 /* ---------------- phase timeline ---------------- */
-const PHASES = ['Decompose', 'Search', 'Verify', 'Rescue', 'Frontier', 'Adjudicate', 'Synthesize', 'Review', 'Fact-check'];
+const PHASES = ['Decompose', 'Search', 'Verify', 'Rescue', 'Coverage', 'Frontier', 'Adjudicate', 'Synthesize', 'Review', 'Fact-check'];
 function phaseIndex(phase) {
   const p = (phase || '').toLowerCase();
   if (/decomp/.test(p)) return 0;
   if (/search/.test(p)) return 1;
   if (/verif/.test(p)) return 2;
   if (/recheck|rescue/.test(p)) return 3;
-  if (/frontier/.test(p)) return 4;
-  if (/adjud/.test(p)) return 5;
-  if (/synth/.test(p)) return 6;
-  if (/review/.test(p)) return 7;
-  if (/factcheck|fact-check/.test(p)) return 8;
+  if (/coverage/.test(p)) return 4;
+  if (/frontier/.test(p)) return 5;
+  if (/adjud/.test(p)) return 6;
+  if (/synth/.test(p)) return 7;
+  if (/review/.test(p)) return 8;
+  if (/factcheck|fact-check/.test(p)) return 9;
   if (/complete|done|final/.test(p)) return PHASES.length;
   return -1;
 }
@@ -918,6 +984,7 @@ function modelChip(name) {
 }
 function itemCard(item, rejected) {
   const card = el('article', 'item');
+  if (item._new) card.classList.add('is-new');
   if (item.parse_failed) {
     card.classList.add('parse-fail');
     const body = el('div', 'i-body');
@@ -940,6 +1007,9 @@ function itemCard(item, rejected) {
   } else {
     priceBlock.appendChild(el('div', 'i-price', fmtPrice(item.price, item.currency)));
   }
+  if (item.price_usd_monthly !== undefined && item.price_usd_monthly !== null) {
+    priceBlock.appendChild(el('div', 'i-price-native', '~' + fmtPrice(item.price_usd_monthly, 'USD') + '/mo'));
+  }
   card.appendChild(priceBlock);
 
   // Everything else goes into the body column (right of the price block).
@@ -947,6 +1017,7 @@ function itemCard(item, rejected) {
   body.appendChild(el('div', 'i-title', item.title || 'Untitled'));
 
   const badges = el('div', 'badge-row');
+  if (item._stage) badges.appendChild(el('span', 'mini stage-badge', item._stage));
   if (item.disputed) {
     const prices = (item.price_candidates || []).map((c) => fmtPrice(c.price)).join(' vs ');
     badges.appendChild(el('span', 'mini warn', 'disputed' + (prices ? ': ' + prices : '')));
@@ -959,6 +1030,14 @@ function itemCard(item, rejected) {
   }
   if (item.condition && item.condition !== 'unknown') {
     badges.appendChild(el('span', 'mini' + (item.condition === 'damaged' ? ' bad' : ''), item.condition));
+  }
+  if (item.basis_flag === 'incomparable_basis') {
+    const b = el('span', 'mini warn', 'different pricing basis');
+    if (item.basis_note) b.title = item.basis_note;
+    badges.appendChild(b);
+  }
+  if (item.price_basis && item.price_basis !== 'unknown' && item.price_basis !== 'free') {
+    badges.appendChild(el('span', 'mini info', item.price_basis.replace(/_/g, ' ')));
   }
   if (item.trust && typeof item.trust.score === 'number') {
     const s = item.trust.score;
@@ -1020,25 +1099,128 @@ function unchanged(key, sig) {
   return false;
 }
 
-/* verified: sort / filter toolbar */
+/* per-site grouping + blocklist */
+function normHost(h) {
+  return String(h || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+}
+// hostOf routes through normHost so a listing URL and a user-typed block normalize identically.
+function hostOf(u) {
+  try { return normHost(new URL(u).hostname); } catch (e) { return ''; }
+}
+// Mirror the backend url_in_sites subdomain matching so the client filter agrees with what the
+// backend will reject next run (blocking apex 'x.com' also hides 'm.x.com').
+function hostBlocked(host) {
+  return state.excludedSites.some((b) => host === b || host.endsWith('.' + b));
+}
+function renderBlockedChips() {
+  const node = $('blockedSites');
+  node.replaceChildren();
+  const hosts = state.excludedSites;
+  node.hidden = !hosts.length;
+  if (!hosts.length) return;
+  node.appendChild(el('span', 'bs-label', 'Blocked'));
+  hosts.forEach((h) => {
+    const chip = el('span', 'blocked-chip');
+    chip.appendChild(document.createTextNode(h));
+    const x = document.createElement('button');
+    x.type = 'button'; x.textContent = '×'; x.title = 'Unblock ' + h;
+    x.addEventListener('click', () => removeExcluded(h));
+    chip.appendChild(x);
+    node.appendChild(chip);
+  });
+}
+function addExcluded(host) {
+  const h = normHost(host);
+  if (!h || state.excludedSites.includes(h)) return;
+  state.excludedSites.push(h);
+  savePrefs(); renderBlockedChips(); renderVerified();
+  toast('Blocked ' + h + ' — takes full effect on the next run');
+}
+function removeExcluded(host) {
+  const h = normHost(host);
+  state.excludedSites = state.excludedSites.filter((x) => x !== h);
+  savePrefs(); renderBlockedChips(); renderVerified();
+}
+function scopeToSite(host) {
+  removeExcluded(host);                 // scope wins over any block on the same host
+  $('sitesInput').value = normHost(host);
+  savePrefs();
+  form.requestSubmit();
+}
+
+/* verified: sort / filter / group toolbar */
 function renderVerified() {
   const items = (state.detail && state.detail.verified) || [];
   $('verifiedTools').hidden = items.length < 2;
   let arr = items.slice();
+  arr.forEach((i) => { i._host = hostOf(i.url); });   // compute the host once; reused by filter + grouping
+  // A freshly-blocked host disappears from the CURRENT run immediately (backend enforces it next run;
+  // subdomain-aware, matching url_in_sites).
+  if (state.excludedSites.length) arr = arr.filter((i) => !hostBlocked(i._host));
   if (state.disputedOnly) arr = arr.filter((i) => i.disputed);
   if (state.verifiedSort === 'price') arr.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
   else if (state.verifiedSort === 'confidence') arr.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
-  const emptyMsg = items.length && !arr.length ? 'No disputed items in this run.' : undefined;
-  const sig = state.current + '|' + state.verifiedSort + '|' + state.disputedOnly + '|' + JSON.stringify(arr.map((i) => [i.url, i.price, i.disputed]));
+  $('verifiedCount').textContent = String(arr.length);   // keep the badge in sync with the filtered view
+  const emptyMsg = items.length && !arr.length ? 'No matching items in this run.' : undefined;
+  const hosts = new Set(arr.map((i) => i._host).filter(Boolean));
+  const grouped = state.groupBySite && hosts.size >= 2;
+  const sig = state.current + '|' + state.verifiedSort + '|' + state.disputedOnly + '|' + grouped + '|'
+    + state.excludedSites.join(',') + '|' + JSON.stringify(arr.map((i) => [i.url, i.price, i.disputed, i.url_check && i.url_check.ok, (i.source_models || []).length]));
   if (unchanged('verified', sig)) return;
-  renderItems($('verifiedList'), arr, false, emptyMsg);
+  if (grouped) renderVerifiedGrouped(arr); else renderItems($('verifiedList'), arr, false, emptyMsg);
 }
+function renderVerifiedGrouped(arr) {
+  const node = $('verifiedList');
+  node.replaceChildren();
+  const groups = new Map();
+  arr.forEach((it) => {
+    const h = it._host || 'other';
+    if (!groups.has(h)) groups.set(h, []);
+    groups.get(h).push(it);
+  });
+  // Cheapest per group, computed once (not re-scanned inside the sort comparator).
+  const mins = new Map([...groups].map(([h, list]) => [h, Math.min(...list.map((i) => (i.price_usd ?? Infinity)))]));
+  [...groups.entries()].sort((a, b) => mins.get(a[0]) - mins.get(b[0])).forEach(([host, list]) => {
+    const det = el('details', 'site-group'); det.open = true;
+    const sum = el('summary');
+    sum.appendChild(el('span', 'sg-host', host));
+    sum.appendChild(el('span', 'count-chip good', String(list.length)));
+    const min = mins.get(host);
+    if (isFinite(min)) sum.appendChild(el('span', 'sg-cheapest', 'from ' + fmtPrice(min, 'USD')));
+    const actions = el('div', 'sg-actions');
+    ['only', 'block'].forEach((act) => {
+      const b = el('button', 'sg-btn' + (act === 'block' ? ' block' : ''));
+      b.type = 'button'; b.textContent = act === 'only' ? 'Only this site' : 'Block site';
+      b.dataset.act = act; b.dataset.host = host;
+      actions.appendChild(b);
+    });
+    sum.appendChild(actions);
+    det.appendChild(sum);
+    const grid = el('div', 'item-grid');
+    list.forEach((it) => grid.appendChild(itemCard(it, false)));
+    det.appendChild(grid);
+    node.appendChild(det);
+  });
+}
+// Per-group action buttons live inside #verifiedList (outside the #verifiedTools delegate); handle
+// them here. preventDefault stops the click from toggling the <details> they sit in.
+$('verifiedList').addEventListener('click', (e) => {
+  const btn = e.target.closest('.sg-btn');
+  if (!btn) return;
+  e.preventDefault(); e.stopPropagation();
+  if (btn.dataset.act === 'only') scopeToSite(btn.dataset.host);
+  else if (btn.dataset.act === 'block') addExcluded(btn.dataset.host);
+});
 $('verifiedTools').addEventListener('click', (e) => {
   const btn = e.target.closest('.tool-btn');
   if (!btn) return;
   if (btn.id === 'disputedOnlyBtn') {
     state.disputedOnly = !state.disputedOnly;
     btn.classList.toggle('on', state.disputedOnly);
+  } else if (btn.id === 'groupSiteBtn') {
+    state.groupBySite = !state.groupBySite;
+    btn.classList.toggle('on', state.groupBySite);
+    savePrefs();
   } else if (btn.dataset.sort) {
     state.verifiedSort = btn.dataset.sort;
     $('verifiedTools').querySelectorAll('[data-sort]').forEach((b) => b.classList.toggle('on', b === btn));
@@ -1060,10 +1242,12 @@ const REASON_LABELS = {
   off_site: 'Off the allowed sites',
   out_of_stock: 'Out of stock / sold',
   missing_price: 'No price found',
+  free_excluded: 'Free — not a paid option',
+  excluded_site: 'Blocked site (excluded by you)',
 };
 function renderRejected(items) {
   const node = $('rejectedList');
-  const sig = state.current + '|' + JSON.stringify(items.map((i) => [i.url, i.price, (i.reasons || [])[0]]));
+  const sig = state.current + '|' + JSON.stringify(items.map((i) => [i.url, i.price, (i.reasons || [])[0], i.url_check && i.url_check.ok]));
   if (unchanged('rejected', sig)) return;
   node.replaceChildren();
   if (!items.length) {
@@ -1105,6 +1289,10 @@ function renderDetails(detail) {
   const grid = el('div', 'details-grid');
   if (cfg.effort) grid.appendChild(kv('Effort', cfg.effort + (cfg.effort_level ? ` (level ${cfg.effort_level})` : '')));
   if (cfg.sites && cfg.sites.length) grid.appendChild(kv('Sites', cfg.sites.join(', ')));
+  if (cfg.vendor_tiers && Object.keys(cfg.vendor_tiers).length) {
+    grid.appendChild(kv('Model tiers', `GPT ${cfg.vendor_tiers.codex} · Gemini ${cfg.vendor_tiers.gemini} · Claude ${cfg.vendor_tiers.claude}`));
+  }
+  if (cfg.excluded_sites && cfg.excluded_sites.length) grid.appendChild(kv('Blocked sites', cfg.excluded_sites.join(', '), true));
   if (cfg.disabled_legs && cfg.disabled_legs.length) {
     grid.appendChild(kv('Models off', cfg.disabled_legs.map((v) => VENDOR_NAMES[v] || v).join(', '), true));
   }
@@ -1262,6 +1450,107 @@ function renderActivity() {
   });
   list.appendChild(lanes);
 }
+
+/* ---------------- live results (SSE finding_settled / stage_summary) ---------------- */
+function runIsLive() {
+  const s = (state.detail && state.detail.run && state.detail.run.status) || state.lastStatus;
+  return s === 'running' || s === 'queued';
+}
+// Identity must match the backend finding_dedupe_key (NOT include stage), so the same finding
+// re-emitted in a later round updates its existing card instead of spawning a duplicate.
+function liveKey(f) {
+  return f.url || f.record_id || ((f.title || 'untitled') + '|' + f.price + '|' + f.currency);
+}
+function liveUpsert(f) {
+  const key = liveKey(f);
+  const prev = state.liveItems.get(key);
+  const ucOk = f.url_check && f.url_check.ok;
+  const changed = !prev || prev._verdict !== f.verdict || prev.price_usd !== f.price_usd || prev.price !== f.price
+    || (prev.url_check && prev.url_check.ok) !== ucOk || (prev.source_models || []).length !== (f.source_models || []).length;
+  const it = prev || { _stage: f.stage, _seq: ++state.liveSeq };  // first-seen stage/order wins
+  it.title = f.title; it.url = f.url; it.record_id = f.record_id;
+  it.price = f.price; it.currency = f.currency; it.price_usd = f.price_usd;
+  it.marketplace = f.marketplace; it.availability = f.availability;
+  it.disputed = f.disputed; it.parse_failed = f.parse_failed; it.reasons = f.reasons || [];
+  it.source_models = f.source_models || [];
+  it.source_model = (f.source_models && f.source_models[0]) || undefined;  // itemCard parse-fail path reads this
+  it.url_check = f.url_check || null;
+  it.live_check = f.live_check || null;  // itemCard prefers live_check; keeping both matches the final card
+  it._verdict = f.verdict;
+  it._new = changed;  // flash only on first sight or a real change, not on every round's re-emit
+  state.liveItems.set(key, it);
+}
+function liveByVerdict(verdict) {
+  return [...state.liveItems.values()].filter((i) => i._verdict === verdict).sort((a, b) => a._seq - b._seq);
+}
+// During a live run the streamed store is fresher than the periodic verification.json snapshot,
+// so it becomes the source of truth for the panels; on a terminal run the authoritative final
+// detail (with trust/confidence) wins.
+function applyLiveToDetail() {
+  if (!runIsLive() || !state.liveItems.size || !state.detail) return false;
+  state.detail.verified = liveByVerdict('verified');
+  state.detail.rejected = liveByVerdict('rejected');
+  return true;
+}
+function clearNewFlags() {
+  state.liveItems.forEach((i) => { i._new = false; });
+}
+function renderStageYield() {
+  const node = $('stageYield');
+  if (!node) return;
+  if (!runIsLive() || !state.liveStages.length) { node.replaceChildren(); return; }
+  node.replaceChildren();
+  let prev = 0;
+  state.liveStages.forEach((s, idx) => {
+    const delta = s.verified_total - prev;
+    prev = s.verified_total;
+    const pill = el('span', 'stage-pill' + (idx === state.liveStages.length - 1 ? ' active' : ''));
+    pill.appendChild(el('span', 'sp-name', s.stage));
+    pill.appendChild(el('span', null, s.verified_total + ' ✓'));
+    pill.appendChild(el('span', 'sp-delta' + (delta > 0 ? '' : ' zero'), (delta >= 0 ? '+' : '') + delta));
+    pill.title = `${s.stage}: ${s.verified_total} verified, ${s.rejected_total} rejected so far`;
+    node.appendChild(pill);
+  });
+}
+function renderLivePreview(area) {
+  const top = liveByVerdict('verified').slice().sort((a, b) => (a.price_usd ?? Infinity) - (b.price_usd ?? Infinity)).slice(0, 8);
+  area.replaceChildren();
+  const card = el('div', 'report-card live-preview');
+  const head = el('div', 'lp-head');
+  head.appendChild(el('span', 'spinner'));
+  const ht = el('div');
+  ht.appendChild(el('div', 'lp-title', 'Preliminary results — updating live'));
+  ht.appendChild(el('div', 'lp-sub', 'The verified findings so far, cheapest first. The synthesized answer replaces this when the models finish.'));
+  head.appendChild(ht);
+  card.appendChild(head);
+  top.forEach((it) => {
+    const row = el('div', 'lp-row');
+    row.appendChild(el('span', 'lp-price', it.price_usd != null ? fmtPrice(it.price_usd, 'USD') : fmtPrice(it.price, it.currency)));
+    row.appendChild(el('span', 'lp-name', it.title || 'Untitled'));
+    if (it._stage) row.appendChild(el('span', 'lp-stage', it._stage));
+    card.appendChild(row);
+  });
+  area.appendChild(card);
+}
+function flushLive() {
+  if (!applyLiveToDetail()) return;
+  renderVerified();
+  renderRejected(state.detail.rejected || []);
+  renderStageYield();
+  const v = state.detail.verified || [], r = state.detail.rejected || [];
+  $('rejectedCount').textContent = String(r.length);   // #verifiedCount is owned by renderVerified (filtered view)
+  const counts = $('countsChip');
+  counts.hidden = false;
+  counts.textContent = `${v.length} verified · ${r.length} rejected`;
+  if (!(state.detail.final_url)) renderLivePreview($('reportArea'));
+  clearNewFlags();
+}
+function scheduleFlush() {
+  if (state.liveDirty) return;
+  state.liveDirty = true;
+  requestAnimationFrame(() => { state.liveDirty = false; flushLive(); });
+}
+
 function handleEvent(f) {
   if (!f || typeof f !== 'object') return;
   switch (f.event) {
@@ -1303,6 +1592,17 @@ function handleEvent(f) {
     case 'cancel_requested':
       $('statusText').textContent = 'Cancelling…';
       break;
+    case 'finding_settled':
+      liveUpsert(f);
+      scheduleFlush();
+      break;
+    case 'stage_summary': {
+      const i = state.liveStages.findIndex((s) => s.stage === f.stage);
+      const entry = { stage: f.stage, verified_total: f.verified_total, rejected_total: f.rejected_total };
+      if (i >= 0) state.liveStages[i] = entry; else state.liveStages.push(entry);
+      scheduleFlush();
+      break;
+    }
     default: break; // ignore unknown event types
   }
 }
@@ -1410,7 +1710,8 @@ function syncFloatPill() {
   }
 }
 function setPanelDefaults(running) {
-  state.openPanels = new Set(running ? ['activity'] : []);
+  // Open the results panel during a run too — it now fills in live, so it shouldn't start collapsed.
+  state.openPanels = new Set(running ? ['verified', 'activity'] : []);
   applyPanelState();
 }
 function applyPanelState() {
@@ -1426,6 +1727,7 @@ async function renderRun(detail) {
   const run = detail.run || {};
   const status = run.status || 'unknown';
   const running = status === 'running' || status === 'queued';
+  applyLiveToDetail();  // during a run the live stream is fresher than the polled snapshot
 
   $('emptyState').hidden = true;
   $('runView').hidden = false;
@@ -1464,8 +1766,8 @@ async function renderRun(detail) {
 
   renderVerified();
   renderRejected(rejected);
-  $('verifiedCount').textContent = String(verified.length);
-  $('rejectedCount').textContent = String(rejected.length);
+  renderStageYield();
+  $('rejectedCount').textContent = String(rejected.length);   // #verifiedCount is owned by renderVerified
   renderDetails(detail);
   renderActivity();
 
@@ -1492,6 +1794,16 @@ async function renderRun(detail) {
         ph.appendChild(el('div', 'rp-note', 'The report could not be loaded.'));
         area.appendChild(ph);
       }
+    }
+  } else if (running && liveByVerdict('verified').length) {
+    /* Live preview replaces the skeleton once results start arriving; flushLive keeps it fresh
+       on each finding, so only (re)render here when first switching into preview mode. */
+    const phKey = 'livepreview|' + (run.run_id || state.current);
+    if (state.reportKey !== phKey) {
+      state.reportKey = phKey;
+      state.reportMd = null;
+      $('reportTools').hidden = true;
+      renderLivePreview(area);
     }
   } else {
     /* Rebuild the placeholder only when its kind changes, otherwise the
@@ -1549,6 +1861,9 @@ async function selectRun(runId, { fresh = false } = {}) {
   localStorage.setItem('currentRun', runId);
   state.activity = new Map();
   state.degraded = new Set();
+  state.liveItems = new Map();
+  state.liveStages = [];
+  state.liveSeq = 0;
   state.reportKey = null;
   highlightHistory();
   $('composer').classList.add('compact');
@@ -1595,12 +1910,17 @@ function syncEffortHint() {
   $('effortHint').textContent = EFFORT_HINTS[$('effortSelect').value] || '';
 }
 function savePrefs() {
-  try { localStorage.setItem('prefs', JSON.stringify({ effort: $('effortSelect').value, sites: $('sitesInput').value, disabled: disabledVendors() })); } catch (e) {}
+  try {
+    localStorage.setItem('prefs', JSON.stringify({
+      effort: $('effortSelect').value, sites: $('sitesInput').value, disabled: disabledVendors(),
+      excludedSites: state.excludedSites, groupBySite: state.groupBySite,
+    }));
+  } catch (e) {}
 }
 function loadPrefs() {
   let p = null;
   try { p = JSON.parse(localStorage.getItem('prefs') || 'null'); } catch (e) {}
-  if (!p) return;
+  if (!p) { renderBlockedChips(); return; }
   if (p.effort) $('effortSelect').value = p.effort;
   if (p.sites) $('sitesInput').value = p.sites;
   const off = new Set(p.disabled || []);
@@ -1609,6 +1929,10 @@ function loadPrefs() {
     b.classList.toggle('on', on);
     b.setAttribute('aria-pressed', String(on));
   });
+  // Blocklist is a GLOBAL, persistent preference (unlike the per-run model tiers).
+  state.excludedSites = Array.isArray(p.excludedSites) ? p.excludedSites.slice() : [];
+  if (p.groupBySite === false) { state.groupBySite = false; $('groupSiteBtn').classList.remove('on'); }
+  renderBlockedChips();
   syncEffortHint();
   syncVendorsHint();
 }
@@ -1637,11 +1961,13 @@ form.addEventListener('submit', async (e) => {
   state.submitting = true;
   syncStartBtn();
   const effort = Number($('effortSelect').value || 2);
+  // Per-vendor tier/effort for this run only (not persisted; defaults to the strongest tier).
+  const vendor_tiers = { codex: $('tierCodex').value, gemini: $('tierGemini').value, claude: $('tierClaude').value };
   try {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim(), disabled: disabledVendors() }),
+      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim(), disabled: disabledVendors(), vendor_tiers, excluded_sites: state.excludedSites }),
     });
     if (!res.ok) throw new Error('http ' + res.status);
     const data = await res.json();
