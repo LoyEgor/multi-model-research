@@ -846,6 +846,252 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(len(calls), 6)
         self.assertEqual({tid for _, tid in calls}, {"task-1", "task-1#v2"})
 
+    def test_run_primary_search_includes_audit_extra_tasks(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append((leg, task_id))
+            return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
+
+        class _Supplier:  # Future-like: yields the audit's extra tasks when waited on
+            def result(self, timeout=None):
+                return [{"id": "audit-1", "query": "extra q", "focus": "f", "preferred_sites": [], "query_variants": []}]
+
+        tasks = [{"id": "task-1", "query": "q1", "query_variants": [], "preferred_sites": []}]
+        cfg = research.make_config("standard")  # level 2: legs codex+gemini+claude, 1 variant, plan_audit on
+        sink = []
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_primary_search("p", tasks, run_dir, cfg,
+                                            extra_tasks_supplier=_Supplier(), extra_tasks_sink=sink)
+        task_ids = {tid for _, tid in calls}
+        self.assertIn("task-1", task_ids)
+        self.assertIn("audit-1", task_ids)          # the audit-added task joined the same fan-out
+        self.assertEqual(len(calls), 6)             # (1 base + 1 extra) tasks × 3 legs
+        self.assertEqual(len(sink), 1)              # only actually-searched extra tasks reported back
+
+    def test_run_primary_search_timed_out_audit_adds_nothing(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append((leg, task_id))
+            return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
+
+        class _SlowSupplier:  # never ready within the bounded wait
+            def result(self, timeout=None):
+                raise research.concurrent.futures.TimeoutError()
+
+        tasks = [{"id": "task-1", "query": "q1", "query_variants": [], "preferred_sites": []}]
+        cfg = research.make_config("standard")
+        sink = []
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_primary_search("p", tasks, run_dir, cfg,
+                                            extra_tasks_supplier=_SlowSupplier(), extra_tasks_sink=sink)
+        self.assertEqual(len(calls), 3)  # only the base task × 3 legs; a late audit adds nothing
+        self.assertEqual(sink, [])
+
+    def test_make_config_plan_audit_gated(self):
+        self.assertFalse(research.make_config(1)["plan_audit"])
+        for lvl in (2, 3, 4):
+            self.assertTrue(research.make_config(lvl)["plan_audit"])
+
+    def test_plan_audit_prompt_content(self):
+        tasks = [{"id": "task-1", "query": "macbook air m2", "focus": "official store",
+                  "source_class": "official_store", "angle": "exact SKU", "preferred_sites": ["apple.com"]}]
+        p = research.build_plan_audit_prompt("find cheap macbook", tasks, research.default_intent(), research.make_config(3))
+        self.assertIn("macbook air m2", p)   # the planned task list is embedded
+        self.assertIn("official_store", p)
+        self.assertIn('"verdict"', p)        # strict JSON schema fields
+        self.assertIn('"extra_tasks"', p)
+        self.assertIn("up to 2", p)          # the additive-task cap is stated
+        self.assertIn("ONLY valid JSON", p)
+
+    def test_coerce_audit_tasks_cap_dedupe_and_tag(self):
+        cfg = research.make_config(3)
+        existing = [{"id": "task-1", "query": "macbook air m2", "query_variants": ["apple macbook air 2022"]}]
+        raw_extra = [
+            {"query": "macbook air m2", "source_class": "official_store"},            # dup of base query -> dropped
+            {"query": "Apple MacBook Air 2022", "source_class": "big_marketplace"},    # dup of a query_variant -> dropped
+            {"query": "refurbished macbook air m2", "query_variants": ["v1", "v2", "v3"], "source_class": "refurb_used"},
+            {"query": "macbook air m2 telegram resale", "source_class": "forums_telegram"},
+            {"query": "macbook air m2 local uk", "source_class": "regional"},          # 3rd valid -> capped out
+        ]
+        out = research.coerce_audit_tasks(raw_extra, existing, cfg)
+        self.assertEqual(len(out), 2)                                   # capped at 2, both dups dropped
+        self.assertEqual([t["origin"] for t in out], ["plan_audit", "plan_audit"])
+        self.assertEqual(out[0]["query_variants"], ["v1"])             # 1-variant cap (surgical)
+        self.assertEqual(len({t["id"] for t in out}), 2)               # distinct audit id space
+        self.assertTrue(all(t["id"].startswith("audit-") for t in out))
+        kept = {t["query"] for t in out}
+        self.assertNotIn("macbook air m2", kept)
+        self.assertNotIn("Apple MacBook Air 2022", kept)
+        # a non-list payload never raises
+        self.assertEqual(research.coerce_audit_tasks(None, existing, cfg), [])
+
+    def test_audit_plan_unparseable_returns_empty(self):
+        import tempfile
+        from unittest import mock
+
+        tasks = [{"id": "task-1", "query": "q", "preferred_sites": []}]
+        for record in ({"success": True, "stdout": "not json at all", "leg": "codex"},
+                       {"success": False, "rc": 1, "leg": "codex"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp)
+                with mock.patch.object(research, "call_model", return_value=record):
+                    out = research.audit_plan("p", tasks, research.default_intent(), run_dir, research.make_config(3))
+                self.assertEqual(out, [])  # advisory: any failure -> [] with no exception
+                rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+                self.assertTrue(any(r["event"] == "plan_audit_finished" for r in rows))  # still observable
+
+    def test_audit_plan_success_yields_extra_tasks(self):
+        import tempfile
+        from unittest import mock
+
+        tasks = [{"id": "task-1", "query": "macbook air m2", "preferred_sites": []}]
+        payload = {"verdict": "gaps", "notes": "no refurb channel planned",
+                   "extra_tasks": [
+                       {"query": "macbook air m2", "source_class": "official_store"},  # dup -> dropped
+                       {"query": "refurbished macbook air m2", "query_variants": ["a", "b"], "source_class": "refurb_used"},
+                   ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            record = {"success": True, "stdout": research.json.dumps(payload), "leg": "codex"}
+            with mock.patch.object(research, "call_model", return_value=record):
+                out = research.audit_plan("p", tasks, research.default_intent(), run_dir, research.make_config(3))
+            meta = research.read_json(run_dir / "run.json", {})
+        self.assertEqual(len(out), 1)                       # dup dropped, one genuinely-additive task kept
+        self.assertEqual(out[0]["origin"], "plan_audit")
+        self.assertEqual(out[0]["query_variants"], ["a"])   # 1-variant cap
+        self.assertEqual(meta["plan_audit"], {"verdict": "gaps", "added": 1})
+
+    def test_make_config_gap_audit_gated(self):
+        self.assertFalse(research.make_config(1)["gap_audit"])
+        for lvl in (2, 3, 4):
+            self.assertTrue(research.make_config(lvl)["gap_audit"])
+
+    def test_gap_audit_prompt_content(self):
+        verified = [
+            {"title": "MacBook Air M2 2022", "price": 899, "currency": "USD", "url": "https://amazon.com/a"},
+            {"title": "MacBook Air M2 refurb", "price_usd": 780, "url": "https://backmarket.com/b"},
+        ]
+        host_dist = {"amazon.com": 1, "backmarket.com": 1, "olx.ua": 0}
+        p = research.build_gap_audit_prompt("find cheap macbook air m2",
+                                            research.default_intent(), verified, host_dist)
+        self.assertIn("MacBook Air M2 2022", p)     # finding one-liners embedded
+        self.assertIn("899 USD", p)
+        self.assertIn("amazon.com", p)              # host distribution embedded
+        self.assertIn("olx.ua", p)                  # incl. a zero-result host
+        self.assertIn("returned NOTHING", p)
+        self.assertIn("up to 3", p)                 # material-gap cap stated
+        self.assertIn("ONLY valid JSON", p)         # strict JSON contract
+        self.assertIn('"gaps"', p)                  # schema key
+        self.assertIn("Do NOT invent gaps", p)      # do-not-invent instruction
+
+    def test_coerce_gap_queries_cap_and_dedupe(self):
+        cfg = research.make_config(2)
+        tasks = [{"id": "task-1", "query": "macbook air m2", "query_variants": ["apple macbook air 2022"]}]
+        raw = [
+            {"query": "macbook air m2", "reason": "x"},                 # dup of base task query -> dropped
+            {"query": "Apple MacBook Air 2022", "reason": "y"},         # dup of a query_variant -> dropped
+            {"query": "refurbished macbook air m2", "reason": "refurb channel missing"},
+            {"query": "macbook air m2 telegram resale", "reason": "no forum channel"},
+            {"query": "refurbished macbook air m2", "reason": "dup of an earlier gap"},  # dup of a kept gap
+            {"query": "macbook air m2 local uk", "reason": "regional"},  # 4th unique -> capped out
+        ]
+        out = research.coerce_gap_queries(raw, tasks, cfg)
+        self.assertEqual(len(out), 3)                                   # capped at 3, all dups dropped
+        queries = [g["query"] for g in out]
+        self.assertNotIn("macbook air m2", queries)
+        self.assertNotIn("Apple MacBook Air 2022", queries)
+        self.assertEqual(len(queries), len(set(q.lower() for q in queries)))  # no dup between gaps
+        self.assertTrue(all("reason" in g for g in out))
+        self.assertEqual(research.coerce_gap_queries("garbage", tasks, cfg), [])  # non-list -> []
+        self.assertEqual(research.coerce_gap_queries([{"reason": "no query"}], tasks, cfg), [])  # empty query
+
+    def test_gap_audit_failure_returns_empty(self):
+        import tempfile
+        from unittest import mock
+
+        verified = [{"title": "t", "price": 1, "currency": "USD", "url": "https://ex.com/a"}]
+        for record in ({"success": True, "stdout": "not json", "leg": "codex"},
+                       {"success": False, "rc": 1, "leg": "codex"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp)
+                with mock.patch.object(research, "call_model", return_value=record):
+                    out = research.gap_audit("p", research.default_intent(), verified,
+                                             {"ex.com": 1}, run_dir, research.make_config(2))
+                self.assertEqual(out, [])  # advisory: any failure -> [] with no exception
+                rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+                self.assertTrue(any(r["event"] == "gap_audit_finished" for r in rows))  # still observable
+
+    def test_gap_audit_success_records_run(self):
+        import tempfile
+        from unittest import mock
+
+        tasks = [{"id": "task-1", "query": "macbook air m2", "preferred_sites": []}]
+        verified = [{"title": "t", "price": 1, "currency": "USD", "url": "https://ex.com/a"}]
+        payload = {"gaps": [
+            {"query": "macbook air m2", "reason": "dup of task -> dropped"},
+            {"query": "refurbished macbook air m2", "reason": "no refurb channel covered"},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            record = {"success": True, "stdout": research.json.dumps(payload), "leg": "codex"}
+            with mock.patch.object(research, "call_model", return_value=record):
+                out = research.gap_audit("p", research.default_intent(), verified,
+                                         {"ex.com": 1}, run_dir, research.make_config(2), tasks)
+            meta = research.read_json(run_dir / "run.json", {})
+        self.assertEqual(len(out), 1)                    # dup-of-task gap dropped, one kept
+        self.assertEqual(out[0]["query"], "refurbished macbook air m2")
+        self.assertEqual(meta["gap_audit"], {"gaps": 1})
+
+    def test_run_coverage_round_includes_gap_queries(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append((leg, task_type, task_id))
+            return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
+
+        cfg = research.make_config("deep", None)  # search_legs codex+gemini+claude
+        gaps = [{"query": "refurbished macbook air m2", "reason": "r1"},
+                {"query": "macbook air m2 regional uk", "reason": "r2"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_coverage_round("p", ["classifieds"], [], research.Path(tmp), cfg,
+                                            {"subject_keywords": ["macbook"]}, gap_queries=gaps)
+        ids = [tid for _, _, tid in calls]
+        self.assertEqual(len(calls), 3)                             # 1 missing-class + 2 gap jobs, same batch
+        self.assertTrue(all(tt == "coverage" for _, tt, _ in calls))
+        self.assertTrue(any(i.startswith("class-classifieds") for i in ids))
+        self.assertEqual(sum(1 for i in ids if i.startswith("gap-")), 2)  # both gap queries fanned out
+
+    def test_run_coverage_round_no_jobs_without_gaps_or_classes(self):
+        import tempfile
+        from unittest import mock
+
+        cfg = research.make_config("standard")  # coverage_rounds == 0 -> effort-2 mini-wave path
+        # Effort-2 mini-wave machinery: no gaps -> no jobs -> no wall-clock; gaps -> jobs fire.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research, "call_model") as m:
+                self.assertEqual(research.run_coverage_round("p", [], [], research.Path(tmp), cfg, None), [])
+                m.assert_not_called()
+        # config gating: effort 2 has no coverage round (uses mini-wave), efforts 3-4 merge into it.
+        self.assertEqual(research.make_config(2)["coverage_rounds"], 0)
+        self.assertEqual(research.make_config(3)["coverage_rounds"], 1)
+        self.assertEqual(research.make_config(4)["coverage_rounds"], 1)
+
     def test_extract_variants(self):
         v = research.extract_variants("Pro - 12$  Max 5x - 26$  Max 20x - 40 USD")
         self.assertEqual(v["pro"]["price"], 12.0)
@@ -1489,12 +1735,17 @@ class ResearchTests(unittest.TestCase):
     def test_coerce_intent_self_ask_fields(self):
         intent = research.coerce_intent({"intent": {
             "subject_keywords": ["x"], "ambiguous": True,
-            "alternatives": ["reading A", "reading B"], "complexity": "single_sku"}})
+            "alternatives": ["Reading A", "Reading B"], "complexity": "single_sku",
+            "clarify_question": "Which one did you mean?"}})
         self.assertTrue(intent["ambiguous"])
         self.assertEqual(intent["complexity"], "single_sku")
-        self.assertEqual(intent["alternatives"], ["reading a", "reading b"])
-        # unknown complexity is dropped
+        # alternatives are user-facing (clarify buttons + report note) -> case is PRESERVED now
+        self.assertEqual(intent["alternatives"], ["Reading A", "Reading B"])
+        self.assertEqual(intent["clarify_question"], "Which one did you mean?")
+        # unknown complexity is dropped; a blank clarify_question normalizes to None
         self.assertIsNone(research.coerce_intent({"intent": {"complexity": "bogus"}})["complexity"])
+        self.assertIsNone(research.default_intent()["clarify_question"])
+        self.assertIsNone(research.coerce_intent({"intent": {"clarify_question": "   "}})["clarify_question"])
 
     def test_decompose_prompt_gated_sections(self):
         quick = research.build_decompose_prompt("find x", research.make_config(1))
@@ -1525,6 +1776,370 @@ class ResearchTests(unittest.TestCase):
                  {"id": "task-2", "source_class": "classifieds"}]
         verified = [{"task_id": "task-1#v2"}, {"task_id": "task-1"}]
         self.assertEqual(research.covered_source_classes(verified, tasks), {"official_store"})
+
+    def test_budget_remaining_and_stage_gate(self):
+        cfg = {"time_budget_sec": 1500}
+        now = research.time.monotonic()
+        # ~0s elapsed: full budget remains and an optional stage fits.
+        self.assertGreater(research.budget_remaining_sec(now, cfg), 1400)
+        self.assertTrue(research.stage_fits_budget(now, cfg))
+        # started long enough ago that only <= the reserve remains: optional stage is skipped.
+        drained = now - (cfg["time_budget_sec"] - research.SYNTHESIS_RESERVE_SEC + 5)
+        self.assertLessEqual(research.budget_remaining_sec(drained, cfg), research.SYNTHESIS_RESERVE_SEC)
+        self.assertFalse(research.stage_fits_budget(drained, cfg))
+        # no budget configured -> unbounded: remaining is None and every stage fits.
+        self.assertIsNone(research.budget_remaining_sec(now, {}))
+        self.assertTrue(research.stage_fits_budget(now, {}))
+
+    def test_clamp_round_timeout_math(self):
+        reserve = research.SYNTHESIS_RESERVE_SEC
+        now = research.time.monotonic()
+        cfg = {"time_budget_sec": reserve + 2000}  # 2000s of budget above the synthesis reserve
+        # plenty left: remaining-reserve (~2000) > configured 300 -> configured wins.
+        self.assertEqual(research.clamp_round_timeout(300, now, cfg), 300)
+        # tighter: remaining-reserve ~400 < configured 600 -> clamps toward remaining-reserve.
+        started = now - 1600  # remaining = reserve+2000-1600 = reserve+400 -> spendable ~400
+        self.assertTrue(398 <= research.clamp_round_timeout(600, started, cfg) <= 400)
+        # drained past the reserve: clamps to the 60s floor, never negative.
+        empty = now - 2100  # remaining < reserve -> remaining-reserve negative
+        self.assertEqual(research.clamp_round_timeout(600, empty, cfg), 60)
+        # unbounded -> configured unchanged.
+        self.assertEqual(research.clamp_round_timeout(600, now, {}), 600)
+
+    def test_emit_deadline_skip_records_event_and_run_field(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            skipped = []
+            research.emit_deadline_skip(run_dir, "frontier", 123.7, skipped)
+            research.emit_deadline_skip(run_dir, "frontier", 100.0, skipped)  # same stage -> deduped
+            research.emit_deadline_skip(run_dir, "final_factcheck", None, skipped)
+            rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+            meta = research.read_json(run_dir / "run.json", {})
+        skips = [r for r in rows if r["event"] == "stage_skipped_deadline"]
+        self.assertEqual([r["stage"] for r in skips], ["frontier", "frontier", "final_factcheck"])
+        self.assertEqual(skips[0]["remaining_sec"], 123)  # int-truncated
+        self.assertIsNone(skips[2]["remaining_sec"])       # unbounded -> None
+        self.assertEqual(skipped, ["frontier", "final_factcheck"])            # deduped accumulation
+        self.assertEqual(meta["skipped_by_deadline"], ["frontier", "final_factcheck"])  # persisted
+
+    def test_decompose_prompt_plan_and_solve_and_exclusivity(self):
+        p = research.build_decompose_prompt("find x", research.make_config(3))
+        self.assertIn("Plan-and-Solve", p)   # plan-then-tasks framing near the top
+        self.assertIn("EXTRACT", p)
+        self.assertIn("MUTUALLY EXCLUSIVE", p)  # task-boundary contract
+
+    def test_recheck_and_frontier_prompts_include_do_not_report_urls(self):
+        known = [f"https://ex.com/{i}" for i in range(25)]
+        rp = research.build_recheck_prompt(
+            "find x", {"title": "t", "url": "https://ex.com/rejected"}, research.make_config(3), known)
+        self.assertIn("Do NOT re-report", rp)
+        self.assertIn("https://ex.com/0", rp)
+        self.assertIn("https://ex.com/19", rp)   # 20th URL kept
+        self.assertNotIn("https://ex.com/20", rp)  # capped at 20
+        fp = research.build_frontier_prompt("find x", 100.0, [], {"subject_keywords": ["x"]}, None, known)
+        self.assertIn("Do NOT re-report", fp)
+        self.assertIn("https://ex.com/0", fp)
+        self.assertNotIn("https://ex.com/20", fp)
+        # no known URLs -> no block at all
+        self.assertNotIn("Do NOT re-report",
+                         research.build_recheck_prompt("find x", {"title": "t"}, research.make_config(3)))
+        self.assertNotIn("Do NOT re-report", research.build_frontier_prompt("find x", 100.0, [], None))
+
+    def test_synthesis_prompt_ambiguity_and_skip_note(self):
+        finding = {"title": "x", "url": "https://e", "price_usd": 10}
+        p = research.build_synthesis_prompt(
+            "find x", [], [finding], [], {"sites": [], "judge_effort": "xhigh"}, None,
+            {"subject_keywords": ["x"], "ambiguous": True, "alternatives": ["a", "b"]},
+            ["coverage", "frontier"],
+        )
+        self.assertIn("intent.ambiguous", p)
+        self.assertIn("proceeded on ONE assumed", p)  # assumption-statement instruction
+        self.assertIn("verification_stages_skipped_deadline", p)  # skipped-stage degradation note wired in
+
+    # ---- interactive clarify gate ----
+
+    def test_decompose_prompt_clarify_instruction(self):
+        p = research.build_decompose_prompt("find x", research.make_config(2))
+        self.assertIn("clarify_question", p)                    # emit-a-question instruction present
+        self.assertIn("SAME language as the user request", p)   # question in the user's language
+        # the first-alternative-is-the-default rule the UI/synthesis rely on
+        self.assertIn("FIRST entry in intent.alternatives MUST be the assumed/default reading", p)
+
+    def test_make_config_interactive_default_and_passthrough(self):
+        self.assertFalse(research.make_config("standard", None)["interactive"])   # default off
+        self.assertFalse(research.make_config("standard", None, interactive=None)["interactive"])
+        self.assertTrue(research.make_config("standard", None, interactive=True)["interactive"])
+
+    def test_should_ask_clarify_gate(self):
+        intent = {"ambiguous": True, "clarify_question": "Which region?", "alternatives": ["EU", "US"]}
+        ask, q, alts = research.should_ask_clarify({"interactive": True}, intent)
+        self.assertTrue(ask)
+        self.assertEqual(q, "Which region?")
+        self.assertEqual(alts, ["EU", "US"])
+        # NON-interactive runs must NEVER ask (scripts never block), even on an ambiguous plan
+        self.assertFalse(research.should_ask_clarify({"interactive": False}, intent)[0])
+        self.assertFalse(research.should_ask_clarify({}, intent)[0])
+        # interactive but no concrete question / not ambiguous -> no ask
+        self.assertFalse(research.should_ask_clarify({"interactive": True},
+                                                     {"ambiguous": True, "clarify_question": ""})[0])
+        self.assertFalse(research.should_ask_clarify({"interactive": True},
+                                                     {"ambiguous": False, "clarify_question": "q"})[0])
+
+    def test_submit_and_read_clarification(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            try:
+                entry = research.submit_clarification(run_dir, "sub1", {"answer": "  the max plan  "})
+                self.assertEqual(entry, {"answer": "the max plan", "skip": False})
+                # registry fast-path AND clarify.json on disk both carry it (belt-and-suspenders)
+                self.assertEqual(research.read_clarification(run_dir, "sub1")["answer"], "the max plan")
+                self.assertEqual(research.read_json(run_dir / "clarify.json", None)["answer"], "the max plan")
+                # explicit skip and a blank answer both normalize to skip=True ("proceed now")
+                self.assertTrue(research.submit_clarification(run_dir, "sub1", {"skip": True})["skip"])
+                self.assertTrue(research.submit_clarification(run_dir, "sub1", {"answer": ""})["skip"])
+            finally:
+                research.clear_clarification("sub1")
+
+    def test_wait_for_clarification(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+            try:
+                # pre-written clarify.json -> returned immediately (even before the deadline check)
+                research.write_json(run_dir / "clarify.json", {"answer": "EU", "skip": False})
+                got = research.wait_for_clarification(run_dir, "w1", timeout_sec=5, poll_interval=0.01)
+                self.assertEqual(got["answer"], "EU")
+            finally:
+                research.clear_clarification("w1")
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            run_dir2 = research.Path(tmp2)
+            try:
+                # nothing written -> None on a tiny timeout, and it returns quickly
+                t0 = research.time.monotonic()
+                self.assertIsNone(
+                    research.wait_for_clarification(run_dir2, "w2", timeout_sec=0.05, poll_interval=0.01))
+                self.assertLess(research.time.monotonic() - t0, 2.0)
+                # a skip payload is a DISTINCT result from an answer (skip=True, empty answer)
+                research.write_json(run_dir2 / "clarify.json", {"answer": "", "skip": True})
+                got2 = research.wait_for_clarification(run_dir2, "w2", timeout_sec=1, poll_interval=0.01)
+                self.assertTrue(got2["skip"])
+                self.assertEqual(got2["answer"], "")
+            finally:
+                research.clear_clarification("w2")
+
+    def test_wait_for_clarification_aborts_on_cancel(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp)
+
+            def boom():
+                raise research.RunCancelled()
+
+            with self.assertRaises(research.RunCancelled):
+                research.wait_for_clarification(run_dir, "wc", timeout_sec=5,
+                                                check_cancel=boom, poll_interval=0.01)
+
+    def test_clarify_wait_excluded_from_budget(self):
+        # Replicates execute_research's mechanism on a controllable clock: while parked on the clarify
+        # question `now` advances, but `started` is advanced by the SAME amount, so the waited seconds
+        # are excluded from budget_remaining_sec (the run's search window is not shortened).
+        from unittest import mock
+
+        cfg = {"time_budget_sec": 1500}
+        clock = {"t": 1000.0}
+        with mock.patch.object(research.time, "monotonic", lambda: clock["t"]):
+            started = research.time.monotonic()                    # run starts at t=1000
+            clock["t"] = 1030.0                                    # 30s of real search elapsed
+            remaining_before_wait = research.budget_remaining_sec(started, cfg)
+            wait_started = research.time.monotonic()               # enter clarify at t=1030
+            clock["t"] = 1055.0                                    # user ponders 25s
+            started += research.time.monotonic() - wait_started    # <- exclusion: started += 25
+            remaining_after_wait = research.budget_remaining_sec(started, cfg)
+            # and WITHOUT the exclusion those 25s would have been billed:
+            billed = research.budget_remaining_sec(started - 25.0, cfg)
+        self.assertAlmostEqual(remaining_before_wait, 1470.0, delta=0.001)
+        self.assertAlmostEqual(remaining_after_wait, 1470.0, delta=0.001)  # wait cost the budget nothing
+        self.assertAlmostEqual(billed, 1445.0, delta=0.001)                # the 25s would otherwise vanish
+
+    def test_clarify_endpoint_records_answer(self):
+        import http.client
+        import json as _json
+        import tempfile
+        import threading
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = research.Path(tmp)
+            run_dir = runs_dir / "clar-run"
+            run_dir.mkdir()
+            research.write_json(run_dir / "run.json", {"run_id": "clar-run", "status": "running"})
+            with mock.patch.object(research, "RUNS_DIR", runs_dir):
+                server = research.http.server.ThreadingHTTPServer(("127.0.0.1", 0), research.ResearchHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                    conn.request("POST", "/api/runs/clar-run/clarify", body=_json.dumps({"answer": "EU region"}),
+                                 headers={"Content-Type": "application/json"})
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 202)
+                    resp.read()
+                    conn.close()
+                    # a POST to a run that does not exist -> 404
+                    conn2 = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                    conn2.request("POST", "/api/runs/nope/clarify", body="{}",
+                                  headers={"Content-Type": "application/json"})
+                    self.assertEqual(conn2.getresponse().status, 404)
+                    conn2.close()
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=3)
+            try:
+                stored = research.read_clarification(run_dir, "clar-run")
+                self.assertEqual(stored["answer"], "EU region")
+                self.assertFalse(stored["skip"])
+            finally:
+                research.clear_clarification("clar-run")
+
+    # ---- adversarial-review fixes (findings 1-6) ----
+
+    def test_build_clarified_prompt_folds_answer_and_execute_research_rebinds(self):
+        original = "cheapest gpu"
+        p = research.build_clarified_prompt(original, "for gaming, EU region")
+        self.assertTrue(p.startswith(original))  # original kept verbatim
+        self.assertIn("User clarification (authoritative): for gaming, EU region", p)
+        self.assertNotEqual(p, original)
+        # The rebind must wire into execute_research's LOCAL prompt (not only the re-decompose), so
+        # every downstream stage (search, gap audit, coverage/frontier, rescue, synthesis, fact-check)
+        # sees the disambiguated request. Guard the wiring, not just the helper.
+        import inspect
+        src = inspect.getsource(research.execute_research)
+        self.assertIn("prompt = build_clarified_prompt(prompt", src)
+
+    def test_protected_proc_survives_straggler_kill_but_not_cancel(self):
+        import subprocess
+        run_id = "test-protected-run"
+        prot = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        reg = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            research.register_proc(run_id, "prot-rec", prot.pid, protected=True)
+            research.register_proc(run_id, "reg-rec", reg.pid)
+            killed = research.kill_stragglers(run_id)  # a fan-out phase's quorum kill
+            self.assertIn("reg-rec", killed)
+            self.assertNotIn("prot-rec", killed)  # overlapping audit call is protected
+            self.assertTrue(research.was_dropped_as_straggler(run_id, "reg-rec"))
+            self.assertFalse(research.was_dropped_as_straggler(run_id, "prot-rec"))
+            # Cancellation reaps EVERYTHING, protected audits included.
+            research.ACTIVE_RUNS.add(run_id)
+            self.assertTrue(research.request_cancel(run_id))
+            self.assertTrue(research.was_dropped_as_straggler(run_id, "prot-rec"))
+        finally:
+            for p in (prot, reg):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=3)
+                except Exception:
+                    pass
+            research.clear_run_registry(run_id)
+            research.ACTIVE_RUNS.discard(run_id)
+            with research.CANCEL_LOCK:
+                research.CANCELLED_RUNS.discard(run_id)
+
+    def test_recheck_do_not_report_excludes_items_own_url(self):
+        # A disputed item lives inside `verified`, so its own URL is in known_urls. The rescue asks the
+        # model to RECOVER this exact item, so its own URL (and price-candidate URLs) must NOT appear in
+        # the "do NOT re-report" block — while OTHER verified URLs still steer the round toward novelty.
+        item = {"title": "t", "url": "https://ex.com/own?utm_source=ad",
+                "price_candidates": [{"url": "https://ex.com/cand"}]}
+        known = ["https://ex.com/own", "https://ex.com/other-a",
+                 "https://ex.com/cand?utm_source=x", "https://ex.com/other-b"]
+        filtered = research.known_urls_minus_item(known, item)
+        self.assertNotIn("https://ex.com/own", filtered)             # own url dropped (tracking-normalized)
+        self.assertNotIn("https://ex.com/cand?utm_source=x", filtered)  # own price-candidate url dropped too
+        self.assertIn("https://ex.com/other-a", filtered)
+        self.assertIn("https://ex.com/other-b", filtered)
+        block = research.do_not_report_block(filtered)
+        self.assertNotIn("ex.com/own", block)
+        self.assertNotIn("ex.com/cand", block)
+        self.assertIn("ex.com/other-a", block)
+        self.assertIn("ex.com/other-b", block)
+
+    def test_post_synthesis_stages_gate_on_smaller_reserve_and_warn_on_skip(self):
+        import inspect
+        # The post-synthesis reserve is much smaller than the synthesis reserve, so review/fact-check
+        # (which run AFTER synthesis) aren't skipped with plenty of budget left.
+        self.assertLess(research.POST_SYNTHESIS_RESERVE_SEC, research.SYNTHESIS_RESERVE_SEC)
+        cfg = {"time_budget_sec": 1000}
+        # remaining sits BETWEEN the two reserves: a pre-synthesis optional stage skips, a
+        # post-synthesis stage still fits.
+        remaining = (research.POST_SYNTHESIS_RESERVE_SEC + research.SYNTHESIS_RESERVE_SEC) / 2
+        started = research.time.monotonic() - (1000 - remaining)
+        self.assertFalse(research.stage_fits_budget(started, cfg))  # default (synthesis) reserve -> skip
+        self.assertTrue(research.stage_fits_budget(
+            started, cfg, reserve_sec=research.POST_SYNTHESIS_RESERVE_SEC))
+        # execute_research gates BOTH post-synthesis stages on the smaller reserve and, when it skips
+        # either (decided after synthesize consumed skipped_by_deadline), prepends a visible callout.
+        src = inspect.getsource(research.execute_research)
+        self.assertEqual(src.count("reserve_sec=POST_SYNTHESIS_RESERVE_SEC"), 2)
+        self.assertIn("NOT REVIEWED", src)
+        self.assertIn("NOT FACT-CHECKED", src)
+
+    def test_straggler_drop_rekills_late_job_within_grace(self):
+        import concurrent.futures
+        import subprocess
+        import tempfile
+        import time
+
+        run_id = "test-late-straggler-run"
+
+        def fast_job(i):
+            time.sleep(0.05)
+            return {"record_id": f"fast-{i}", "latency_sec": 0.1, "success": True}
+
+        def late_slow_job():
+            # Spawns its tracked subprocess only AFTER the first straggler sweep would have fired,
+            # mimicking a late audit-added task. The re-firing kill must still reap it, so the
+            # post-quorum wait stays bounded instead of stretching to the full 30s.
+            time.sleep(1.5)
+            proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            research.register_proc(run_id, "late-rec", proc.pid)
+            try:
+                proc.wait()
+            finally:
+                research.unregister_proc(run_id, "late-rec")
+            return {"record_id": "late-rec", "latency_sec": 30.0, "success": False}
+
+        config = dict(research.make_config("quick", None))
+        config["straggler_grace_sec"] = 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp) / run_id
+                run_dir.mkdir()
+                started = time.monotonic()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = [
+                        executor.submit(fast_job, 1),
+                        executor.submit(fast_job, 2),
+                        executor.submit(fast_job, 3),
+                        executor.submit(late_slow_job),
+                    ]
+                    records = research.collect_with_straggler_drop(futures, run_dir, config)
+                elapsed = time.monotonic() - started
+            self.assertEqual(len(records), 4)
+            self.assertLess(elapsed, 15.0)  # re-fired kill reaped the late job; not awaited to 30s
+            self.assertTrue(research.was_dropped_as_straggler(run_id, "late-rec"))
+        finally:
+            research.clear_run_registry(run_id)
 
 
 if __name__ == "__main__":

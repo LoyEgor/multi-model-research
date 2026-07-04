@@ -211,3 +211,69 @@ Shipped:
   `test_user_disabled_blocks_call_model` (the runtime guard). 66 tests.
 - Adversarial review (Explore agent) traced every call_model / call_agy_claude site against all
   1- and 2-vendor-disabled combinations: no path can call a disabled vendor, no empty-list crash.
+
+## Improvement round 3 — search quality & latency (2026-07-04)
+
+Owner-requested follow-up, backed by an external best-practices research pass (Anthropic
+multi-agent research system, OpenAI/Gemini Deep Research, STORM, reflective-retrieval papers).
+
+### R3.1 — Run time-budget enforcement — DONE 2026-07-04
+The previously-dead `time_budget_sec` in `EFFORT_PROFILES` (1500/2400/4200/5100s for
+quick/standard/deep/max) is now real. `budget_remaining_sec()`/`stage_fits_budget()` gate every
+OPTIONAL stage — recheck rounds after the first, coverage rounds, frontier rounds, adversarial
+review, final factcheck — and skip one with a `stage_skipped_deadline` event once only
+`SYNTHESIS_RESERVE_SEC` (`RESEARCH_SYNTHESIS_RESERVE_SEC`, default 900s) remains, so the
+always-run synthesis stays inside the budget; recorded in `run.json.skipped_by_deadline`,
+surfaced in the report as a degradation note (never a warning callout) and in the UI timeline as
+"skipped (time budget)". `clamp_round_timeout()` also shrinks each optional round's own phase
+timeout to whatever budget remains. Effort levels now have predictable wall-clock ceilings instead
+of an unbounded worst case.
+
+### R3.2 — Concurrent plan auditor — DONE 2026-07-04
+At effort 2-4 (`config.plan_audit`), right after decompose a cheap judge-vendor call
+(`audit_plan()`, `build_plan_audit_prompt()`, codex-first, effort medium, task_type
+`"plan_audit"`, budget-exempt) audits the task list for coverage/overlap/missing angles WHILE the
+primary search wave is already running in its own executor. It may add up to 2 surgical extra
+tasks (`origin="plan_audit"`, 1 query variant each), deduped against the existing queries via the
+same `normalize_task` validation, submitted into the SAME executor before collection starts —
+near-zero added wall-clock. Advisory: any failure yields no extra tasks and never faults the run.
+Events `plan_audit_started`/`plan_audit_finished`; `run.json.plan_audit`; `tasks.json` rewritten
+with the accepted extras.
+
+### R3.3 — Semantic gap audit — DONE 2026-07-04
+At effort 2-4 (`config.gap_audit`), while rescue rounds run, a second concurrent judge-vendor call
+(`gap_audit()`, `build_gap_audit_prompt()`, task_type `"gap_audit"`) reviews the post-primary
+verified findings digest (top-15 one-liners + host distribution + zero-result hosts) and names up
+to 3 MATERIAL uncovered angles, each with a concrete search query (strict JSON, explicit
+do-not-invent-gaps instruction), coerced via `coerce_gap_queries()` (cap 3, deduped against the
+task queries). At effort 3-4 the gap queries merge into the EXISTING coverage round's fan-out (no
+new serial phase); at effort 2, where coverage rounds are off, they trigger one bounded
+budget-gated mini-wave (phase `gap_search`) only when gaps were actually found.
+
+### R3.4 — Interactive clarify gate — DONE 2026-07-04
+The decomposer now also emits `intent.clarify_question` (in the user's language) plus
+case-preserving `intent.alternatives` (first entry = the assumed default) whenever
+`intent.ambiguous`. For interactive runs (the UI always sends `interactive: true`; CLI opt-in via
+the new `--ask` flag; the default stays non-blocking) `should_ask_clarify()` pauses the run in
+phase `clarify`, emits SSE `clarify_pending {question, alternatives, timeout_sec}`, and
+`wait_for_clarification()` waits up to `RESEARCH_CLARIFY_TIMEOUT_SEC` (default 45s) for
+`POST /api/runs/<id>/clarify {"answer"|"skip"}`. An answer triggers ONE re-decompose with the
+clarification appended; a timeout or skip proceeds on the assumed reading (recorded in
+`run.json.clarify` and `intent.assumed`, stated near the top of the report per the synthesis
+prompt's assumption-statement instruction). The waited time is excluded from the run's time
+budget (`started` is pushed forward by the wait duration). UI: a clarify card with quick-answer
+buttons, free text, skip, and a countdown; "No questions — research is running. You can step
+away." when nothing was asked.
+
+Also shipped this round (free prompt upgrades, no new code paths): Plan-and-Solve phrasing +
+mutual-exclusivity task boundaries in the decompose prompt; "Do NOT re-report these URLs" lists
+(`do_not_report_block()`, cap 20) added to the recheck and frontier prompts; the assumption-
+statement instruction in the synthesis prompt (used by R3.4 above).
+
+Deliberately NOT implemented (evidence-based): sharing findings between parallel search legs
+mid-flight — research shows it destroys the independent cross-check signal (sycophancy up to
+85.5%, oracle gap up to 32.3%; "The Cost of Consensus", arXiv 2605.00914). Only coverage state
+(already-searched URLs, via `do_not_report_block()`) is shared between rounds. Streaming
+per-item verification was deferred (a seconds-level win for high implementation complexity).
+
+Tests: 101 → 129, all green.

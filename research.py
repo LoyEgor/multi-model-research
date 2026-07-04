@@ -62,10 +62,21 @@ MAX_PRIMARY_WORKERS = max(2, env_int("RESEARCH_MAX_PRIMARY_WORKERS", 6))
 MAX_VERIFY_WORKERS = max(2, env_int("RESEARCH_MAX_VERIFY_WORKERS", 8))
 # A run with no heartbeat for longer than one full model call + slack is dead, not "running".
 STALE_AFTER_SEC = RAW_TIMEOUT_SEC + 600
-# Wall-clock budget guard. Each effort profile sets time_budget_sec (TOTAL run cap). Search/rescue/
-# coverage/frontier rounds stop once only SYNTHESIS_RESERVE_SEC remains, so the value-delivering
-# synthesis/review/fact-check always get to run inside the budget. Keeps deep/max well under 90 min.
+# Wall-clock budget guard. Each effort profile sets time_budget_sec (TOTAL run cap). Optional rounds
+# (extra rescue/coverage/frontier rounds, adversarial review, fact-check) are skipped once only
+# SYNTHESIS_RESERVE_SEC remains, so the always-run synthesis stays inside the budget. Under 90 min.
 SYNTHESIS_RESERVE_SEC = max(120, env_int("RESEARCH_SYNTHESIS_RESERVE_SEC", 900))
+# The adversarial review and final fact-check run AFTER synthesis, so the synthesis reserve no longer
+# needs protecting for them — gating those two on the full SYNTHESIS_RESERVE_SEC would skip the deep/
+# max signature stages with plenty of budget left. They get their own much smaller post-synthesis
+# reserve instead (just enough to finish writing final.md).
+POST_SYNTHESIS_RESERVE_SEC = max(30, env_int("RESEARCH_POST_SYNTHESIS_RESERVE_SEC", 120))
+# Interactive clarify gate: how long to wait for the user's answer to a clarifying question before
+# proceeding on the assumed default reading. Only ever reached on interactive (UI / --ask) runs; the
+# non-interactive CLI/API default never asks and never waits. The waited time is excluded from the
+# run's time budget (execute_research pushes `started` forward), so parking on a question never eats
+# into the search itself.
+CLARIFY_TIMEOUT_SEC = max(1, env_int("RESEARCH_CLARIFY_TIMEOUT_SEC", 45))
 ACTIVE_RUNS: set[str] = set()
 
 # Per-run circuit breaker: after N consecutive call failures a leg is disabled for the REST OF
@@ -221,23 +232,32 @@ def paced_budget(leg: str, requested: int, reserve: int = 0, counts: dict | None
 PROC_REGISTRY_LOCK = threading.Lock()
 RUN_PROCS: dict[str, dict[str, int]] = {}
 RUN_DROPPED: dict[str, set[str]] = {}
+# Protected calls (plan_audit / gap_audit) overlap a straggler-dropping fan-out phase; a phase's
+# quorum kill must NOT reap them. Cancellation still does (kill_stragglers include_protected=True).
+RUN_PROTECTED: dict[str, set[str]] = {}
 
 
-def register_proc(run_id: str, record_id: str, pid: int) -> None:
+def register_proc(run_id: str, record_id: str, pid: int, protected: bool = False) -> None:
     with PROC_REGISTRY_LOCK:
         RUN_PROCS.setdefault(run_id, {})[record_id] = pid
+        if protected:
+            RUN_PROTECTED.setdefault(run_id, set()).add(record_id)
 
 
 def unregister_proc(run_id: str, record_id: str) -> None:
     with PROC_REGISTRY_LOCK:
         RUN_PROCS.get(run_id, {}).pop(record_id, None)
+        RUN_PROTECTED.get(run_id, set()).discard(record_id)
 
 
-def kill_stragglers(run_id: str) -> list[str]:
+def kill_stragglers(run_id: str, include_protected: bool = False) -> list[str]:
     with PROC_REGISTRY_LOCK:
         procs = dict(RUN_PROCS.get(run_id) or {})
+        protected = set(RUN_PROTECTED.get(run_id) or ())
     killed = []
     for record_id, pid in procs.items():
+        if not include_protected and record_id in protected:
+            continue  # a concurrent audit overlaps this phase; only cancellation may reap it
         try:
             os.killpg(pid, signal.SIGTERM)
             killed.append(record_id)
@@ -274,6 +294,7 @@ def clear_run_registry(run_id: str) -> None:
     with PROC_REGISTRY_LOCK:
         RUN_PROCS.pop(run_id, None)
         RUN_DROPPED.pop(run_id, None)
+        RUN_PROTECTED.pop(run_id, None)
 
 
 # Run cancellation: the UI's cancel button sets the flag and kills in-flight subprocesses;
@@ -298,13 +319,97 @@ def request_cancel(run_id: str) -> bool:
         return False
     with CANCEL_LOCK:
         CANCELLED_RUNS.add(run_id)
-    kill_stragglers(run_id)  # abort in-flight model calls; queued ones are blocked at spawn
+    # Cancellation reaps EVERY in-flight call, including protected audits; queued ones block at spawn.
+    kill_stragglers(run_id, include_protected=True)
     return True
 
 
 def clear_cancel(run_id: str) -> None:
     with CANCEL_LOCK:
         CANCELLED_RUNS.discard(run_id)
+
+
+# Interactive clarify gate: the answer to a clarifying question arrives out-of-band via the HTTP
+# clarify endpoint while execute_research parks in a bounded poll loop. Belt-and-suspenders like the
+# cancel flag — the answer is stored BOTH in this in-memory registry (same-process fast path) AND in
+# runs/<id>/clarify.json on disk, and the poll loop reads whichever is present.
+CLARIFY_LOCK = threading.Lock()
+CLARIFY_ANSWERS: dict[str, dict] = {}
+
+
+def _normalize_clarify_payload(payload: object) -> dict:
+    """Coerce a raw clarify request body into {'answer': str, 'skip': bool}. An empty/blank answer
+    (or an explicit skip flag) means 'proceed now with the default reading'."""
+    payload = payload if isinstance(payload, dict) else {}
+    answer = str(payload.get("answer") or "").strip()
+    skip = bool(payload.get("skip")) or not answer
+    return {"answer": answer, "skip": skip}
+
+
+def submit_clarification(run_dir: Path, run_id: str, payload: object) -> dict:
+    """Record a clarify response from the HTTP endpoint into the in-memory registry AND clarify.json.
+    Returns the normalized entry. Mirrors the cancel flag's dual store so an answer is never lost to a
+    thread-visibility gap between the request handler and the waiting pipeline thread."""
+    entry = _normalize_clarify_payload(payload)
+    with CLARIFY_LOCK:
+        CLARIFY_ANSWERS[run_id] = entry
+    try:
+        write_json(run_dir / "clarify.json", entry)
+    except OSError:
+        pass  # the registry alone suffices in-process; disk is the cross-process fallback
+    return entry
+
+
+def read_clarification(run_dir: Path, run_id: str) -> dict | None:
+    """Return a stored clarify response (registry first, then clarify.json), or None if none yet."""
+    with CLARIFY_LOCK:
+        entry = CLARIFY_ANSWERS.get(run_id)
+    if entry is not None:
+        return entry
+    data = read_json(run_dir / "clarify.json", None)
+    return data if isinstance(data, dict) else None
+
+
+def clear_clarification(run_id: str) -> None:
+    with CLARIFY_LOCK:
+        CLARIFY_ANSWERS.pop(run_id, None)
+
+
+def wait_for_clarification(run_dir: Path, run_id: str, timeout_sec: float,
+                           check_cancel=None, poll_interval: float = 0.5) -> dict | None:
+    """Block up to timeout_sec for a clarify response, polling the registry/clarify.json every
+    poll_interval seconds. Returns the response dict as soon as one lands, or None on timeout. Reads
+    once before checking the deadline so a pre-existing answer returns immediately even at timeout 0.
+    check_cancel(), when given, runs each tick so a cancel during the wait still aborts promptly."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        entry = read_clarification(run_dir, run_id)
+        if entry is not None:
+            return entry
+        if check_cancel is not None:
+            check_cancel()
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll_interval)
+
+
+def should_ask_clarify(config: dict, intent: dict) -> tuple[bool, str, list]:
+    """Gate predicate for the interactive clarify question. Returns (ask, question, alternatives).
+    Asks ONLY when the run is interactive AND the plan flagged the request ambiguous AND a concrete
+    question was produced — so non-interactive (CLI default / API-without-flag) runs never block."""
+    intent = intent or {}
+    question = str(intent.get("clarify_question") or "").strip()
+    alternatives = [str(a).strip() for a in (intent.get("alternatives") or []) if str(a).strip()]
+    ask = bool(config.get("interactive") and intent.get("ambiguous") and question)
+    return ask, question, alternatives
+
+
+def build_clarified_prompt(original_prompt: str, answer: str) -> str:
+    """Fold an interactive clarification into the prompt so EVERY downstream stage (search, gap
+    audit, coverage/frontier, rescue, synthesis, fact-check) sees the disambiguated request — not
+    just the re-decompose. execute_research rebinds its local `prompt` to this. The original prompt
+    is preserved verbatim in run.json (init_run) for the UI header, so nothing is lost."""
+    return f"{original_prompt}\n\n---\nUser clarification (authoritative): {answer}"
 
 
 # Vendors the user switched OFF for this run (to save that provider's quota). Role selection
@@ -410,6 +515,8 @@ EFFORT_PROFILES = {
         "differentiate_legs": False,
         "angle_variants_per_task": 0,
         "coverage_rounds": 0,
+        "plan_audit": False,
+        "gap_audit": False,
         "adjudicate_samples": 1,
     },
     2: {
@@ -434,6 +541,8 @@ EFFORT_PROFILES = {
         "differentiate_legs": False,
         "angle_variants_per_task": 0,
         "coverage_rounds": 0,
+        "plan_audit": True,
+        "gap_audit": True,
         "adjudicate_samples": 1,
     },
     3: {
@@ -458,6 +567,8 @@ EFFORT_PROFILES = {
         "differentiate_legs": True,
         "angle_variants_per_task": 1,
         "coverage_rounds": 1,
+        "plan_audit": True,
+        "gap_audit": True,
         "adjudicate_samples": 3,
     },
     4: {
@@ -482,6 +593,8 @@ EFFORT_PROFILES = {
         "differentiate_legs": True,
         "angle_variants_per_task": 2,
         "coverage_rounds": 1,
+        "plan_audit": True,
+        "gap_audit": True,
         "adjudicate_samples": 3,
     },
 }
@@ -550,10 +663,14 @@ def normalize_vendors(values: object) -> list[str]:
 
 
 def make_config(effort: object = None, sites: object = None, disabled: object = None,
-                vendor_tiers: object = None, excluded_sites: object = None) -> dict:
+                vendor_tiers: object = None, excluded_sites: object = None,
+                interactive: object = False) -> dict:
     level = parse_effort(effort)
     config = dict(EFFORT_PROFILES[level])
     config["effort_level"] = level
+    # Interactive runs (UI, or CLI --ask) may pause once for a clarifying question; non-interactive
+    # runs (CLI default, API without the flag) never do. Default False so scripts never block.
+    config["interactive"] = bool(interactive)
     config["sites"] = normalize_sites(sites)
     # Blocklist (inverse of the sites scope): domains the user never wants back. An explicit scope
     # wins on overlap, so the two fields can never contradict each other.
@@ -1466,6 +1583,13 @@ Return ONLY valid JSON. No Markdown.
 User request:
 {user_prompt}
 
+Work in three ordered steps (Plan-and-Solve — do not jump straight to the tasks):
+1. EXTRACT the decision variables and constraints from the request: subject, region/currency,
+   pricing basis, required tier, budget or price to beat.
+2. DEVISE the full coverage plan — which source-classes and angles JOINTLY answer the request with
+   no overlap between them.
+3. Only THEN emit the tasks below.
+
 FIRST, before emitting tasks, silently self-ask and RESOLVE (do NOT ask the user — proceed with the
 most likely reading; this only enriches the plan):
 - The canonical product/model/edition this maps to, plus its real-world ALIASES, transliterations
@@ -1473,7 +1597,12 @@ most likely reading; this only enriches the plan):
 - Which tiers / variants / pack sizes exist, and which one the user means.
 - The implied region / currency / language.
 - Whether the request is genuinely ambiguous: if two readings would MATERIALLY change
-  subject_keywords, set intent.ambiguous=true and list the competing readings in intent.alternatives.
+  subject_keywords, set intent.ambiguous=true and list the competing readings in intent.alternatives
+  as 2-4 short candidate readings. When ambiguous, ALSO emit intent.clarify_question: ONE compact
+  question, phrased in the SAME language as the user request, that would resolve the ambiguity. The
+  FIRST entry in intent.alternatives MUST be the assumed/default reading the system proceeds with if
+  the question goes unanswered — so order alternatives with your best guess first. Keep alternatives
+  short enough to serve as one-tap answer buttons. When NOT ambiguous, leave clarify_question null.
 - The PRICING BASIS the user shops on: paid once (one_time), a recurring subscription (monthly /
   yearly), metered by usage (per token / per request / per GB), per seat, or a rental. If the user
   says "cheapest subscription / plan / paid tier", they want a PAID recurring offering — a FREE tier
@@ -1486,6 +1615,8 @@ multi_constraint. For a trivial single_sku lookup you MAY return as few as 2 tas
 multi_constraint use the full {n}. NEVER exceed {n} tasks.
 
 {task_rule}
+Tasks must be MUTUALLY EXCLUSIVE: each task's query targets offers the SIBLING tasks do NOT cover, so
+the same listing is never chased twice.
 {site_rule}
 Write plain queries WITHOUT search operators like site: — put domains in preferred_sites instead.
 For each task ALSO give 2-3 "query_variants": alternate SURFACE phrasings of the SAME query that
@@ -1526,8 +1657,61 @@ Schema:
     "required_tier": null, "official_price": null, "official_currency": null,
     "cheaper_than_official": false, "price_basis": "unknown", "official_price_basis": "unknown",
     "free_ok": true, "monthly_usage_units": null, "usage_unit": null,
-    "complexity": "single_sku", "ambiguous": false, "alternatives": []
+    "complexity": "single_sku", "ambiguous": false, "alternatives": [], "clarify_question": null
   }}
+}}
+"""
+
+
+def build_plan_audit_prompt(user_prompt: str, tasks: list[dict], intent: dict, config: dict) -> str:
+    """Adversarial reviewer of the DECOMPOSITION itself (no search results yet). It sees only the
+    request, the planned tasks and the extracted intent, and proposes at most 2 genuinely-additive
+    tasks that close a coverage gap — never rephrasings of what is already planned."""
+    plan_view = [
+        {k: t[k] for k in ("id", "query", "focus", "source_class", "angle", "preferred_sites") if k in t}
+        for t in tasks
+    ]
+    sites = config.get("sites") or []
+    site_rule = (
+        f"HARD CONSTRAINT: research is restricted to {', '.join(sites)} — any extra_tasks must target "
+        f"ONLY those domains in preferred_sites."
+        if sites
+        else "Extra tasks should name the venues they target in preferred_sites."
+    )
+    return f"""You audit the RESEARCH PLAN of a multi-model offer-research system BEFORE any searching.
+You see ONLY the user's request, the planned tasks and the extracted intent — NO search results yet.
+Return ONLY valid JSON. No Markdown.
+
+User request:
+{user_prompt}
+
+Extracted intent:
+{json.dumps(intent, ensure_ascii=False, indent=2, sort_keys=True)}
+
+Planned tasks:
+{json.dumps(plan_view, ensure_ascii=False, indent=2)}
+
+Judge the plan on three axes:
+(a) COVERAGE — do these tasks TOGETHER answer the user's question, or is a material part unaddressed?
+(b) OVERLAP — do two tasks chase the same listings / duplicate each other's venues?
+(c) MISSING ANGLES — is a whole channel absent (official store / big marketplace / classifieds /
+    refurb-used / regional-local), or a needed query FORMULATION missing (local-language phrasing,
+    exact model/SKU code, transliteration), or a venue CATEGORY typical for this domain left out?
+
+If and only if a REAL gap exists, propose up to 2 extra tasks that CLOSE it. Each extra task MUST be
+genuinely additive — a NEW source channel, angle, or formulation — never a reworded existing task.
+If the plan is already complete, return verdict "ok" and an empty extra_tasks list. {site_rule}
+
+Schema:
+{{
+  "verdict": "ok" | "gaps",
+  "extra_tasks": [
+    {{"id": "audit-1", "query": "specific search query", "focus": "what this task adds",
+      "query_variants": ["one alternate surface phrasing"],
+      "source_class": "classifieds", "angle": "why this closes a gap",
+      "preferred_sites": []}}
+  ],
+  "notes": "one short sentence on the gap (or why the plan is complete)"
 }}
 """
 
@@ -1576,6 +1760,53 @@ def fallback_tasks(user_prompt: str, config: dict) -> list[dict]:
     ]
 
 
+def normalize_task(raw: object, idx: object, run_sites: list[str]) -> dict | None:
+    """Canonicalize ONE raw task dict into the task schema. Shared by decompose coercion and the
+    plan auditor so both apply the same site-scoping / variant-dedup / structured-field rules.
+    Returns None when the task has no usable query."""
+    if not isinstance(raw, dict):
+        return None
+    query = str(raw.get("query") or "").strip()
+    if not query:
+        return None
+    preferred = raw.get("preferred_sites") or []
+    if not isinstance(preferred, list):
+        preferred = [str(preferred)]
+    preferred = [site for site in (normalize_site(s) for s in preferred) if site]
+    if run_sites:
+        preferred = [site for site in preferred if site in run_sites] or list(run_sites)
+
+    def clean_variants(key: str) -> list[str]:
+        raw_v = raw.get(key) or []
+        if not isinstance(raw_v, list):
+            raw_v = [str(raw_v)]
+        out, seen = [], {query.lower()}
+        for v in raw_v:
+            v = str(v or "").strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out.append(v)
+        return out
+
+    task = {
+        "id": str(raw.get("id") or f"task-{idx}"),
+        "query": query,
+        "query_variants": clean_variants("query_variants")[:4],
+        "focus": str(raw.get("focus") or "Find current purchasable offers with verified URLs."),
+        "preferred_sites": preferred,
+    }
+    # Structured-decompose / angle-expansion fields (effort >=3). Preserved when the brain emits
+    # them; harmless and ignored downstream when the effort profile keeps those features off.
+    angle_variants = clean_variants("angle_variants")[:3]
+    if angle_variants:
+        task["angle_variants"] = angle_variants
+    if raw.get("source_class"):
+        task["source_class"] = str(raw.get("source_class")).strip().lower()
+    if raw.get("angle"):
+        task["angle"] = str(raw.get("angle")).strip()
+    return task
+
+
 def coerce_tasks(payload: object, user_prompt: str, config: dict) -> list[dict]:
     if isinstance(payload, dict):
         raw_tasks = payload.get("tasks") or []
@@ -1587,46 +1818,9 @@ def coerce_tasks(payload: object, user_prompt: str, config: dict) -> list[dict]:
     run_sites = config.get("sites") or []
     tasks: list[dict] = []
     for idx, raw in enumerate(raw_tasks[: config["task_count"]], start=1):
-        if not isinstance(raw, dict):
-            continue
-        query = str(raw.get("query") or "").strip()
-        if not query:
-            continue
-        preferred = raw.get("preferred_sites") or []
-        if not isinstance(preferred, list):
-            preferred = [str(preferred)]
-        preferred = [site for site in (normalize_site(s) for s in preferred) if site]
-        if run_sites:
-            preferred = [site for site in preferred if site in run_sites] or list(run_sites)
-        def clean_variants(key: str) -> list[str]:
-            raw_v = raw.get(key) or []
-            if not isinstance(raw_v, list):
-                raw_v = [str(raw_v)]
-            out, seen = [], {query.lower()}
-            for v in raw_v:
-                v = str(v or "").strip()
-                if v and v.lower() not in seen:
-                    seen.add(v.lower())
-                    out.append(v)
-            return out
-
-        task = {
-            "id": str(raw.get("id") or f"task-{idx}"),
-            "query": query,
-            "query_variants": clean_variants("query_variants")[:4],
-            "focus": str(raw.get("focus") or "Find current purchasable offers with verified URLs."),
-            "preferred_sites": preferred,
-        }
-        # Structured-decompose / angle-expansion fields (effort >=3). Preserved when the brain emits
-        # them; harmless and ignored downstream when the effort profile keeps those features off.
-        angle_variants = clean_variants("angle_variants")[:3]
-        if angle_variants:
-            task["angle_variants"] = angle_variants
-        if raw.get("source_class"):
-            task["source_class"] = str(raw.get("source_class")).strip().lower()
-        if raw.get("angle"):
-            task["angle"] = str(raw.get("angle")).strip()
-        tasks.append(task)
+        task = normalize_task(raw, idx, run_sites)
+        if task is not None:
+            tasks.append(task)
 
     # Floor of 2 (not 3): the complexity classifier may legitimately emit a 2-task plan for a
     # trivial single-SKU lookup; only fall back when the brain returned a degenerate result.
@@ -1704,7 +1898,7 @@ def default_intent() -> dict:
     return {
         "subject_keywords": [], "exclude_keywords": [],
         "required_tier": None, "official_price_usd": None, "cheaper_than_official": False,
-        "ambiguous": False, "alternatives": [], "complexity": None,
+        "ambiguous": False, "alternatives": [], "clarify_question": None, "complexity": None,
         "price_basis": "unknown", "official_price_basis": "unknown", "free_ok": True,
         "monthly_usage_units": None, "usage_unit": None, "official_price_monthly_usd": None,
     }
@@ -1720,6 +1914,13 @@ def coerce_intent(payload: object) -> dict:
         if isinstance(v, str):
             v = [v]
         return [str(x).strip().lower() for x in (v or []) if str(x).strip()]
+
+    def displaylist(v):
+        # Case-PRESERVING variant for user-facing text (alternatives are shown verbatim as the
+        # clarify quick-answer buttons and the report's assumed-reading note).
+        if isinstance(v, str):
+            v = [v]
+        return [str(x).strip() for x in (v or []) if str(x).strip()]
 
     intent["subject_keywords"] = strlist(raw.get("subject_keywords"))
     intent["exclude_keywords"] = strlist(raw.get("exclude_keywords"))
@@ -1739,7 +1940,8 @@ def coerce_intent(payload: object) -> dict:
         if intent["official_price_usd"] else None
     )
     intent["ambiguous"] = bool(raw.get("ambiguous"))
-    intent["alternatives"] = strlist(raw.get("alternatives"))[:4]
+    intent["alternatives"] = displaylist(raw.get("alternatives"))[:4]
+    intent["clarify_question"] = str(raw.get("clarify_question") or "").strip() or None
     complexity = str(raw.get("complexity") or "").strip().lower()
     intent["complexity"] = complexity if complexity in {"single_sku", "comparison", "broad_category", "multi_constraint"} else None
     return intent
@@ -1965,8 +2167,39 @@ Schema:
 """
 
 
+def do_not_report_block(known_urls: list[str] | None, cap: int = 20) -> str:
+    """A compact 'already have these, find NEW ones' list for the rescue/frontier prompts so a
+    round spends its budget on novel offers instead of re-surfacing verified URLs. Deduped + capped
+    to keep the prompt bounded; empty string when nothing is known yet."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for url in known_urls or []:
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+        if len(urls) >= cap:
+            break
+    if not urls:
+        return ""
+    return ("\n- Do NOT re-report these already-known/verified URLs; find NEW offers (or genuinely "
+            "cheaper/better ones):\n" + "\n".join(urls))
+
+
+def known_urls_minus_item(known_urls: list[str] | None, item: dict) -> list[str]:
+    """Rescue-prompt view of the do-not-report list, minus the item's OWN url(s). A rescue asks the
+    model to RECOVER this exact listing, so a disputed item living inside `verified` would otherwise
+    appear in its own 'do NOT re-report these URLs' block — a contradiction. Other verified URLs stay
+    (they still steer the round toward novel offers). Comparison is normalized (tracking-param safe)."""
+    own = {normalize_url_for_key(item.get("url"))}
+    for cand in (item.get("price_candidates") or []):
+        if isinstance(cand, dict):
+            own.add(normalize_url_for_key(cand.get("url")))
+    own.discard(None)
+    return [u for u in (known_urls or []) if normalize_url_for_key(u) not in own]
+
+
 def build_frontier_prompt(user_prompt: str, ceiling_usd: float, run_sites: list[str], intent: dict | None,
-                          excluded: list[str] | None = None) -> str:
+                          excluded: list[str] | None = None, known_urls: list[str] | None = None) -> str:
     """Targeted search for offers STRICTLY cheaper than the current best credible price — the
     frontier round pushes the price floor down or proves nothing cheaper-and-credible exists."""
     site_rule = (f"- HARD CONSTRAINT: only URLs on these domains: {', '.join(run_sites)}.\n" if run_sites else "")
@@ -1988,7 +2221,7 @@ Rules:
   (yearly→monthly) or usage before claiming an offer is cheaper; never present a one-time price as
   cheaper than a subscription. Report each offer's price_basis.
 - Return direct listing/offer URLs with native price + currency code. Unknown fields null.
-- If there is genuinely nothing credible below ${ceiling_usd:.2f}, return an empty findings array.
+- If there is genuinely nothing credible below ${ceiling_usd:.2f}, return an empty findings array.{do_not_report_block(known_urls)}
 
 Schema:
 {{"findings": [{{"title": "...", "price": 0, "currency": "USD", "url": "https://...",
@@ -2118,11 +2351,14 @@ def apply_confidence(verified: list[dict]) -> None:
         item["confidence_calibrated"] = calibrate_confidence(item)
 
 
-def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: dict, intent: dict | None, round_no: int) -> list[dict]:
+def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: dict, intent: dict | None, round_no: int,
+                       known_urls: list[str] | None = None, timeout_cap: int | None = None) -> list[dict]:
     """One frontier sweep: each search leg hunts strictly below the ceiling."""
     search_legs = config.get("search_legs") or ["codex", "gemini"]
-    fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent, config.get("excluded_sites"))
+    fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent, config.get("excluded_sites"), known_urls)
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
+    if timeout_cap is not None:
+        timeout = min(timeout, timeout_cap)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(search_legs))) as executor:
         futures = [
             executor.submit(call_model, leg, fp, run_dir, "frontier", f"frontier-{round_no}",
@@ -2172,28 +2408,71 @@ Schema:
 """
 
 
+def build_gap_search_prompt(user_prompt: str, gap_query: str, avoid_hosts: list[str],
+                            run_sites: list[str], intent: dict | None, excluded: list[str] | None = None) -> str:
+    """Targeted search for ONE semantic gap the coverage auditor flagged — a specific angle/channel of
+    the user's question the current results do not address. Distinct from build_coverage_prompt, which
+    chases an empty source CLASS; this chases a MISSING ANGLE expressed as a concrete query."""
+    subj = ", ".join((intent or {}).get("subject_keywords") or []) or "the requested item"
+    site_rule = (f"- HARD CONSTRAINT: only URLs on these domains: {', '.join(run_sites)}.\n" if run_sites else "")
+    site_rule += excluded_sites_rule(excluded)
+    avoid_rule = (f"- These hosts are already saturated; look ELSEWHERE, do not just re-return them: "
+                  f"{', '.join(avoid_hosts)}.\n" if avoid_hosts and not run_sites else "")
+    return f"""You are a COVERAGE-GAP research worker. The current results MISS a specific angle of the
+user's question. Find CURRENTLY AVAILABLE, credible offers for the SAME thing ({subj}) that
+SPECIFICALLY address this angle: {gap_query}
+Use live web results. Return ONLY valid JSON. No Markdown.
+
+Original user request:
+{user_prompt}
+
+Rules:
+{site_rule}{avoid_rule}- It must be the SAME thing the user wants (right product/tier), working and honestly described.
+- Return direct listing/offer URLs with native price + currency code. Unknown fields null.
+- If this angle genuinely has nothing credible, return an empty findings array (do NOT pad).
+
+Schema:
+{{"findings": [{{"title": "...", "price": 0, "currency": "USD", "url": "https://...",
+  "marketplace": "...", "availability": "...", "condition": "...", "tier": null,
+  "seller": "...", "location": null, "shipping": null, "evidence": "...", "confidence": 0.0}}]}}
+"""
+
+
 def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: list[str],
-                       run_dir: Path, config: dict, intent: dict | None) -> list[dict]:
-    """One coverage sweep: each empty source-class gets a targeted search, round-robin across legs
-    (negative-space exploration — cross-check still happens at verify, so no need for all legs)."""
+                       run_dir: Path, config: dict, intent: dict | None, timeout_cap: int | None = None,
+                       gap_queries: list[dict] | None = None) -> list[dict]:
+    """One coverage sweep, round-robin across legs (negative-space exploration — cross-check still
+    happens at verify, so no need for all legs). Fires two kinds of job IN THE SAME executor batch:
+    one per empty source-CLASS, plus one per semantic GAP query the auditor flagged. No serial phase."""
     search_legs = config.get("search_legs") or ["codex", "gemini"]
     run_sites = config.get("sites") or []
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
-    jobs = [(search_legs[i % len(search_legs)], sc) for i, sc in enumerate(missing_classes)]
+    if timeout_cap is not None:
+        timeout = min(timeout, timeout_cap)
+    excluded = config.get("excluded_sites")
+    # Kind-tagged jobs so both class and gap searches share one round-robin over legs and one batch.
+    jobs: list[tuple[str, object, str]] = []
+    for sc in missing_classes:
+        jobs.append(("class", sc, build_coverage_prompt(prompt, sc, avoid_hosts, run_sites, intent, excluded)))
+    for gq in (gap_queries or []):
+        query = str((gq or {}).get("query") or "").strip()
+        if query:
+            jobs.append(("gap", query, build_gap_search_prompt(prompt, query, avoid_hosts, run_sites, intent, excluded)))
     if not jobs:
         return []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
         futures = [
-            executor.submit(call_model, leg,
-                            build_coverage_prompt(prompt, sc, avoid_hosts, run_sites, intent, config.get("excluded_sites")),
-                            run_dir, "coverage", f"coverage-{sc}",
-                            timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
-            for leg, sc in jobs
+            executor.submit(call_model, search_legs[i % len(search_legs)], built_prompt,
+                            run_dir, "coverage", f"{kind}-{key}",
+                            timeout, config["search_effort"],
+                            config.get("claude_search_model") if search_legs[i % len(search_legs)] == "claude" else None)
+            for i, (kind, key, built_prompt) in enumerate(jobs)
         ]
         return collect_with_straggler_drop(futures, run_dir, config)
 
 
-def build_recheck_prompt(user_prompt: str, rejected_item: dict, config: dict) -> str:
+def build_recheck_prompt(user_prompt: str, rejected_item: dict, config: dict,
+                         known_urls: list[str] | None = None) -> str:
     compact = json.dumps(
         {
             "title": rejected_item.get("title"),
@@ -2233,7 +2512,7 @@ Your job:
 - First try to RECOVER this exact item: listings move, change language prefixes, or get re-posted —
   find the current working URL for the same offer, its live price, and availability.
 - If the exact item is truly gone, find the closest equivalent current offer.
-- Return an empty findings array ONLY if you are confident no current purchasable offer exists for it.{site_rule}
+- Return an empty findings array ONLY if you are confident no current purchasable offer exists for it.{site_rule}{do_not_report_block(known_urls)}
 
 Use the same schema:
 {{
@@ -2341,6 +2620,7 @@ def build_synthesis_prompt(
     config: dict,
     degraded_legs: list[str] | None = None,
     intent: dict | None = None,
+    skipped_stages: list[str] | None = None,
 ) -> str:
     unconfirmed = [item for item in rejected if is_rescuable(item)]
     dead = [item for item in rejected if not is_rescuable(item)]
@@ -2353,6 +2633,7 @@ def build_synthesis_prompt(
         "intent": intent or None,
         "restricted_to_sites": config.get("sites") or None,
         "degraded_legs": degraded_legs or None,
+        "verification_stages_skipped_deadline": skipped_stages or None,
         "host_distribution": found_hosts,
         "sites_with_zero_results": zero_result_sites or None,
         "tasks": tasks,
@@ -2407,6 +2688,13 @@ Also include:
   ones in a separate "Unverified — check manually" section with URLs and what to verify.
 - If degraded_legs is set, one of the search models failed — state it as a Markdown blockquote AT
   THE VERY TOP (`> WARNING: ...`). Never present this warning as the best pick or first section.
+- If verification_stages_skipped_deadline is non-empty, some verification stages were skipped to stay
+  within the run's time budget — add ONE short degradation note (not the lead, not a warning callout)
+  saying which stages were skipped and that the results are less exhaustively cross-checked.
+- If intent.ambiguous is true (or intent.alternatives is non-empty), the run proceeded on ONE assumed
+  reading of an ambiguous request. State that assumption explicitly near the TOP of the report — which
+  reading you answered (intent.assumed, when set, is the exact default reading the system used) and
+  what the alternative readings were — so the user can correct it.
 - Each finding carries confidence_calibrated {{score, band: high/medium/low, factors}} combining
   cross-model agreement, live verification, seller trust and the model's own confidence. State the
   confidence of your top pick honestly (e.g. "high confidence — 3 models agree, live-verified,
@@ -2599,7 +2887,8 @@ def call_model(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        register_proc(run_id, record_id, proc.pid)
+        # Audit calls overlap a straggler-dropping phase; protect them from that phase's quorum kill.
+        register_proc(run_id, record_id, proc.pid, protected=task_type in ("plan_audit", "gap_audit"))
         stdout, stderr = proc.communicate(timeout=timeout)
         rc = proc.returncode
         timed_out = False
@@ -2745,6 +3034,7 @@ def init_run(prompt: str, config: dict) -> Path:
                 "sites": config.get("sites") or [],
                 "excluded_sites": config.get("excluded_sites") or [],
                 "vendor_tiers": config.get("vendor_tiers") or {},
+                "interactive": bool(config.get("interactive")),
             },
             "created_at": utc_now(),
             "updated_at": utc_now(),
@@ -2814,6 +3104,184 @@ def decompose_tasks(prompt: str, run_dir: Path, config: dict) -> tuple[list[dict
     except ValueError:
         return fallback_tasks(prompt, config), default_intent()
     return coerce_tasks(payload, prompt, config), coerce_intent(payload)
+
+
+def audit_plan(prompt: str, tasks: list[dict], intent: dict, run_dir: Path, config: dict) -> list[dict]:
+    """Concurrent plan reviewer. Advisory only: on ANY failure returns [] with no fallback tasks.
+    Runs on the judge vendor (codex-first — codex has no concurrency cap, so it never steals a
+    search slot). Returns accepted extra tasks (<=2, 1 variant each, tagged origin=plan_audit).
+    Emits plan_audit_finished + records run.json.plan_audit so the audit is observable even when
+    the primary search proceeds without waiting for it."""
+    brain = judge_vendor(config)
+    added: list[dict] = []
+    verdict, notes = "error", ""
+    try:
+        record = call_model(
+            brain,
+            build_plan_audit_prompt(prompt, tasks, intent, config),
+            run_dir,
+            "plan_audit",
+            "audit",
+            timeout=180,
+            effort="medium",
+            claude_model=vendor_claude_model(brain, config),
+        )
+        if record.get("success"):
+            payload = extract_json(record.get("stdout") or "")
+            if isinstance(payload, dict):
+                verdict = str(payload.get("verdict") or "").strip().lower() or "gaps"
+                notes = str(payload.get("notes") or "").strip()
+                added = coerce_audit_tasks(payload.get("extra_tasks"), tasks, config)
+    except (ValueError, KeyError, TypeError):
+        added = []  # advisory: never let a malformed audit fault the run
+    emit_event(run_dir, "plan_audit_finished", verdict=verdict, added=len(added), notes=notes[:200])
+    update_run(run_dir, plan_audit={"verdict": verdict, "added": len(added)})
+    return added
+
+
+def coerce_audit_tasks(raw_extra: object, tasks: list[dict], config: dict) -> list[dict]:
+    """Validate the auditor's extra tasks through the SAME normalization as decompose, then keep only
+    surgical, non-duplicate additions: drop any whose query matches an existing task's query or a
+    query_variant (case-insensitive), force distinct audit ids, cap 1 variant each, cap 2 total."""
+    if not isinstance(raw_extra, list):
+        return []
+    run_sites = config.get("sites") or []
+    existing = set()
+    for t in tasks:
+        existing.add(str(t.get("query") or "").strip().lower())
+        for v in (t.get("query_variants") or []):
+            existing.add(str(v or "").strip().lower())
+    out: list[dict] = []
+    for idx, raw in enumerate(raw_extra, start=1):
+        task = normalize_task(raw, f"audit-{idx}", run_sites)
+        if task is None or task["query"].lower() in existing:
+            continue
+        task["id"] = f"audit-{idx}"  # force a distinct id space so it never collides with a plan task
+        task["query_variants"] = task["query_variants"][:1]  # surgical, not broad
+        task["origin"] = "plan_audit"
+        existing.add(task["query"].lower())
+        out.append(task)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def build_gap_audit_prompt(user_prompt: str, intent: dict, verified: list[dict],
+                           host_dist: dict[str, int]) -> str:
+    """Semantic coverage auditor of the VERIFIED RESULTS (distinct from the plan auditor, which sees
+    only the plan). It gets a compact digest — the request, the extracted intent, the top verified
+    findings as one-liners and the host distribution (incl. hosts that returned nothing) — and names
+    up to 3 MATERIAL gaps: angles/channels of the question the current results plainly do not cover.
+    Quality over quantity: an empty list is the correct answer when coverage is adequate."""
+    intent = intent or {}
+    intent_view = {
+        "subject": intent.get("subject_keywords") or [],
+        "exclude": intent.get("exclude_keywords") or [],
+        "required_tier": intent.get("required_tier"),
+        "price_basis": intent.get("price_basis"),
+    }
+    lines = []
+    for f in verified[:15]:
+        price = f.get("price")
+        currency = f.get("currency")
+        if price is not None and currency:
+            price_str = f"{price} {currency}"
+        elif f.get("price_usd") is not None:
+            price_str = f"${f.get('price_usd')}"
+        else:
+            price_str = "price?"
+        title = (str(f.get("title") or "").strip()[:80] or "?")
+        lines.append(f"- {title} | {price_str} | {host_of(f.get('url')) or '?'}")
+    findings_digest = "\n".join(lines) or "(no verified findings yet)"
+    dist_lines = [
+        f"- {h}: {n} result(s)" + ("  <-- returned NOTHING" if not n else "")
+        for h, n in sorted(host_dist.items(), key=lambda kv: -kv[1])
+    ]
+    dist_digest = "\n".join(dist_lines) or "(none)"
+    return f"""You audit the COVERAGE of a multi-model offer-research run AFTER its first verified
+results. Decide whether the question is answered from enough angles, or whether whole aspects are
+still uncovered. Return ONLY valid JSON. No Markdown.
+
+User request:
+{user_prompt}
+
+Extracted intent:
+{json.dumps(intent_view, ensure_ascii=False, sort_keys=True)}
+
+Top verified findings so far:
+{findings_digest}
+
+Where results came from (host distribution):
+{dist_digest}
+
+Name up to 3 MATERIAL gaps — aspects/angles/channels of the user's question the findings above
+plainly DO NOT cover. A gap is material when it is a real part of what the user asked and is missing,
+e.g.: a missing CHANNEL TYPE (official store / big marketplace / classifieds / refurb-used / regional),
+a missing REGION or local-language FORMULATION, a missing PRODUCT VARIANT family, or a venue category
+that returned ZERO results yet plausibly has offers. For EACH gap give ONE concrete search query plus
+a one-line reason it matters.
+Do NOT invent gaps when coverage is already adequate — return an empty list. Verdict quality beats
+quantity: a shorter honest list is better than padded guesses.
+
+Schema:
+{{"gaps": [{{"query": "specific search query", "reason": "one line: what aspect this closes"}}]}}
+"""
+
+
+def coerce_gap_queries(raw_gaps: object, tasks: list[dict] | None, config: dict) -> list[dict]:
+    """Validate the semantic auditor's proposed gaps: keep at most 3 {query, reason} entries whose
+    query does not duplicate (case-insensitive) an existing task query/variant or an earlier kept
+    gap. Any non-list / malformed payload yields []."""
+    if not isinstance(raw_gaps, list):
+        return []
+    seen = set()
+    for t in (tasks or []):
+        seen.add(str(t.get("query") or "").strip().lower())
+        for v in (t.get("query_variants") or []):
+            seen.add(str(v or "").strip().lower())
+    out: list[dict] = []
+    for raw in raw_gaps:
+        if not isinstance(raw, dict):
+            continue
+        query = str(raw.get("query") or "").strip()
+        if not query or query.lower() in seen:
+            continue
+        seen.add(query.lower())
+        out.append({"query": query, "reason": str(raw.get("reason") or "").strip()})
+        if len(out) >= 3:
+            break
+    return out
+
+
+def gap_audit(prompt: str, intent: dict, verified: list[dict], host_dist: dict[str, int],
+              run_dir: Path, config: dict, tasks: list[dict] | None = None) -> list[dict]:
+    """Concurrent semantic coverage auditor. Advisory only: on ANY failure returns [] (non-fatal).
+    Runs on the judge vendor (codex-first — no concurrency cap, so it never steals a search slot).
+    Returns up to 3 non-duplicate gap queries. Emits gap_audit_finished + records run.json.gap_audit
+    so the audit is observable even when the run proceeds without acting on it."""
+    brain = judge_vendor(config)
+    gaps: list[dict] = []
+    try:
+        record = call_model(
+            brain,
+            build_gap_audit_prompt(prompt, intent, verified, host_dist),
+            run_dir,
+            "gap_audit",
+            "gap",
+            timeout=180,
+            effort="medium",
+            claude_model=vendor_claude_model(brain, config),
+        )
+        if record.get("success"):
+            payload = extract_json(record.get("stdout") or "")
+            if isinstance(payload, dict):
+                gaps = coerce_gap_queries(payload.get("gaps"), tasks, config)
+    except (ValueError, KeyError, TypeError):
+        gaps = []  # advisory: never let a malformed audit fault the run
+    emit_event(run_dir, "gap_audit_finished", gaps=len(gaps),
+               reasons=[g["reason"][:80] for g in gaps])
+    update_run(run_dir, gap_audit={"gaps": len(gaps)})
+    return gaps
 
 
 def parse_model_records(records: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -2901,7 +3369,6 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
     records: list[dict] = []
     latencies: list[float] = []
     deadline: float | None = None
-    killed_once = False
     pending = set(futures)
     while pending:
         wait_timeout = max(1.0, deadline - time.monotonic()) if deadline is not None else None
@@ -2919,12 +3386,14 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
         if deadline is None and len(records) >= quorum:
             median = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
             deadline = time.monotonic() + max(config["straggler_grace_sec"], median * 0.5)
-        if deadline is not None and time.monotonic() >= deadline and not killed_once:
+        if deadline is not None and time.monotonic() >= deadline:
             killed = kill_stragglers(run_dir.name)
             if killed:
                 emit_event(run_dir, "stragglers_killed", record_ids=killed)
-            killed_once = True
-            deadline = time.monotonic() + 30  # killed procs unwind within seconds; don't re-kill
+            # Re-arm every grace interval: a job that spawned its subprocess AFTER the first sweep
+            # (e.g. a late audit-added task) is reaped on the next pass, so the post-quorum wait stays
+            # bounded to the grace window instead of stretching to the full phase timeout.
+            deadline = time.monotonic() + max(1.0, config["straggler_grace_sec"])
     return records
 
 
@@ -2956,7 +3425,8 @@ def task_query_set(task: dict, n: int, n_angle: int = 0) -> list[dict]:
     return out
 
 
-def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: dict) -> list[dict]:
+def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: dict,
+                       extra_tasks_supplier: object = None, extra_tasks_sink: list | None = None) -> list[dict]:
     # All three families search in parallel at every level. Claude searches at the per-profile
     # claude_search_model tier (opus) under its own tight concurrency + per-run budget, so the
     # capped daily pool isn't drained (paced_budget trims it, drop-from-search removes Claude when
@@ -2966,7 +3436,6 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
     search_legs = config.get("search_legs") or ["codex", "gemini"]
     n_variants = config.get("query_variants_per_task", 1)
     n_angle = int(config.get("angle_variants_per_task") or 0)
-    expanded = [tv for task in tasks for tv in task_query_set(task, n_variants, n_angle)]
     # Anti-herding (effort >=3): every leg still searches every task (cross-check preserved), but
     # each gets a DIFFERENT source-class lean via rotation so legs explore complementary negative
     # space instead of all returning the same popular sites. SOFT lean (return strong offers from
@@ -2974,15 +3443,18 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
     # suppressed. off (effort 1-2) -> leg_focus=None -> byte-for-byte the old identical-prompt behaviour.
     differentiate = bool(config.get("differentiate_legs"))
     classes = list(SOURCE_CLASS_HINTS)
-    jobs = [
-        (leg, tv, (classes[(l_idx + t_idx) % len(classes)] if differentiate else None))
-        for t_idx, tv in enumerate(expanded)
-        for l_idx, leg in enumerate(search_legs)
-    ]
-
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
-        futures = [
+
+    def make_jobs(task_list: list[dict], n_var: int, n_ang: int) -> list[tuple]:
+        expanded = [tv for task in task_list for tv in task_query_set(task, n_var, n_ang)]
+        return [
+            (leg, tv, (classes[(l_idx + t_idx) % len(classes)] if differentiate else None))
+            for t_idx, tv in enumerate(expanded)
+            for l_idx, leg in enumerate(search_legs)
+        ]
+
+    def submit(executor, job_list: list[tuple]) -> list:
+        return [
             executor.submit(
                 call_model,
                 leg,
@@ -2994,9 +3466,42 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
                 config["search_effort"],
                 config.get("claude_search_model") if leg == "claude" else None,
             )
-            for leg, tv, focus in jobs
+            for leg, tv, focus in job_list
         ]
+
+    jobs = make_jobs(tasks, n_variants, n_angle)
+    # Provision extra worker slots up front (the pool size is fixed at creation) so any late
+    # audit-added tasks (<=2, 1 variant each, all search legs) run alongside the initial fan-out.
+    # The reserve rides ON TOP of MAX_PRIMARY_WORKERS: a plain min(MAX, jobs+reserve) would zero it
+    # out whenever the base fan-out already saturates the cap, leaving late audit jobs queued behind.
+    reserve = 2 * len(search_legs) if extra_tasks_supplier is not None else 0
+    workers = max(1, min(len(jobs) + reserve, MAX_PRIMARY_WORKERS + reserve))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = submit(executor, jobs)
+        # Concurrent plan auditor: the initial jobs are already running, so a BOUNDED wait for the
+        # audit costs ~0 extra wall-clock (searches progress meanwhile). collect_with_straggler_drop
+        # fixes its totals/quorum at call time, so we submit the late jobs BEFORE collecting.
+        if extra_tasks_supplier is not None:
+            extra_tasks = wait_for_extra_tasks(extra_tasks_supplier, timeout)
+            if extra_tasks:
+                futures += submit(executor, make_jobs(extra_tasks, 1, 0))
+                if extra_tasks_sink is not None:
+                    # Only the tasks that were actually SEARCHED — a late audit that missed the
+                    # bounded wait yields nothing here, so the coverage grid / tasks.json never lists
+                    # a source_class that was never queried.
+                    extra_tasks_sink.extend(extra_tasks)
         return collect_with_straggler_drop(futures, run_dir, config)
+
+
+def wait_for_extra_tasks(supplier: object, search_timeout: int) -> list[dict]:
+    """Bounded wait on the plan-audit supplier (a Future-like with .result(timeout)). Waits at most
+    min(90s, search_timeout/4); on timeout or any error returns [] and leaves the audit running in
+    the background (its result is recorded by audit_plan itself, just unused by this phase)."""
+    wait_sec = min(90.0, max(1.0, search_timeout / 4))
+    try:
+        return list(supplier.result(timeout=wait_sec) or [])
+    except Exception:
+        return []
 
 
 def run_rechecks(
@@ -3006,6 +3511,8 @@ def run_rechecks(
     config: dict,
     round_no: int,
     attempts: dict[str, set[str]],
+    known_urls: list[str] | None = None,
+    timeout_cap: int | None = None,
 ) -> tuple[list[dict], int]:
     """Rescue pass for rejected/disputed items. `attempts` maps canonical item key -> legs that
     already tried it, so each round can hand the item to a model that has NOT tried yet (the
@@ -3043,12 +3550,14 @@ def run_rechecks(
         return [], dropped
 
     timeout = min(RAW_TIMEOUT_SEC, config["recheck_timeout_sec"])
+    if timeout_cap is not None:
+        timeout = min(timeout, timeout_cap)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
         futures = [
             executor.submit(
                 call_model,
                 leg,
-                build_recheck_prompt(prompt, item, config),
+                build_recheck_prompt(prompt, item, config, known_urls_minus_item(known_urls, item)),
                 run_dir,
                 "recheck",
                 task_id,
@@ -3320,7 +3829,7 @@ def fallback_report(prompt: str, verified: list[dict], rejected: list[dict], deg
     return "\n".join(lines) + "\n"
 
 
-def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], rejected: list[dict], run_dir: Path, config: dict, intent: dict | None = None) -> str:
+def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], rejected: list[dict], run_dir: Path, config: dict, intent: dict | None = None, skipped_stages: list[str] | None = None) -> str:
     degraded = disabled_legs(run_dir.name)
     if not verified:
         return fallback_report(prompt, verified, rejected, degraded)
@@ -3329,7 +3838,7 @@ def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], reje
     for judge in judge_chain(config):
         record = call_model(
             judge,
-            build_synthesis_prompt(prompt, tasks, verified, rejected, config, degraded, intent),
+            build_synthesis_prompt(prompt, tasks, verified, rejected, config, degraded, intent, skipped_stages),
             run_dir,
             "synthesize",
             f"final-{judge}",
@@ -3344,7 +3853,7 @@ def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], reje
     # user disabled Claude for this run.
     if "claude" in (config.get("enabled_legs") or []):
         reserve = call_agy_claude(
-            build_synthesis_prompt(prompt, tasks, verified, rejected, config, degraded, intent),
+            build_synthesis_prompt(prompt, tasks, verified, rejected, config, degraded, intent, skipped_stages),
             run_dir, "synthesize", "final-claude-agy", timeout=700,
         )
         if reserve["success"] and reserve.get("stdout", "").strip():
@@ -3352,13 +3861,52 @@ def synthesize_report(prompt: str, tasks: list[dict], verified: list[dict], reje
     return fallback_report(prompt, verified, rejected, degraded)
 
 
+def budget_remaining_sec(started_monotonic: float, config: dict) -> float | None:
+    """Wall-clock seconds left before the run's total time budget is spent, or None when no budget
+    is configured (unbounded). time_budget_sec is the TOTAL run cap from the effort profile."""
+    total = config.get("time_budget_sec")
+    if not total:
+        return None
+    return float(total) - (time.monotonic() - started_monotonic)
+
+
+def stage_fits_budget(started_monotonic: float, config: dict, reserve_sec: float = SYNTHESIS_RESERVE_SEC) -> bool:
+    """Whether an OPTIONAL stage may still run: only when more than the synthesis reserve remains, so
+    the value-delivering synthesis/review/fact-check always get to run inside the budget. Always True
+    when no budget is configured (unbounded)."""
+    remaining = budget_remaining_sec(started_monotonic, config)
+    return remaining is None or remaining > reserve_sec
+
+
+def clamp_round_timeout(configured_timeout: int, started_monotonic: float, config: dict,
+                        reserve_sec: float = SYNTHESIS_RESERVE_SEC) -> int:
+    """Shrink an optional round's per-phase timeout so a single round cannot eat into the synthesis
+    reserve; never drops below a 60s floor. Returns the configured timeout unchanged when unbounded."""
+    remaining = budget_remaining_sec(started_monotonic, config)
+    if remaining is None:
+        return configured_timeout
+    return int(min(configured_timeout, max(60, remaining - reserve_sec)))
+
+
+def emit_deadline_skip(run_dir: Path, stage: str, remaining_sec: float | None, skipped: list[str]) -> None:
+    """Record that an optional stage was skipped to stay within the time budget: stream the event,
+    accumulate the stage name (deduped) into `skipped`, and persist the list to run.json for the UI."""
+    emit_event(run_dir, "stage_skipped_deadline", stage=stage,
+               remaining_sec=int(remaining_sec) if remaining_sec is not None else None)
+    if stage not in skipped:
+        skipped.append(stage)
+    update_run(run_dir, skipped_by_deadline=list(skipped))
+
+
 def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
     run_id = run_dir.name
+    started = time.monotonic()
     sites = config.get("sites") or []
     excluded = config.get("excluded_sites") or []
     all_parsed_records: list[dict] = []
     verified: list[dict] = []
     rejected: list[dict] = []
+    gap_queries: list[dict] = []  # semantic-gap follow-up queries, filled after the recheck loop
     emitted_findings: dict = {}  # shared across rounds so a finding streams once (not every re-verify)
     ACTIVE_RUNS.add(run_id)
     init_leg_health(run_id)
@@ -3392,6 +3940,15 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         if run_cancelled(run_id):
             raise RunCancelled()
 
+    skipped_by_deadline: list[str] = []
+
+    def record_deadline_skip(stage: str) -> None:
+        emit_deadline_skip(run_dir, stage, budget_remaining_sec(started, config), skipped_by_deadline)
+
+    audit_executor = None
+    audit_future = None
+    gap_executor = None
+    gap_future = None
     try:
         update_run(run_dir, status="running", phase="decomposing", progress=None)
         tasks, intent = decompose_tasks(prompt, run_dir, config)
@@ -3399,8 +3956,60 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         update_run(run_dir, intent=intent)
         check_cancel()
 
+        # ---- interactive clarify gate ----
+        # Only interactive runs (UI / --ask) can pause here; the non-interactive CLI default and
+        # API-without-flag never enter either branch and proceed exactly as before. When a question is
+        # asked we park in a bounded poll loop, then either re-decompose ONCE with the answer or
+        # proceed on the assumed default reading. The waited seconds are EXCLUDED from the time budget
+        # by pushing `started` forward, so parking on a question never eats into the search window
+        # (record_deadline_skip / stage gates all read the same `started`).
+        ask_clarify, clarify_q, clarify_alts = should_ask_clarify(config, intent)
+        if config.get("interactive") and not ask_clarify:
+            emit_event(run_dir, "clarify_resolved", asked=False)
+        elif ask_clarify:
+            update_run(run_dir, phase="clarify", progress=None)
+            emit_event(run_dir, "clarify_pending", question=clarify_q,
+                       alternatives=clarify_alts, timeout_sec=CLARIFY_TIMEOUT_SEC)
+            wait_started = time.monotonic()
+            answer = wait_for_clarification(run_dir, run_id, CLARIFY_TIMEOUT_SEC, check_cancel=check_cancel)
+            started += time.monotonic() - wait_started  # don't bill the user's think time to the budget
+            if answer and not answer.get("skip") and answer.get("answer"):
+                emit_event(run_dir, "clarify_resolved", asked=True, answered=True)
+                update_run(run_dir, phase="decomposing", progress=None)
+                # Rebind the local prompt so ALL downstream stages use the disambiguated request,
+                # not only this re-decompose (run.json still holds the original for the UI header).
+                prompt = build_clarified_prompt(prompt, answer["answer"])
+                tasks, intent = decompose_tasks(prompt, run_dir, config)
+                write_json(run_dir / "tasks.json", {"tasks": tasks, "intent": intent})
+                update_run(run_dir, intent=intent,
+                           clarify={"asked": True, "answered": True, "question": clarify_q,
+                                    "answer": answer["answer"]})
+            else:
+                emit_event(run_dir, "clarify_resolved", asked=True, answered=False)
+                assumed = clarify_alts[0] if clarify_alts else None
+                intent["assumed"] = assumed  # flows into build_synthesis_prompt via the intent context
+                write_json(run_dir / "tasks.json", {"tasks": tasks, "intent": intent})
+                update_run(run_dir, intent=intent,
+                           clarify={"asked": True, "answered": False, "question": clarify_q,
+                                    "assumed": assumed})
+            check_cancel()
+
+        # Concurrent plan auditor (effort >=2): kick it off BEFORE the search so it overlaps the
+        # primary-search window. run_primary_search does a bounded wait on this future and folds any
+        # accepted extra tasks into the SAME fan-out — no serial phase, ~0 extra wall-clock.
+        if config.get("plan_audit"):
+            emit_event(run_dir, "plan_audit_started")
+            audit_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            audit_future = audit_executor.submit(audit_plan, prompt, tasks, intent, run_dir, config)
+
         update_run(run_dir, phase="primary_search", progress=None)
-        primary_records = run_primary_search(prompt, tasks, run_dir, config)
+        audit_added: list[dict] = []
+        primary_records = run_primary_search(prompt, tasks, run_dir, config,
+                                             extra_tasks_supplier=audit_future,
+                                             extra_tasks_sink=audit_added)
+        if audit_added:
+            tasks = tasks + audit_added
+            write_json(run_dir / "tasks.json", {"tasks": tasks, "intent": intent})
         findings, parse_rejections, parsed_records = parse_model_records(primary_records)
         all_parsed_records.extend(parsed_records)
         write_json(run_dir / "findings.json", {"stage": "primary", "findings": findings, "parse_rejections": parse_rejections})
@@ -3411,12 +4020,34 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         record_stage_results(run_dir, "primary", verified, rejected)
         check_cancel()
 
+        # Concurrent semantic-gap auditor (effort >=2): kick it off BEFORE the rescue loop so its one
+        # call hides inside the recheck window (~0 extra wall-clock). It deliberately audits the
+        # POST-PRIMARY verified state — rescue only recovers already-known items, it never changes
+        # coverage — and its follow-up queries are collected right after the loop.
+        if config.get("gap_audit") and verified:
+            emit_event(run_dir, "gap_audit_started")
+            gap_dist = dict(host_distribution(verified))
+            requested_sites = config.get("sites") or [s for t in tasks for s in (t.get("preferred_sites") or [])]
+            for s in requested_sites:
+                gap_dist.setdefault(s, 0)  # zero-result hosts feed the auditor a real coverage gap
+            gap_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            gap_future = gap_executor.submit(gap_audit, prompt, intent, list(verified), gap_dist,
+                                             run_dir, config, tasks)
+
         rescue_attempts: dict[str, set[str]] = {}
         recheck_dropped = 0
         for round_no in range(1, config["recheck_rounds"] + 1):
+            # The first rescue round always runs (rescue philosophy); later rounds are optional and
+            # yield to the synthesis reserve.
+            if round_no > 1 and not stage_fits_budget(started, config):
+                record_deadline_skip("recheck")
+                break
             update_run(run_dir, phase=f"rechecking_{round_no}", progress=None)
             disputed = [item for item in verified if item.get("disputed")]
-            recheck_records, dropped = run_rechecks(prompt, rejected + disputed, run_dir, config, round_no, rescue_attempts)
+            cap = clamp_round_timeout(config["recheck_timeout_sec"], started, config) if round_no > 1 else None
+            known = [v.get("url") for v in verified if v.get("url")]
+            recheck_records, dropped = run_rechecks(prompt, rejected + disputed, run_dir, config, round_no,
+                                                    rescue_attempts, known_urls=known, timeout_cap=cap)
             recheck_dropped += dropped
             if not recheck_records:
                 break
@@ -3432,18 +4063,34 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             update_run(run_dir, recheck_dropped=recheck_dropped)
         check_cancel()
 
+        # The gap audit overlapped the rescue window; collect its follow-up queries now. Any failure
+        # is advisory — gap_audit swallows it and returns [], so this never faults the run.
+        if gap_future is not None:
+            try:
+                gap_queries = gap_future.result() or []
+            except Exception:
+                gap_queries = []
+
         # Coverage-gap rounds (effort >=3): search the (structured) source-classes that produced
         # nothing credible, steering away from saturated hosts. Distinct from rescue (recovers
         # rejected) and frontier (chases cheaper). Stops when no class is empty, a round adds no new
         # verified listing, or the budget runs out. Only ADDS candidates that pass the same gate.
+        # The semantic-gap follow-ups MERGE into the coverage round's fan-out (only on round 1, so a
+        # second coverage round never re-searches them) — no serial phase is added for gaps here.
         for round_no in range(1, config.get("coverage_rounds", 0) + 1):
             all_classes = {t.get("source_class") for t in tasks if t.get("source_class")}
             missing = sorted(all_classes - covered_source_classes(verified, tasks))
-            if not missing:
+            round_gaps = gap_queries if round_no == 1 else []
+            if not missing and not round_gaps:
+                break
+            if not stage_fits_budget(started, config):
+                record_deadline_skip("coverage")
                 break
             update_run(run_dir, phase=f"coverage_{round_no}", progress=None)
             avoid_hosts = [h for h, _ in sorted(host_distribution(verified).items(), key=lambda kv: -kv[1])[:3]]
-            coverage_records = run_coverage_round(prompt, missing, avoid_hosts, run_dir, config, intent)
+            cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
+            coverage_records = run_coverage_round(prompt, missing, avoid_hosts, run_dir, config, intent,
+                                                  timeout_cap=cap, gap_queries=round_gaps)
             if not coverage_records:
                 break
             c_findings, c_parse_rej, c_parsed = parse_model_records(coverage_records)
@@ -3457,14 +4104,38 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             if not ({dedupe_key(v) for v in verified} - prev_keys):  # novelty-exhausted: stop
                 break
 
+        # Effort-2 semantic-gap mini-wave: at this level coverage rounds are OFF, so the merged path
+        # above never ran. When the auditor found material gaps AND the budget allows it, fire ONE
+        # bounded sweep of just those gap queries (reusing run_coverage_round with no missing classes).
+        if config.get("coverage_rounds", 0) == 0 and gap_queries and stage_fits_budget(started, config):
+            update_run(run_dir, phase="gap_search", progress=None)
+            avoid_hosts = [h for h, _ in sorted(host_distribution(verified).items(), key=lambda kv: -kv[1])[:3]]
+            cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
+            gap_records = run_coverage_round(prompt, [], avoid_hosts, run_dir, config, intent,
+                                             timeout_cap=cap, gap_queries=gap_queries)
+            if gap_records:
+                g_findings, g_parse_rej, g_parsed = parse_model_records(gap_records)
+                all_parsed_records.extend(g_parsed)
+                findings = findings + g_findings
+                parse_rejections = parse_rejections + g_parse_rej
+                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="gap", emitted=emitted_findings)
+                record_stage_results(run_dir, "gap", verified, rejected)
+                check_cancel()
+
         # Frontier rounds: push strictly below the current best credible price until a round finds
         # nothing cheaper-and-credible (dry) or the round budget is spent. Effort-gated.
         for round_no in range(1, config.get("frontier_rounds", 0) + 1):
             ceiling = credible_floor_usd(verified)
             if ceiling is None:
                 break
+            if not stage_fits_budget(started, config):
+                record_deadline_skip("frontier")
+                break
             update_run(run_dir, phase=f"frontier_{round_no}", progress=None)
-            frontier_records = run_frontier_round(prompt, ceiling, run_dir, config, intent, round_no)
+            cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
+            known = [v.get("url") for v in verified if v.get("url")]
+            frontier_records = run_frontier_round(prompt, ceiling, run_dir, config, intent, round_no,
+                                                  known_urls=known, timeout_cap=cap)
             if not frontier_records:
                 break
             f_findings, f_parse_rej, f_parsed = parse_model_records(frontier_records)
@@ -3493,22 +4164,37 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         write_model_stats(run_id, all_parsed_records, rejected)
 
         update_run(run_dir, phase="synthesizing", progress=None)
-        report = synthesize_report(prompt, tasks, verified, rejected, run_dir, config, intent)
+        report = synthesize_report(prompt, tasks, verified, rejected, run_dir, config, intent, skipped_by_deadline)
         check_cancel()
 
+        # Review + fact-check run AFTER synthesis, so they gate on the small post-synthesis reserve
+        # (just enough to finish writing final.md), NOT the full synthesis reserve. Because these two
+        # skips are decided after synthesize_report already consumed skipped_by_deadline, the promised
+        # in-report degradation note can't cover them — so a deadline skip here ALSO prepends a visible
+        # callout to the report string (mirrors the "⚠ FINAL CHECK" mechanism below).
         if config["review_legs"]:
-            update_run(run_dir, phase="reviewing", progress=None)
-            report = adversarial_review(prompt, report, verified, rejected, run_dir, config)
+            if stage_fits_budget(started, config, reserve_sec=POST_SYNTHESIS_RESERVE_SEC):
+                update_run(run_dir, phase="reviewing", progress=None)
+                report = adversarial_review(prompt, report, verified, rejected, run_dir, config)
+            else:
+                record_deadline_skip("adversarial_review")
+                report = ("> ⚠ NOT REVIEWED: the time budget ran out before the adversarial review "
+                          "could run — treat these findings as not independently reviewed.\n\n" + report)
 
         # Final adversarial fact-check of the top pick — re-confirm the single most important
         # claim before presenting it; a failure becomes a warning callout at the top of the report.
         if config.get("final_factcheck") and verified:
-            update_run(run_dir, phase="factchecking", progress=None)
-            fc = factcheck_top_pick(prompt, verified, run_dir, config, intent)
-            update_run(run_dir, final_check=fc)
-            if fc and fc.get("ok") is False:
-                report = (f"> ⚠ FINAL CHECK: the top recommendation could not be re-confirmed "
-                          f"({fc['reason']}). Re-verify it yourself before buying.\n\n" + report)
+            if stage_fits_budget(started, config, reserve_sec=POST_SYNTHESIS_RESERVE_SEC):
+                update_run(run_dir, phase="factchecking", progress=None)
+                fc = factcheck_top_pick(prompt, verified, run_dir, config, intent)
+                update_run(run_dir, final_check=fc)
+                if fc and fc.get("ok") is False:
+                    report = (f"> ⚠ FINAL CHECK: the top recommendation could not be re-confirmed "
+                              f"({fc['reason']}). Re-verify it yourself before buying.\n\n" + report)
+            else:
+                record_deadline_skip("final_factcheck")
+                report = ("> ⚠ NOT FACT-CHECKED: the time budget ran out before the final fact-check "
+                          "of the top pick — re-verify it yourself before buying.\n\n" + report)
 
         (run_dir / "final.md").write_text(report, encoding="utf-8")
 
@@ -3561,8 +4247,15 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         except Exception:
             (run_dir / "final.md").write_text(f"# Research failed\n\n{exc}\n", encoding="utf-8")
     finally:
+        # Both auditors are fast relative to the phases they overlap, so by now they have almost
+        # always finished; shut their pools down (non-blocking) so no stray thread outlives the run.
+        if audit_executor is not None:
+            audit_executor.shutdown(wait=False)
+        if gap_executor is not None:
+            gap_executor.shutdown(wait=False)
         ACTIVE_RUNS.discard(run_id)
         clear_cancel(run_id)
+        clear_clarification(run_id)
         clear_user_disabled(run_id)
         clear_run_gemini_model(run_id)
         clear_leg_health(run_id)
@@ -3877,6 +4570,23 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(409, {"error": "call_not_active"})
             return
 
+        match = re.fullmatch(r"/api/runs/([^/]+)/clarify", parsed.path)
+        if match:
+            run_id = Path(urllib.parse.unquote(match.group(1))).name
+            run_dir = RUNS_DIR / run_id
+            if not run_dir.exists():
+                self.send_json(404, {"error": "run_not_found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            except (json.JSONDecodeError, ValueError):
+                self.send_json(400, {"error": "invalid_json"})
+                return
+            entry = submit_clarification(run_dir, run_id, body)
+            self.send_json(202, {"status": "clarify_received", "skip": entry["skip"]})
+            return
+
         if parsed.path != "/api/runs":
             self.send_json(404, {"error": "not_found"})
             return
@@ -3889,7 +4599,8 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
                 return
             config = make_config(payload.get("effort"), payload.get("sites"), payload.get("disabled"),
                                  vendor_tiers=payload.get("vendor_tiers"),
-                                 excluded_sites=payload.get("excluded_sites"))
+                                 excluded_sites=payload.get("excluded_sites"),
+                                 interactive=payload.get("interactive"))
             run_id = start_background_run(prompt, config)
             self.send_json(202, {"run_id": run_id})
         except json.JSONDecodeError:
@@ -3947,6 +4658,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Gemini tier for every role it plays (default: high).")
     parser.add_argument("--claude-tier", default=None, choices=CLAUDE_TIERS,
                         help="Claude tier for every role it plays (default: opus).")
+    parser.add_argument("--ask", action="store_true",
+                        help="Interactive: if the request is ambiguous, pause once to ask a "
+                             "clarifying question (waits up to RESEARCH_CLARIFY_TIMEOUT_SEC, then "
+                             "proceeds on the default reading). Off by default so scripts never block.")
     parser.add_argument("--serve", action="store_true", help="Start the local Web UI.")
     parser.add_argument("--host", default="127.0.0.1", help="Host for --serve.")
     parser.add_argument("--port", type=int, default=8765, help="Port for --serve.")
@@ -3974,7 +4689,8 @@ def main(argv: list[str] | None = None) -> int:
     config = make_config(args.effort, ",".join(args.site) if args.site else None,
                          ",".join(args.disable) if args.disable else None,
                          vendor_tiers={k: v for k, v in cli_tiers.items() if v},
-                         excluded_sites=",".join(args.exclude_site) if args.exclude_site else None)
+                         excluded_sites=",".join(args.exclude_site) if args.exclude_site else None,
+                         interactive=args.ask)
     run_dir = run_research(prompt, config)
     meta = read_json(run_dir / "run.json", {}) or {}
     print(f"run_id: {run_dir.name}")

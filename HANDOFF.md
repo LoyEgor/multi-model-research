@@ -1,4 +1,4 @@
-# HANDOFF — current state & next steps (updated 2026-06-13, vendor on/off)
+# HANDOFF — current state & next steps (updated 2026-07-04, search quality & latency)
 
 For the next model continuing this project. Read `README.md` first (the stable spec: goal,
 token-economy rule, verified CLI facts, smoke tests). Read `ROADMAP.md` for the agreed phase
@@ -9,10 +9,12 @@ open. The owner communicates in Russian; everything written into the repo stays 
 
 `research.py` (single file, stdlib-only — no FastAPI, deliberately, so `start.command` runs with
 zero install) is a working orchestrator:
-decompose (Codex) → parallel search (Codex + Gemini per task) → URL + live-page verification →
-listing-ID dedupe + cross-leg price-dispute detection → rescue rounds (other leg) → Claude
-adjudication of disputes → synthesis (Codex) → cross-vendor adversarial review (effort ≥3) →
-`final.md`.
+decompose (Codex) → optional interactive clarify gate (ambiguous requests only) → parallel search
+(Codex + Gemini per task, a concurrent plan auditor riding the same wave at effort 2-4) → URL +
+live-page verification → listing-ID dedupe + cross-leg price-dispute detection → rescue rounds
+(other leg, a concurrent gap auditor riding the rescue window at effort 2-4) → Claude adjudication
+of disputes → synthesis (Codex) → cross-vendor adversarial review (effort ≥3) → `final.md`. Every
+OPTIONAL stage past the first rescue round is gated by the effort profile's wall-clock time budget.
 
 Three subscription legs, in the shared **llm-legs** git submodule at `lib/legs/`
 (`ask_codex.sh` gpt-5.5, `ask_gemini.sh` Google via Antigravity `agy --print` pinned to
@@ -43,12 +45,33 @@ judge, arbiter, reviewer and synthesis. A per-run `USER_DISABLED` guard in `call
 (`skipped_by_user`) and an `enabled_legs` gate on the agy Claude reserve are the belt-and-
 suspenders. Disabling all three is ignored (a run always keeps ≥1 vendor).
 
+Improvement round 3 — search quality & latency (2026-07-04), backed by an external best-practices
+pass (Anthropic multi-agent research system, OpenAI/Gemini Deep Research, STORM, reflective-
+retrieval papers): (1) the per-effort `time_budget_sec` (1500/2400/4200/5100s) is now enforced —
+`budget_remaining_sec`/`stage_fits_budget` gate every OPTIONAL stage (recheck rounds after the
+first, coverage, frontier, adversarial review, final factcheck), skipping one with a
+`stage_skipped_deadline` event once only `SYNTHESIS_RESERVE_SEC` remains, recorded in
+`run.json.skipped_by_deadline` and surfaced as a report degradation note + UI timeline "skipped
+(time budget)"; (2) a concurrent plan auditor (effort 2-4, `config.plan_audit`) rides the primary
+search wave and may fold up to 2 extra tasks (`origin="plan_audit"`) into the same fan-out before
+collection; (3) a concurrent semantic-gap auditor (effort 2-4, `config.gap_audit`) rides the
+rescue window and surfaces up to 3 material uncovered angles, merged into the coverage round's
+fan-out at effort 3-4 or firing one bounded mini-wave at effort 2; (4) an interactive clarify gate
+— decompose also emits `intent.clarify_question`/`intent.alternatives`; interactive runs (UI always
+sends `interactive: true`, CLI opt-in via `--ask`) pause in phase `clarify`, emit SSE
+`clarify_pending`, and wait up to `RESEARCH_CLARIFY_TIMEOUT_SEC` (default 45s, excluded from the
+time budget) for `POST /api/runs/<id>/clarify`; an answer triggers one re-decompose, timeout/skip
+proceeds on the assumed default reading (stated near the top of the report). Deliberately NOT
+done: sharing findings between parallel search legs mid-flight — research shows it collapses the
+independent cross-check signal (sycophancy up to 85.5%); only coverage state (searched URLs) is
+shared, via the existing "do not re-report these URLs" prompt block.
+
 Live-page verification (minimal Stage 2): `apply_live_check` fetches verified marketplace
 listings, rejects non-active ads (`listing_inactive`), and overrides the model-claimed price
 with the live page price (`price_corrected_from`). Currently OLX-only (listing-ID patterns +
 generic price regex) — Plati/Prom/JSON-LD adapters are the open Stage 2 work.
 
-Tests: `python3 -m unittest discover tests` — 66 tests, all passing.
+Tests: `python3 -m unittest discover tests` — 129 tests, all passing.
 
 Git: public repos github.com/LoyEgor/{multi-model-research, llm-legs}; find-truth private. The
 owner controls git — do NOT commit/push without explicit per-action instruction.

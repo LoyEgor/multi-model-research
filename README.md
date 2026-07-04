@@ -91,20 +91,32 @@ Local Web UI — easiest way to use the system:
 Effort levels (`--effort`, slider, or names quick/standard/deep/max). Scaling adds breadth and
 verification layers; it NEVER swaps in weaker model tiers:
 
-| level | tasks | rescue rounds | max rescue items | legs per rescue | adversarial review | Claude seat (adjudication/review) | codex effort |
-|-------|-------|---------------|------------------|-----------------|--------------------|-----------------------------------|--------------|
-| 1 quick | 3 | 1 | 4 | 1 | – | Sonnet | medium |
-| 2 standard (default) | 4 | 1 | 6 | 1 | – | Sonnet | medium search / xhigh judge |
-| 3 deep | 5 | 2 | 8 | 1 (rotates) | Gemini | Opus | medium search / xhigh judge |
-| 4 max | 6 | 2 | 12 | 2 (both) | Gemini + Opus | Opus | xhigh everywhere |
+| level | tasks | rescue rounds | max rescue items | legs per rescue | adversarial review | Claude seat (adjudication/review) | codex effort | time budget |
+|-------|-------|---------------|------------------|-----------------|--------------------|-----------------------------------|--------------|-------------|
+| 1 quick | 3 | 1 | 4 | 1 | – | Sonnet | medium | 25 min |
+| 2 standard (default) | 4 | 1 | 6 | 1 | – | Sonnet | medium search / xhigh judge | 40 min |
+| 3 deep | 5 | 2 | 8 | 1 (rotates) | Gemini | Opus | medium search / xhigh judge | 70 min |
+| 4 max | 6 | 2 | 12 | 2 (both) | Gemini + Opus | Opus | xhigh everywhere | 85 min |
 
 The Claude seat is tiered by cost: Sonnet at low effort, Opus at high effort. **Opus is the hard
 cost ceiling** — `lib/legs/ask_claude.sh` refuses Mythos-class models (fable/mythos) outright, no
 override. Dispute adjudication runs at EVERY level (it is cheap and only fires when models
 disagree); review layers appear from level 3.
 
+The time budget is an enforced wall-clock ceiling (`time_budget_sec` per effort profile), not a
+soft estimate: once only a synthesis reserve remains, remaining OPTIONAL stages (extra rescue
+rounds, coverage, frontier, adversarial review, final factcheck) are skipped rather than run over
+— reported as a degradation note, never silently. Effort levels 2-4 also run a concurrent plan
+auditor (alongside the primary search) and a concurrent gap auditor (alongside rescue) that can add
+a few extra tasks/queries at near-zero added latency.
+
 What v1 does:
-- asks Codex to decompose the prompt into independent search tasks (count from effort);
+- asks Codex to decompose the prompt into independent search tasks (count from effort); when the
+  request is ambiguous AND the run is interactive (UI always, or CLI `--ask`), the run pauses once
+  in a **clarify gate** with a question + quick-answer alternatives, then re-decomposes on the
+  answer or proceeds on the assumed default reading after a timeout;
+- at effort 2-4, a concurrent **plan auditor** rides the primary search wave (near-zero added
+  latency) and may add up to 2 surgical extra tasks if it spots a coverage gap or overlap;
 - runs Codex and Gemini in parallel for the primary search, with per-leg query templates
   (Codex never sees `site:` operators — it returns empty findings on them; Gemini gets them
   appended when a site restriction is active);
@@ -127,6 +139,9 @@ What v1 does:
   for the same item's working URL / live price. Items the rescue budget skipped are counted in
   `run.json.recheck_dropped` (shown in the UI). Only disproven/policy rejections are final:
   `out_of_stock`, `off_site`, `parse_failed`, `adjudicated_reject`;
+- at effort 2-4, a concurrent **gap auditor** rides the rescue window and names up to 3 materially
+  uncovered angles with concrete search queries — merged into the coverage round at effort 3-4, or
+  a single bounded mini-wave at effort 2 when gaps are actually found;
 - items still unverified after rescue go into the final report's **"Unverified — check
   manually"** section with URLs and what to check — they may be exactly what the user wanted;
 - Claude (thin arbiter: Sonnet at effort 1-2, Opus at 3-4) adjudicates surviving price disputes
@@ -142,6 +157,10 @@ What v1 does:
   the run (circuit breaker; shown in the UI and warned about in the report), slow stragglers are
   killed once 75% of a phase has returned (their items go to rescue), per-phase timeouts come
   from the effort profile, and the judge seat falls back codex → claude → gemini;
+- enforces the per-effort **time budget**: each optional stage (extra rescue rounds, coverage,
+  frontier, adversarial review, final factcheck) only runs if enough of the wall-clock budget is
+  left for it plus the synthesis reserve; once it isn't, the stage is skipped and the report says
+  so instead of running past its effort-level ceiling;
 - protects the scarce Gemini quota: the CLI call is hard-bounded (`GEMINI_CLI_TIMEOUT`, default
   240 s — the CLI HANGS in internal retries when the pro quota is exhausted, it does not fail),
   quota errors exit with code 5 and instantly disable the leg for the run (same for Codex
@@ -164,7 +183,11 @@ Useful local tuning knobs:
 - `RESEARCH_URL_TIMEOUT_SEC=12` — per URL check timeout;
 - `RESEARCH_MAX_TASKS` — overrides the effort profile's task count when set (capped 3-6);
 - `RESEARCH_MAX_RECHECK_ITEMS` — overrides the effort profile's per-round recheck cap when set;
-- `RESEARCH_MAX_PRIMARY_WORKERS=6` — primary fan-out concurrency.
+- `RESEARCH_MAX_PRIMARY_WORKERS=6` — primary fan-out concurrency;
+- `RESEARCH_SYNTHESIS_RESERVE_SEC=900` — wall-clock reserved for synthesis; optional stages stop
+  once the run's time budget has only this much left;
+- `RESEARCH_CLARIFY_TIMEOUT_SEC=45` — how long an interactive run waits for an answer to the
+  clarify gate's question before proceeding on the assumed default reading.
 
 v1 limitations:
 - Claude is used only in THIN seats (adjudication, review) at effort >= 3 — by design, not a gap.

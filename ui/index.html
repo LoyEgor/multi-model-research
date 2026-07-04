@@ -164,6 +164,8 @@
   .phase .ph-ico { font-size: 11px; line-height: 1; }
   .phase.done { background: var(--good-soft); color: var(--good); }
   .phase.active { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+  .phase.skipped { background: var(--surface-2); color: var(--muted); opacity: .7; }
+  .phase .ph-skip { font-size: 11px; font-style: italic; opacity: .8; }
 
   /* Report */
   .report { display: flex; flex-direction: column; gap: 18px; }
@@ -208,6 +210,25 @@
   .error-card h3 { margin: 0 0 6px; font-family: var(--display); font-weight: 600; letter-spacing: -.01em; font-size: 15px; }
   .error-card p { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
   .partial-note { padding: 12px 20px; border-radius: var(--r-md); background: var(--warn-soft); color: var(--warn); font-size: 13px; font-weight: 500; animation: float-in .4s ease both; }
+
+  /* Interactive clarify gate */
+  .clarify-card { border-radius: var(--r-lg); background: var(--accent-soft); padding: 20px 24px; animation: float-in .4s ease both; display: flex; flex-direction: column; gap: 14px; }
+  .clarify-card.slim { padding: 12px 20px; }
+  .clarify-card.disabled { opacity: .6; pointer-events: none; }
+  .clarify-status { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 500; color: var(--accent-ink); }
+  .clarify-q { font-family: var(--display); font-weight: 600; font-size: 16px; letter-spacing: -.01em; color: var(--ink); }
+  .clarify-alts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .clarify-alt { padding: 8px 16px; border-radius: 999px; background: var(--surface); color: var(--ink); font-size: 13px; font-weight: 600; box-shadow: var(--shadow-sm); transition: background .2s ease, color .2s ease; }
+  .clarify-alt:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  .clarify-alt.default-alt { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .clarify-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .clarify-input { flex: 1; min-width: 160px; border: 0; outline: 0; border-radius: 999px; background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; padding: 10px 16px; }
+  .clarify-send { padding: 10px 20px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 600; font-size: 13px; transition: background .2s ease, opacity .2s ease; }
+  .clarify-send:hover:not(:disabled) { background: var(--accent-dark); }
+  .clarify-send:disabled { opacity: .45; cursor: default; }
+  .clarify-skip { padding: 10px 16px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); font-weight: 600; font-size: 13px; transition: background .2s ease; }
+  .clarify-skip:hover:not(:disabled) { background: var(--sunken); }
+  .clarify-count { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; margin-left: auto; }
 
   /* Collapsible panels */
   .panels { display: flex; flex-direction: column; gap: 12px; }
@@ -497,6 +518,8 @@
         <div class="progress-track" id="progressTrack" hidden><div class="progress-fill" id="progressFill"></div></div>
       </div>
 
+      <div class="clarify-card" id="clarifyCard" hidden></div>
+
       <div class="error-card" id="errorCard" hidden>
         <h3>Run failed</h3>
         <p id="errorText"></p>
@@ -576,6 +599,9 @@ const state = {
   es: null,
   activity: new Map(),       // record_id -> {leg, task_type, task_id, state, latency}
   degraded: new Set(),       // live-updated via SSE
+  skippedPhases: new Set(),  // phase indices skipped to stay within the time budget (SSE)
+  reachedPhases: new Set(),  // phase indices the run actually became active at (distinguishes a
+                             // partial-skip stage that DID run from one that never started)
   reportKey: null,           // cache key of rendered report
   reportMd: null,            // raw markdown of the rendered report
   openPanels: new Set(),
@@ -593,6 +619,10 @@ const state = {
   liveStages: [],            // [{stage, verified_total, rejected_total}] from stage_summary
   liveSeq: 0,                // arrival counter -> stable "discovery order" for the live list
   liveDirty: false,          // a finding_settled arrived; coalesce renders to one frame
+  clarify: null,             // interactive clarify gate: {status:'checking'|'pending'|'resolved', ...}
+  clarifyTimer: null,        // countdown interval for a pending clarify question
+  clarifySending: false,     // an answer POST is in flight (disables the card until resolved)
+  clarifyRenderKey: null,    // structural signature of the rendered card (avoids clobbering typed input)
 };
 const $ = (id) => document.getElementById(id);
 const TERMINAL = ['completed', 'failed', 'cancelled'];
@@ -948,7 +978,10 @@ function closeMobileHistory() {
 const PHASES = ['Decompose', 'Search', 'Verify', 'Rescue', 'Coverage', 'Frontier', 'Adjudicate', 'Synthesize', 'Review', 'Fact-check'];
 function phaseIndex(phase) {
   const p = (phase || '').toLowerCase();
-  if (/decomp/.test(p)) return 0;
+  if (/decomp|clarif/.test(p)) return 0;  // the clarify wait sits within the Decompose stage
+  // The effort-2 gap sweep runs AFTER rescue as a coverage-style pass; map it to Coverage so the
+  // timeline advances (>= rescue) instead of regressing to Search on the /search/ fallback below.
+  if (/gap_search/.test(p)) return 4;
   if (/search/.test(p)) return 1;
   if (/verif/.test(p)) return 2;
   if (/recheck|rescue/.test(p)) return 3;
@@ -964,18 +997,139 @@ function phaseIndex(phase) {
 function renderTimeline(phase, status) {
   const tl = $('timeline');
   const active = status === 'running' || status === 'queued';
+  state.timeline = { phase, status };  // remember so a late stage_skipped_deadline can re-render
   tl.hidden = !active;
   if (!active) return;
   const idx = phaseIndex(phase);
+  if (idx >= 0 && idx < PHASES.length) state.reachedPhases.add(idx);
   const row = $('phaseRow');
   row.replaceChildren();
   PHASES.forEach((name, i) => {
-    const cls = idx >= PHASES.length || i < idx ? 'done' : (i === idx ? 'active' : '');
+    const done = idx >= PHASES.length || i < idx;
+    // A stage_skipped_deadline mark on a stage the run already ran means only a LATER round was
+    // dropped (e.g. rescue round 2) — keep it done. Only stages that never became active (review /
+    // fact-check skipped after synthesis) render as skipped.
+    const skipped = state.skippedPhases.has(i) && !state.reachedPhases.has(i);
+    const cls = skipped ? 'skipped' : (done ? 'done' : (i === idx ? 'active' : ''));
     const ph = el('span', 'phase ' + cls);
-    ph.appendChild(el('span', 'ph-ico', cls === 'done' ? '✓' : (cls === 'active' ? '●' : '○')));
+    ph.appendChild(el('span', 'ph-ico', skipped ? '⊘' : (done ? '✓' : (i === idx ? '●' : '○'))));
     ph.appendChild(document.createTextNode(name));
+    if (skipped) { ph.title = 'skipped (time budget)'; ph.appendChild(el('span', 'ph-skip', 'skipped')); }
     row.appendChild(ph);
   });
+}
+
+/* ---------------- interactive clarify gate ---------------- */
+function clearClarifyTimer() {
+  if (state.clarifyTimer) { clearInterval(state.clarifyTimer); state.clarifyTimer = null; }
+}
+function clarifyRemaining(c) {
+  if (!c || !c.timeoutSec || !c.startedAt) return null;
+  return Math.max(0, Math.ceil(c.timeoutSec - (Date.now() - c.startedAt) / 1000));
+}
+async function sendClarify(body) {
+  if (state.mock || !state.current || state.clarifySending) return;
+  state.clarifySending = true;
+  state.clarifyRenderKey = null;
+  renderClarify();  // reflect the disabled "Sending…" state at once; clarify_resolved finalizes it
+  try {
+    const res = await fetch('/api/runs/' + encodeURIComponent(state.current) + '/clarify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('http ' + res.status);  // a 4xx must free the card for a retry, not stick at "Sending…"
+  } catch (e) {
+    state.clarifySending = false;
+    state.clarifyRenderKey = null;
+    toast('Could not send your answer');
+    renderClarify();
+  }
+}
+function startClarifyCountdown() {
+  clearClarifyTimer();
+  const tick = () => {
+    const rem = clarifyRemaining(state.clarify);
+    const cd = $('clarifyCount');
+    if (cd) cd.textContent = rem === null ? '' : rem + 's';
+    if (rem !== null && rem <= 0) clearClarifyTimer();
+  };
+  tick();
+  state.clarifyTimer = setInterval(tick, 1000);
+}
+function renderClarify() {
+  const box = $('clarifyCard');
+  const c = state.clarify;
+  if (!c) { clearClarifyTimer(); box.hidden = true; box.className = 'clarify-card'; box.replaceChildren(); state.clarifyRenderKey = null; return; }
+  // Only rebuild on a STRUCTURAL change — a bare poll/countdown tick must not wipe a half-typed answer.
+  const key = [c.status, c.asked, c.answered, c.question, state.clarifySending ? 's' : ''].join('|');
+  if (state.clarifyRenderKey === key) return;
+  state.clarifyRenderKey = key;
+  box.hidden = false;
+  box.replaceChildren();
+
+  if (c.status === 'checking') {
+    box.className = 'clarify-card slim';
+    const row = el('div', 'clarify-status');
+    row.appendChild(el('span', 'spinner'));
+    row.appendChild(document.createTextNode('Checking whether a clarifying question is needed…'));
+    box.appendChild(row);
+    return;
+  }
+  if (c.status === 'resolved') {
+    clearClarifyTimer();
+    box.className = 'clarify-card slim';
+    const row = el('div', 'clarify-status');
+    const msg = !c.asked ? 'No questions — research is running. You can step away.'
+      : c.answered ? 'Clarification applied.'
+      : 'No answer — proceeding with the default reading.';
+    row.appendChild(el('span', '', c.asked && !c.answered ? '→' : '✓'));
+    row.appendChild(document.createTextNode(msg));
+    box.appendChild(row);
+    return;
+  }
+
+  // status === 'pending'
+  const disabled = state.clarifySending;
+  box.className = 'clarify-card' + (disabled ? ' disabled' : '');
+  const head = el('div', 'clarify-status');
+  head.appendChild(document.createTextNode('A quick question to focus the search'));
+  const cd = el('span', 'clarify-count'); cd.id = 'clarifyCount';
+  head.appendChild(cd);
+  box.appendChild(head);
+  box.appendChild(el('div', 'clarify-q', c.question || ''));
+
+  if (c.alternatives && c.alternatives.length) {
+    const alts = el('div', 'clarify-alts');
+    c.alternatives.forEach((a, i) => {
+      const b = el('button', 'clarify-alt' + (i === 0 ? ' default-alt' : ''), a);
+      b.type = 'button';
+      b.disabled = disabled;
+      if (i === 0) b.title = 'Default — used if you do not answer';
+      b.addEventListener('click', () => sendClarify({ answer: a }));
+      alts.appendChild(b);
+    });
+    box.appendChild(alts);
+  }
+
+  const formRow = el('div', 'clarify-form');
+  const input = el('input', 'clarify-input');
+  input.type = 'text';
+  input.placeholder = 'Or type your own answer…';
+  input.disabled = disabled;
+  const send = el('button', 'clarify-send', disabled ? 'Sending…' : 'Send');
+  send.type = 'button';
+  send.disabled = disabled;
+  const submit = () => { const v = input.value.trim(); if (v) sendClarify({ answer: v }); };
+  send.addEventListener('click', submit);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+  const skip = el('button', 'clarify-skip', 'Skip');
+  skip.type = 'button';
+  skip.disabled = disabled;
+  skip.addEventListener('click', () => sendClarify({ skip: true }));
+  formRow.appendChild(input);
+  formRow.appendChild(send);
+  formRow.appendChild(skip);
+  box.appendChild(formRow);
+  startClarifyCountdown();
 }
 
 /* ---------------- item cards ---------------- */
@@ -1580,6 +1734,31 @@ function handleEvent(f) {
     case 'stragglers_killed':
       (f.record_ids || []).forEach((id) => activityUpsert(id, { state: 'killed' }));
       break;
+    case 'clarify_pending':
+      clearClarifyTimer();
+      state.clarify = {
+        status: 'pending',
+        question: f.question || '',
+        alternatives: Array.isArray(f.alternatives) ? f.alternatives : [],
+        timeoutSec: Number(f.timeout_sec) || 0,
+        startedAt: f.ts ? Date.parse(f.ts) : Date.now(),  // catch-up: elapsed since the server emitted
+      };
+      state.clarifySending = false;
+      state.clarifyRenderKey = null;
+      renderClarify();
+      break;
+    case 'clarify_resolved':
+      state.clarify = { status: 'resolved', asked: !!f.asked, answered: !!f.answered };
+      state.clarifySending = false;
+      state.clarifyRenderKey = null;
+      renderClarify();
+      break;
+    case 'plan_audit_finished':
+      if (f.added > 0) toast('Plan audit added ' + f.added + ' task' + (f.added > 1 ? 's' : ''));
+      break;
+    case 'gap_audit_finished':
+      if (f.gaps > 0) toast('Gap audit flagged ' + f.gaps + ' gap' + (f.gaps > 1 ? 's' : ''));
+      break;
     case 'leg_disabled':
       if (f.leg) { state.degraded.add(f.leg); renderDegraded(); toast('Model down: ' + f.leg); }
       break;
@@ -1592,6 +1771,14 @@ function handleEvent(f) {
     case 'cancel_requested':
       $('statusText').textContent = 'Cancelling…';
       break;
+    case 'stage_skipped_deadline': {
+      const idx = phaseIndex(f.stage);
+      if (idx >= 0 && idx < PHASES.length) {
+        state.skippedPhases.add(idx);
+        if (state.timeline) renderTimeline(state.timeline.phase, state.timeline.status);
+      }
+      break;
+    }
     case 'finding_settled':
       liveUpsert(f);
       scheduleFlush();
@@ -1738,6 +1925,21 @@ async function renderRun(detail) {
   renderDegraded();
   renderTimeline(run.phase, status);
 
+  // Interactive clarify gate: while an interactive run is still deciding (decompose/clarify), show a
+  // subtle "checking…" line until an SSE clarify event takes over. SSE (clarify_pending/_resolved)
+  // owns state.clarify once it arrives — replayed to late subscribers too — so this only fills the
+  // pre-event gap and never overrides a real question or its resolution.
+  const interactive = !!(run.config && run.config.interactive);
+  if (TERMINAL.includes(status)) {
+    // A dead run (done/failed/cancelled) must never keep a live clarify card or its countdown —
+    // Send would POST into a finished run and the "checking…" spinner would spin forever.
+    state.clarify = null;
+    clearClarifyTimer();
+  } else if (interactive && running && !state.clarify && /decomp|clarif|start|queue/.test((run.phase || '').toLowerCase())) {
+    state.clarify = { status: 'checking' };
+  }
+  renderClarify();
+
   const verified = detail.verified || [];
   const rejected = detail.rejected || [];
   const counts = $('countsChip');
@@ -1835,6 +2037,7 @@ async function renderRun(detail) {
 function stopWatch() {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   clearElapsedTimer();
+  clearClarifyTimer();
   stopSSE();
 }
 async function refresh() {
@@ -1861,10 +2064,16 @@ async function selectRun(runId, { fresh = false } = {}) {
   localStorage.setItem('currentRun', runId);
   state.activity = new Map();
   state.degraded = new Set();
+  state.skippedPhases = new Set();
+  state.reachedPhases = new Set();
   state.liveItems = new Map();
   state.liveStages = [];
   state.liveSeq = 0;
   state.reportKey = null;
+  clearClarifyTimer();
+  state.clarify = null;
+  state.clarifySending = false;
+  state.clarifyRenderKey = null;
   highlightHistory();
   $('composer').classList.add('compact');
 
@@ -1967,7 +2176,7 @@ form.addEventListener('submit', async (e) => {
     const res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim(), disabled: disabledVendors(), vendor_tiers, excluded_sites: state.excludedSites }),
+      body: JSON.stringify({ prompt, effort, sites: $('sitesInput').value.trim(), disabled: disabledVendors(), vendor_tiers, excluded_sites: state.excludedSites, interactive: true }),
     });
     if (!res.ok) throw new Error('http ' + res.status);
     const data = await res.json();
