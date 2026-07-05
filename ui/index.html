@@ -996,6 +996,9 @@ function phaseIndex(phase) {
   // The effort-2 gap sweep runs AFTER rescue as a coverage-style pass; map it to Coverage so the
   // timeline advances (>= rescue) instead of regressing to Search on the /search/ fallback below.
   if (/gap_search/.test(p)) return 4;
+  // model_verifying is a post-rescue recovery pass (opens bot-walled pages via a web-capable model);
+  // map it to Rescue so the timeline holds there instead of regressing to Verify on /verif/ below.
+  if (/model_verif/.test(p)) return 3;
   if (/search/.test(p)) return 1;
   if (/verif/.test(p)) return 2;
   if (/recheck|rescue/.test(p)) return 3;
@@ -1401,11 +1404,13 @@ const REASON_LABELS = {
   http_404: 'Dead link — 404 not found',
   http_410: 'Dead link — 410 gone',
   bot_blocked: 'Blocked by anti-bot wall — verify manually',
+  model_check_failed: 'A web-capable model opened it and could not confirm it',
   parse_failed: 'Model output unparseable',
   timeout: 'Verification timed out',
   content_mismatch: 'Live page sells something else',
   listing_inactive: 'Listing no longer active',
   off_intent: 'Not what was asked for',
+  excluded_by_keyword: 'Excluded by an intent keyword — may be a false match, check manually',
   wrong_tier: 'Wrong tier / variant',
   not_below_official: 'Not below the official price',
   off_site: 'Off the allowed sites',
@@ -1915,6 +1920,14 @@ function handleEvent(f) {
       break;
     case 'gap_audit_finished':
       if (f.gaps > 0) toast('Gap audit flagged ' + f.gaps + ' gap' + (f.gaps > 1 ? 's' : ''));
+      break;
+    case 'straggler_grace_extended': {
+      const n = Number(f.waiting_for) || 0;
+      $('statusText').textContent = 'Waiting for ' + n + ' model' + (n === 1 ? '' : 's') + ' to finish…';
+      break;
+    }
+    case 'model_verify_finished':
+      if (f.promoted > 0) toast('Model verification recovered ' + f.promoted + ' offer' + (f.promoted > 1 ? 's' : ''));
       break;
     case 'leg_disabled':
       if (f.leg) { state.degraded.add(f.leg); renderDegraded(); toast('Model down: ' + f.leg); }

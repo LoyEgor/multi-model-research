@@ -108,12 +108,50 @@ produced a report). Not yet live-validated: the gap_audit happy path (needs ≥1
 pair) and the deferred `bench/harness.py` benchmark run — both blocked on the gemini quota reset
 (~2026-07-09).
 
+Improvement round 6 — stability, network-blocked recovery, follow-up-round speed (2026-07-05):
+measured against two failed production runs (a fast-but-empty quick run where a quota-dead gemini
++ empty-but-successful claude reached quorum and SIGTERM-killed the only capable leg, and a
+standard run where the genuinely cheapest offers were all bot-walled by our plain-HTTP verifier).
+(1) **S1 — quorum hygiene** in `collect_with_straggler_drop`: only a call that RAN AND SUCCEEDED
+advances the quorum; a skipped-without-running (disabled/no-budget/cancelled) or ran-and-failed
+(rc≠0, incl. rc=5 quota) call shrinks the effective quorum base instead. When every fast job that
+could deliver is dead the quorum DISENGAGES (no deadline armed) so the phase waits for the slow leg
+to its own timeout rather than a grace timer killing it. Applied uniformly to the legacy no-fast-
+total path too. (2) **S2 — zero-findings reaper guard**: when the grace deadline expires but ZERO
+findings have been parsed so far and calls are still pending, EXTEND the grace (emit
+`straggler_grace_extended` with `waiting_for`) instead of killing — killing would guarantee an
+empty phase; the natural bound is each call's own subprocess timeout, and the loop still exits when
+`pending` empties (cancel-safe). ≥1 finding → reap as before. (3) **Q1 — model-assisted
+verification** (`run_model_verify`, new phase `model_verifying`, events `model_verify_started` /
+`model_verify_finished`): a bounded stage right after rescue + gap collection, before
+coverage/frontier. Takes the top-K cheapest rejected items whose failures are ALL network-
+verification-class (`model_verify_eligible`: `bot_blocked`/`timeout`/`http_NNN`/`url_unverified`,
+`missing_price` only alongside a network reason — every semantic reason disqualifies), fires one
+web-capable call each (claude→gemini→skip; `model_verify_cap` 2/3/4/6) asking the model to OPEN the
+url its own way and return strict JSON. Verdicts land in a run-scoped `model_verdicts`
+{dedupe_key→verdict} store threaded into every `verify_findings` so a promotion is DURABLE across
+later re-verifies (`apply_model_verdict`): live=true → promoted to verified, `model_verified` flag,
+url_check `{ok, method:"model"}`, fields adopted from the page-read, re-run through the SAME
+semantic gates; live=false → final non-rescuable reason `model_check_failed`. `calibrate_confidence`
+gives model-verified items live_score 0.7 (below machine-live 1.0, well above unverified 0.4).
+Eligible items are EXCLUDED from the rescue loop (no wasted re-search of the same blocked URL).
+(4) **P1 — slow-leg cap in follow-up rounds**: `run_rechecks` and `run_coverage_round` now cap
+codex at `codex_task_cap` jobs per phase (highest-value first, rest cycle fast legs); the primary
+main+audit `make_jobs` threads the consumed slow count so the cap is per-PHASE, not per-call
+(audit tasks no longer restart codex at rank 0). Frontier already fires ≤1 codex job/round.
+(5) **M2**: coverage/frontier/rechecks skip force-disabled and user-disabled legs at assembly time.
+(6) **M1**: a successful call with EMPTY output no longer produces a `parse_failed` placeholder
+(absence of findings ≠ rejected finding) — it counts as a completed empty call in per-model stats;
+a real malformed (non-empty, unparseable) payload still does. UI: `model_check_failed` reason
+label, `model_verifying`→Rescue timeline slot, `straggler_grace_extended` status line,
+`model_verify_finished` recovery toast.
+
 Live-page verification (minimal Stage 2): `apply_live_check` fetches verified marketplace
 listings, rejects non-active ads (`listing_inactive`), and overrides the model-claimed price
 with the live page price (`price_corrected_from`). Currently OLX-only (listing-ID patterns +
 generic price regex) — Plati/Prom/JSON-LD adapters are the open Stage 2 work.
 
-Tests: `python3 -m unittest discover tests` — 150 tests, all passing.
+Tests: `python3 -m unittest discover tests` — 176 tests, all passing.
 
 Git: public repos github.com/LoyEgor/{multi-model-research, llm-legs}; find-truth private. The
 owner controls git — do NOT commit/push without explicit per-action instruction.

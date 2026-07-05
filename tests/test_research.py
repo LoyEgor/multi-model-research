@@ -804,9 +804,9 @@ class ResearchTests(unittest.TestCase):
             "subject_keywords": ["macbook"], "exclude_keywords": ["for parts"],
             "required_tier": "max_5x", "official_price_usd": 100.0, "cheaper_than_official": True,
         }
-        # wrong product (exclude keyword)
-        self.assertEqual(research.intent_rejection({"title": "MacBook Air for parts"}, intent), "off_intent")
-        # wrong product (no subject keyword)
+        # exclude keyword hit -> recoverable (distinct reason), NOT final off_intent
+        self.assertEqual(research.intent_rejection({"title": "MacBook Air for parts"}, intent), "excluded_by_keyword")
+        # wrong product (no subject keyword) -> final
         self.assertEqual(research.intent_rejection({"title": "Dell XPS laptop"}, intent), "off_intent")
         # wrong tier (pro < max_5x)
         self.assertEqual(research.intent_rejection({"title": "macbook", "tier": "pro", "price_usd": 50}, intent), "wrong_tier")
@@ -884,6 +884,43 @@ class ResearchTests(unittest.TestCase):
     def test_free_excluded_non_rescuable(self):
         self.assertIn("free_excluded", research.NON_RESCUABLE_REASONS)
         self.assertFalse(research.is_rescuable({"reasons": ["free_excluded"]}))
+
+    def test_keyword_hits_word_boundaries(self):
+        # Glued-substring false positives must NOT fire (the root-cause bug: "prompt" nuking
+        # every listing that says "prompts").
+        self.assertEqual(research.keyword_hits("supports prompts and caching", ["prompt"]), [])
+        self.assertEqual(research.keyword_hits("freedom of choice", ["free"]), [])
+        self.assertEqual(research.keyword_hits("send us an invoice", ["voice"]), [])
+        self.assertEqual(research.keyword_hits("industrial supply", ["trial"]), [])
+        # a standalone word inside a phrase DOES match (correct; same shape as Cyrillic below)
+        self.assertEqual(research.keyword_hits("supports prompt caching", ["prompt"]), ["prompt"])
+        # multi-word phrase: whole-phrase boundary
+        self.assertEqual(research.keyword_hits("Claude Pro plan monthly", ["claude pro"]), ["claude pro"])
+        self.assertEqual(research.keyword_hits("claude professional edition", ["claude pro"]), [])
+        # Cyrillic (Unicode word chars)
+        self.assertEqual(research.keyword_hits("общий аккаунт доступ", ["аккаунт"]), ["аккаунт"])
+        self.assertEqual(research.keyword_hits("аккаунтище большой", ["аккаунт"]), [])
+        # a genuine standalone match still fires
+        self.assertEqual(research.keyword_hits("MacBook Air for parts", ["for parts"]), ["for parts"])
+
+    def test_intent_rejection_word_boundary_no_false_reject(self):
+        # Root-cause: an OpenRouter Fable 5 listing must NOT be nuked by the bad generic exclude
+        # keyword "prompt" merely because its evidence says "prompts" (word-boundary fix).
+        intent = {"subject_keywords": ["claude", "fable 5"], "exclude_keywords": ["prompt", "free"]}
+        finding = {"title": "OpenRouter - Anthropic Claude Fable 5",
+                   "evidence": "supports prompts; pay-as-you-go", "marketplace": "OpenRouter"}
+        self.assertIsNone(research.intent_rejection(finding, intent))
+        # a genuinely standalone excluded word -> recoverable "excluded_by_keyword", not a silent
+        # final delete (change #3): stays rescuable, lands in "Unverified — check manually".
+        excluded = {"title": "Claude Fable 5 free giveaway", "evidence": "", "marketplace": ""}
+        reason = research.intent_rejection(excluded, intent)
+        self.assertEqual(reason, "excluded_by_keyword")
+        self.assertNotIn("excluded_by_keyword", research.NON_RESCUABLE_REASONS)
+        self.assertTrue(research.is_rescuable({"reasons": ["excluded_by_keyword"]}))
+        # missing all subject keywords -> final off_intent
+        self.assertEqual(
+            research.intent_rejection({"title": "GitLab Premium", "evidence": "", "marketplace": ""}, intent),
+            "off_intent")
 
     def test_merge_finding_upgrades_unknown_basis(self):
         a = research.normalize_finding({"title": "x", "price": 10, "currency": "USD"}, "codex", "t", "r1")
@@ -1259,9 +1296,11 @@ class ResearchTests(unittest.TestCase):
             run_dir = research.Path(tmp)
             with mock.patch.object(research, "call_model", side_effect=fake_call):
                 research.run_primary_search("p", tasks, run_dir, cfg)
-        # 1 task × 2 queries × 3 legs = 6 calls; variant id distinct
-        self.assertEqual(len(calls), 6)
+        # Fast legs (gemini, claude) cover every query variant; codex — the slow long-pole leg —
+        # covers only the BASE query. 1 task × 2 variants × 2 fast legs + 1 codex base = 5 calls.
+        self.assertEqual(len(calls), 5)
         self.assertEqual({tid for _, tid in calls}, {"task-1", "task-1#v2"})
+        self.assertEqual([tid for leg, tid in calls if leg == "codex"], ["task-1"])
 
     def test_run_primary_search_includes_audit_extra_tasks(self):
         import tempfile
@@ -1315,6 +1354,102 @@ class ResearchTests(unittest.TestCase):
                                             extra_tasks_supplier=_SlowSupplier(), extra_tasks_sink=sink)
         self.assertEqual(len(calls), 3)  # only the base task × 3 legs; a late audit adds nothing
         self.assertEqual(sink, [])
+
+    def test_codex_task_cap_limits_slow_leg_fanout(self):
+        # The slow leg (codex) covers only the BASE query of the first codex_task_cap tasks; the
+        # fast legs (gemini/claude) cover every task for full breadth. deep -> codex_task_cap 3.
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append((leg, task_id))
+            return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
+
+        tasks = [{"id": f"task-{i}", "query": f"q{i}", "query_variants": [], "preferred_sites": []}
+                 for i in range(1, 6)]  # 5 tasks
+        cfg = research.make_config("deep", None)
+        self.assertEqual(cfg["codex_task_cap"], 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_primary_search("p", tasks, research.Path(tmp), cfg)
+        self.assertEqual(sorted(t for leg, t in calls if leg == "codex"), ["task-1", "task-2", "task-3"])
+        for leg in ("gemini", "claude"):  # fast legs still cover all five tasks
+            self.assertEqual(sorted(t for l, t in calls if l == leg), [f"task-{i}" for i in range(1, 6)])
+
+    def test_collect_straggler_quorum_ignores_slow_leg(self):
+        # With fast_quorum_total set, the grace window opens once the FAST legs reach quorum — the
+        # slow codex calls are NOT in the denominator, so the phase never blocks on codex. Here 2
+        # fast + 2 codex: fast quorum (ceil(2*0.75)=2) is met by the fast pair alone, so stragglers
+        # are reaped without any codex having returned. (The old all-calls quorum needed 3 of 4 and
+        # would hang on the still-pending codex.)
+        import concurrent.futures
+        import tempfile
+        import threading as th
+        from unittest import mock
+
+        release = th.Event()
+        # A record carries a finding so the zero-findings reaper guard (S2) does not extend the grace:
+        # this test exercises the normal "quorum met + findings present -> reap the straggler" path.
+        _stdout = '{"findings":[{"title":"x","url":"https://e.com/1","price":10,"currency":"USD"}]}'
+
+        def fast():
+            return {"leg": "gemini", "record_id": "f", "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": _stdout}
+
+        def slow():
+            release.wait(5)
+            return {"leg": "codex", "record_id": "s", "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": _stdout}
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        futs = [pool.submit(fast), pool.submit(fast), pool.submit(slow), pool.submit(slow)]
+        for f in futs[:2]:
+            f.result()  # both fast calls are in before collect runs
+        config = dict(research.make_config("standard", None))
+        config["straggler_grace_sec"] = 0.2
+        killed_called = th.Event()
+
+        def fake_kill(run_id, include_protected=False):
+            killed_called.set()
+            release.set()  # the kill unblocks the (would-be SIGKILLed) codex futures
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "q"
+            run_dir.mkdir()
+            with mock.patch.object(research, "kill_stragglers", fake_kill):
+                records = research.collect_with_straggler_drop(futs, run_dir, config, fast_quorum_total=2)
+        pool.shutdown(wait=True)
+        self.assertTrue(killed_called.is_set())  # grace opened + stragglers reaped on fast quorum alone
+        self.assertEqual(len(records), 4)
+
+    def test_straggler_kill_does_not_trip_breaker(self):
+        # A straggler-killed call is a scheduling drop of a healthy-but-slow leg, not a leg failure:
+        # it must never count toward disabling the leg, while genuine failures still trip the breaker.
+        run_id = "breaker-guard-test"
+        research.init_leg_health(run_id)
+        try:
+            for _ in range(research.BREAKER_THRESHOLD + 2):
+                self.assertFalse(research.apply_call_to_breaker(run_id, "codex", False, True))
+            self.assertFalse(research.leg_disabled(run_id, "codex"))
+            tripped = [research.apply_call_to_breaker(run_id, "gemini", False, False)
+                       for _ in range(research.BREAKER_THRESHOLD)]
+            self.assertTrue(any(tripped))
+            self.assertTrue(research.leg_disabled(run_id, "gemini"))
+        finally:
+            research.clear_leg_health(run_id)
+
+    def test_effort_profiles_codex_cap_and_grace_scale(self):
+        # Speed/quality gradient stays monotonic across effort levels: codex fan-out and the slow-leg
+        # grace both grow with effort, so the modes stay distinguishable.
+        caps = [research.make_config(l)["codex_task_cap"] for l in (1, 2, 3, 4)]
+        graces = [research.make_config(l)["straggler_grace_sec"] for l in (1, 2, 3, 4)]
+        self.assertEqual(caps, sorted(caps))
+        self.assertTrue(all(c >= 1 for c in caps))
+        self.assertEqual(graces, sorted(graces))
+        self.assertLess(graces[0], graces[-1])
 
     def test_make_config_plan_audit_gated(self):
         self.assertFalse(research.make_config(1)["plan_audit"])
@@ -1975,7 +2110,11 @@ class ResearchTests(unittest.TestCase):
 
         def fast_job(latency):
             time.sleep(0.05)
-            return {"record_id": f"fast-{latency}", "latency_sec": latency, "success": True}
+            # Carry a finding so the zero-findings guard (S2) does not extend the grace instead of
+            # reaping — this test asserts the slow call IS killed once the quorum + findings are in.
+            return {"record_id": f"fast-{latency}", "leg": "gemini", "task_id": "t",
+                    "latency_sec": latency, "success": True,
+                    "stdout": '{"findings":[{"title":"x","url":"https://e.com/1","price":10,"currency":"USD"}]}'}
 
         def slow_job():
             proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -2352,6 +2491,11 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("EXTRACT", p)
         self.assertIn("MUTUALLY EXCLUSIVE", p)  # task-boundary contract
 
+    def test_decompose_prompt_exclude_keyword_guard(self):
+        p = research.build_decompose_prompt("find x", research.make_config(3))
+        self.assertIn("NEVER add generic words that co-occur with valid offers", p)
+        self.assertIn('bad: ["prompt", "free", "api"]', p)
+
     def test_recheck_and_frontier_prompts_include_do_not_report_urls(self):
         known = [f"https://ex.com/{i}" for i in range(25)]
         rp = research.build_recheck_prompt(
@@ -2626,7 +2770,10 @@ class ResearchTests(unittest.TestCase):
 
         def fast_job(i):
             time.sleep(0.05)
-            return {"record_id": f"fast-{i}", "latency_sec": 0.1, "success": True}
+            # Carry a finding so the zero-findings guard (S2) reaps rather than extends the grace.
+            return {"record_id": f"fast-{i}", "leg": "gemini", "task_id": "t", "latency_sec": 0.1,
+                    "success": True,
+                    "stdout": '{"findings":[{"title":"x","url":"https://e.com/1","price":10,"currency":"USD"}]}'}
 
         def late_slow_job():
             # Spawns its tracked subprocess only AFTER the first straggler sweep would have fired,
@@ -2662,6 +2809,365 @@ class ResearchTests(unittest.TestCase):
             self.assertTrue(research.was_dropped_as_straggler(run_id, "late-rec"))
         finally:
             research.clear_run_registry(run_id)
+
+    # ---- Round 6: S1 quorum hygiene ----
+    _FINDING_STDOUT = '{"findings":[{"title":"x","url":"https://e.com/1","price":10,"currency":"USD"}]}'
+
+    def test_s1_failed_fast_records_shrink_quorum_base(self):
+        # A fast leg that RAN AND FAILED (success=False) must not advance the quorum — it shrinks the
+        # base instead. 3 fast (1 ok+finding, 2 failed) + 1 slow: effective base = 3-2 = 1, so the one
+        # successful fast meets quorum and the slow straggler is reaped.
+        import concurrent.futures
+        import tempfile
+        import threading as th
+        from unittest import mock
+
+        release = th.Event()
+
+        def ok_fast():
+            return {"leg": "gemini", "record_id": "ok", "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": self._FINDING_STDOUT}
+
+        def bad_fast(rid):
+            return {"leg": "gemini", "record_id": rid, "task_id": "t", "latency_sec": 0.01, "success": False}
+
+        def slow():
+            release.wait(5)
+            return {"leg": "codex", "record_id": "s", "task_id": "t", "latency_sec": 0.01, "success": True}
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        futs = [pool.submit(ok_fast), pool.submit(bad_fast, "b1"), pool.submit(bad_fast, "b2"), pool.submit(slow)]
+        for f in futs[:3]:
+            f.result()
+        config = dict(research.make_config("standard", None))
+        config["straggler_grace_sec"] = 0.2
+        killed = th.Event()
+
+        def fake_kill(run_id, include_protected=False):
+            killed.set(); release.set(); return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "q"
+            run_dir.mkdir()
+            with mock.patch.object(research, "kill_stragglers", fake_kill):
+                records = research.collect_with_straggler_drop(futs, run_dir, config, fast_quorum_total=3)
+        pool.shutdown(wait=True)
+        self.assertTrue(killed.is_set())
+        self.assertEqual(len(records), 4)
+
+    def test_s1_all_fast_dead_disengages_quorum(self):
+        # Every fast leg is dead -> the quorum disengages: NO deadline is armed, so the phase waits
+        # for the slow leg to finish on its own rather than a grace timer reaping the only leg that
+        # can still deliver.
+        import concurrent.futures
+        import tempfile
+        import threading as th
+        import time
+        from unittest import mock
+
+        def bad_fast(rid):
+            return {"leg": "gemini", "record_id": rid, "task_id": "t", "latency_sec": 0.01, "success": False}
+
+        def slow():
+            time.sleep(0.4)
+            return {"leg": "codex", "record_id": "s", "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": self._FINDING_STDOUT}
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        futs = [pool.submit(bad_fast, "b1"), pool.submit(bad_fast, "b2"), pool.submit(slow)]
+        for f in futs[:2]:
+            f.result()
+        config = dict(research.make_config("standard", None))
+        config["straggler_grace_sec"] = 0.05
+        killed = th.Event()
+
+        def fake_kill(run_id, include_protected=False):
+            killed.set(); return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "q"
+            run_dir.mkdir()
+            with mock.patch.object(research, "kill_stragglers", fake_kill):
+                records = research.collect_with_straggler_drop(futs, run_dir, config, fast_quorum_total=2)
+        pool.shutdown(wait=True)
+        self.assertFalse(killed.is_set())  # quorum disengaged: slow leg awaited, not reaped
+        self.assertEqual(len(records), 3)
+        self.assertTrue(any(r["record_id"] == "s" for r in records))
+
+    # ---- Round 6: S2 zero-findings reaper guard ----
+    def test_s2_zero_findings_extends_grace_instead_of_killing(self):
+        # Quorum met but NOTHING found yet: the reaper guard extends the grace (emitting
+        # straggler_grace_extended) and awaits the pending call rather than guaranteeing an empty
+        # phase. The loop still terminates once the pending call completes.
+        import concurrent.futures
+        import tempfile
+        import threading as th
+        import time
+        from unittest import mock
+
+        def empty_fast(rid):
+            return {"leg": "gemini", "record_id": rid, "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": ""}
+
+        # Outlasts the 1s minimum wait clamp so the grace deadline actually expires mid-wait (with the
+        # pending call still running) and the zero-findings guard fires before the call completes.
+        def slow():
+            time.sleep(1.3)
+            return {"leg": "codex", "record_id": "s", "task_id": "t", "latency_sec": 0.01,
+                    "success": True, "stdout": self._FINDING_STDOUT}
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        futs = [pool.submit(empty_fast, "f1"), pool.submit(empty_fast, "f2"), pool.submit(slow)]
+        for f in futs[:2]:
+            f.result()
+        config = dict(research.make_config("standard", None))
+        config["straggler_grace_sec"] = 0.05
+        killed = th.Event()
+
+        def fake_kill(run_id, include_protected=False):
+            killed.set(); return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "q"
+            run_dir.mkdir()
+            with mock.patch.object(research, "kill_stragglers", fake_kill):
+                records = research.collect_with_straggler_drop(futs, run_dir, config, fast_quorum_total=2)
+            events = [research.json.loads(l)["event"]
+                      for l in (run_dir / "events.jsonl").read_text().splitlines()]
+        pool.shutdown(wait=True)
+        self.assertFalse(killed.is_set())  # zero findings -> extend, never kill
+        self.assertIn("straggler_grace_extended", events)
+        self.assertEqual(len(records), 3)  # loop terminated once the slow call completed
+
+    # ---- Round 6: Q1 model-assisted verification ----
+    def test_model_verify_eligible_predicate(self):
+        def item(reasons, url="https://e.com/1", price=100):
+            return {"reasons": reasons, "url": url, "price": price, "price_usd": price}
+        self.assertTrue(research.model_verify_eligible(item(["bot_blocked"])))
+        self.assertTrue(research.model_verify_eligible(item(["http_403"])))
+        self.assertTrue(research.model_verify_eligible(item(["timeout", "missing_price"])))
+        self.assertFalse(research.model_verify_eligible(item(["off_intent"])))        # semantic
+        self.assertFalse(research.model_verify_eligible(item(["bot_blocked", "wrong_tier"])))  # mixed
+        self.assertFalse(research.model_verify_eligible(item(["bot_blocked"], url=None)))       # no url
+        self.assertFalse(research.model_verify_eligible({"reasons": ["bot_blocked"], "url": "https://e.com/1"}))  # no price
+        self.assertFalse(research.model_verify_eligible(item([])))                    # no reasons
+        self.assertFalse(research.model_verify_eligible(item(["missing_price"])))     # no genuine network reason
+
+    def test_apply_model_verdict_promotes_with_confidence_penalty(self):
+        finding = research.normalize_finding(
+            {"title": "MacBook Air M2", "url": "https://walmart.com/ip/1", "price": 199, "currency": "USD"},
+            "gemini", "t", "r")
+        finding["reasons"] = ["bot_blocked"]
+        mv = {research.dedupe_key(finding): {"live": True, "price": 205, "currency": "USD",
+              "title": "MacBook Air M2", "availability": "available", "seller": "Walmart",
+              "url": "https://walmart.com/ip/1", "leg": "gemini"}}
+        verified, rejected = research.verify_findings([finding], None, None, None, model_verdicts=mv)
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(len(rejected), 0)
+        v = verified[0]
+        self.assertTrue(v.get("model_verified"))
+        self.assertEqual(v["price"], 205)
+        self.assertEqual((v.get("url_check") or {}).get("method"), "model")
+        research.apply_trust(verified)
+        research.apply_confidence(verified)
+        self.assertTrue(any("model-verified" in f for f in v["confidence_calibrated"]["factors"]))
+        # Below a machine-live-verified equivalent, but well above an unverified item.
+        live_equiv = dict(v)
+        live_equiv.pop("model_verified", None)
+        live_equiv["live_check"] = {"ok": True, "live_price": 205}
+        self.assertLess(v["confidence_calibrated"]["score"], research.calibrate_confidence(live_equiv)["score"])
+
+    def test_apply_model_verdict_rejects_on_not_live(self):
+        finding = research.normalize_finding(
+            {"title": "x", "url": "https://e.com/1", "price": 50, "currency": "USD"}, "gemini", "t", "r")
+        mv = {research.dedupe_key(finding): {"live": False, "leg": "gemini", "notes": "could not open"}}
+        verified, rejected = research.verify_findings([finding], None, None, None, model_verdicts=mv)
+        self.assertEqual(len(verified), 0)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("model_check_failed", rejected[0]["reasons"])
+        self.assertFalse(research.is_rescuable(rejected[0]))          # final — will not loop back
+        self.assertFalse(research.model_verify_eligible(rejected[0]))  # nor re-enter model-verify
+
+    def test_run_model_verify_records_verdicts_top_k_and_leg_fallback(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=240, effort="medium", claude_model=None):
+            calls.append((leg, task_id))
+            return {"success": True, "leg": leg, "task_id": task_id, "record_id": task_id,
+                    "stdout": '{"live": true, "price": 150, "currency": "USD", "title": "x"}'}
+
+        def mk(price, url):
+            return {"reasons": ["bot_blocked"], "url": url, "price": price, "price_usd": price, "title": "t"}
+
+        rejected = [mk(300, "https://e.com/3"), mk(100, "https://e.com/1"), mk(200, "https://e.com/2")]
+        cfg = dict(research.make_config("standard", None))
+        cfg["model_verify_cap"] = 2
+        run_id = "mv-topk"
+        research.init_leg_health(run_id)
+        research.init_leg_budget(run_id, {"gemini": 5, "claude": 5})
+        research.force_disable_leg(run_id, "claude", "test")  # force the claude->gemini fallback
+        verdicts: dict = {}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp) / run_id
+                run_dir.mkdir()
+                with mock.patch.object(research, "call_model", side_effect=fake_call):
+                    checked = research.run_model_verify("p", rejected, run_dir, cfg, None, verdicts)
+        finally:
+            research.clear_leg_health(run_id)
+            research.clear_leg_budget(run_id)
+        self.assertEqual(checked, 2)
+        self.assertEqual([leg for leg, _ in calls], ["gemini", "gemini"])       # claude disabled -> gemini
+        self.assertIn(research.dedupe_key({"url": "https://e.com/1"}), verdicts)  # cheapest selected
+        self.assertIn(research.dedupe_key({"url": "https://e.com/2"}), verdicts)
+        self.assertNotIn(research.dedupe_key({"url": "https://e.com/3"}), verdicts)  # dearest dropped by cap
+
+    def test_run_model_verify_skips_when_no_web_leg(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(*a, **k):
+            calls.append(a)
+            return {"success": True}
+
+        rejected = [{"reasons": ["bot_blocked"], "url": "https://e.com/1", "price": 100, "price_usd": 100}]
+        cfg = dict(research.make_config("standard", None))
+        run_id = "mv-skip"
+        research.init_leg_health(run_id)
+        research.init_leg_budget(run_id, {"gemini": 5, "claude": 5})
+        research.force_disable_leg(run_id, "claude", "test")
+        research.force_disable_leg(run_id, "gemini", "test")
+        verdicts: dict = {}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = research.Path(tmp) / run_id
+                run_dir.mkdir()
+                with mock.patch.object(research, "call_model", side_effect=fake_call):
+                    checked = research.run_model_verify("p", rejected, run_dir, cfg, None, verdicts)
+        finally:
+            research.clear_leg_health(run_id)
+            research.clear_leg_budget(run_id)
+        self.assertEqual(checked, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(verdicts, {})
+
+    def test_run_rechecks_excludes_model_verify_eligible(self):
+        import tempfile
+        from unittest import mock
+
+        prompts = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=300, effort="medium", claude_model=None):
+            prompts.append(prompt)
+            return {"success": True, "leg": leg, "task_id": task_id, "record_id": task_id, "stdout": '{"findings": []}'}
+
+        # 4 network-only items against model_verify_cap=3: the top-3 cheapest go to model-verify
+        # (excluded from rescue), the overflow item must KEEP the rescue path — otherwise it would
+        # lose both recovery attempts.
+        net_items = [{"reasons": ["bot_blocked"], "url": f"https://e.com/net{i}", "price": 100 + i,
+                      "price_usd": 100 + i, "title": f"net{i}", "source_model": "gemini"}
+                     for i in range(4)]
+        sem_item = {"reasons": ["excluded_by_keyword"], "url": "https://e.com/sem", "price": 100,
+                    "price_usd": 100, "title": "sem", "source_model": "gemini"}
+        cfg = dict(research.make_config("standard", None))
+        self.assertEqual(cfg["model_verify_cap"], 3)
+        run_id = "rc-excl"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / run_id
+            run_dir.mkdir()
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_rechecks("p", net_items + [sem_item], run_dir, cfg, 1, {})
+        self.assertTrue(any("e.com/sem" in p for p in prompts))     # semantic reject -> still rescued
+        for i in range(3):
+            self.assertFalse(any(f"e.com/net{i}" in p for p in prompts))  # top-K -> model-verify
+        self.assertTrue(any("e.com/net3" in p for p in prompts))   # beyond the cap -> rescue kept
+
+    def test_select_model_verify_candidates_usd_ranking(self):
+        # Mixed currencies must rank by USD, not raw native numbers: 4500 (UAH, no USD conversion)
+        # must NOT beat $120 for the last verify slot — unconverted prices sort last.
+        native = {"reasons": ["bot_blocked"], "url": "https://e.com/uah", "price": 4500,
+                  "price_usd": None, "title": "native"}
+        usd = {"reasons": ["bot_blocked"], "url": "https://e.com/usd", "price": 120,
+               "price_usd": 120, "title": "usd"}
+        cfg = {"model_verify_cap": 1}
+        picked = research.select_model_verify_candidates([native, usd], cfg)
+        self.assertEqual([it["url"] for it in picked], ["https://e.com/usd"])
+        self.assertEqual(research.select_model_verify_candidates([native, usd], {"model_verify_cap": 0}), [])
+
+    # ---- Round 6: P1 slow-leg cap in follow-up rounds ----
+    def test_rechecks_slow_leg_cap(self):
+        import tempfile
+        from unittest import mock
+
+        legs_used = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=480, effort="medium", claude_model=None):
+            legs_used.append(leg)
+            return {"success": True, "leg": leg, "task_id": task_id, "record_id": task_id, "stdout": '{"findings": []}'}
+
+        # Rescuable but SEMANTIC (excluded_by_keyword) so they are not model-verify-eligible (else the
+        # rescue loop would drop them); source=gemini so codex is a preferred non-source leg.
+        items = [{"reasons": ["excluded_by_keyword"], "url": f"https://e.com/{i}", "price": 10 + i,
+                  "price_usd": 10 + i, "title": f"t{i}", "source_model": "gemini"} for i in range(6)]
+        cfg = dict(research.make_config("deep", None))  # codex_task_cap 3, recheck_legs 1, max_recheck_items 6
+        self.assertEqual(cfg["codex_task_cap"], 3)
+        run_id = "rc-cap"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / run_id
+            run_dir.mkdir()
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_rechecks("p", items, run_dir, cfg, 1, {})
+        self.assertEqual(legs_used.count("codex"), 3)  # exactly the per-phase cap, not one per item
+
+    def test_primary_codex_cap_spans_main_and_audit(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append((leg, task_id))
+            return {"success": True, "leg": leg, "task_id": task_id, "record_id": task_id, "stdout": '{"findings": []}'}
+
+        class Supplier:
+            def result(self, timeout=None):
+                return [{"id": "audit-1", "query": "aq1", "query_variants": [], "preferred_sites": []},
+                        {"id": "audit-2", "query": "aq2", "query_variants": [], "preferred_sites": []}]
+
+        tasks = [{"id": f"task-{i}", "query": f"q{i}", "query_variants": [], "preferred_sites": []}
+                 for i in range(1, 4)]  # 3 main tasks
+        cfg = research.make_config("standard", None)  # codex_task_cap 2
+        self.assertEqual(cfg["codex_task_cap"], 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_primary_search("p", tasks, research.Path(tmp), cfg,
+                                            extra_tasks_supplier=Supplier(), extra_tasks_sink=[])
+        codex_tasks = sorted(t for leg, t in calls if leg == "codex")
+        self.assertEqual(codex_tasks, ["task-1", "task-2"])  # cap spent on main; audit tasks get no codex
+
+    # ---- Round 6: M1 empty-but-valid results are not parse failures ----
+    def test_empty_success_record_no_parse_failed(self):
+        rec = {"leg": "gemini", "task_id": "t", "record_id": "r1", "success": True,
+               "stdout": "", "stdout_file": "f"}
+        findings, parse_rej, parsed = research.parse_model_records([rec])
+        self.assertEqual(findings, [])
+        self.assertEqual(parse_rej, [])            # no rejected placeholder for an empty-but-successful call
+        self.assertFalse(parsed[0]["parse_failed"])  # still a completed call in the per-model stats
+        self.assertTrue(parsed[0]["no_sources"])
+
+    def test_real_parse_error_still_placeholder(self):
+        rec = {"leg": "gemini", "task_id": "t", "record_id": "r2", "success": True,
+               "stdout": "not json {", "stdout_file": "f"}
+        findings, parse_rej, parsed = research.parse_model_records([rec])
+        self.assertEqual(findings, [])
+        self.assertEqual(len(parse_rej), 1)
+        self.assertEqual(parse_rej[0]["reasons"], ["parse_failed"])
+        self.assertTrue(parsed[0]["parse_failed"])
 
 
 if __name__ == "__main__":

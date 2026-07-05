@@ -58,7 +58,7 @@ DAILY_CAPS = {
 CLAUDE_SEARCH_RESERVE = max(0, env_int("RESEARCH_CLAUDE_SEARCH_RESERVE", 8))
 RAW_TIMEOUT_SEC = max(60, env_int("RESEARCH_MODEL_TIMEOUT_SEC", 900))
 URL_TIMEOUT_SEC = max(2, env_int("RESEARCH_URL_TIMEOUT_SEC", 12))
-MAX_PRIMARY_WORKERS = max(2, env_int("RESEARCH_MAX_PRIMARY_WORKERS", 6))
+MAX_PRIMARY_WORKERS = max(2, env_int("RESEARCH_MAX_PRIMARY_WORKERS", 16))
 MAX_VERIFY_WORKERS = max(2, env_int("RESEARCH_MAX_VERIFY_WORKERS", 8))
 # Small pool that warms the run URL cache concurrently with the still-running search calls, so the
 # batch verify hits a warm cache instead of starting all network I/O only after the slowest call.
@@ -133,6 +133,17 @@ def record_leg_result(run_id: str, leg: str, success: bool) -> bool:
         return False
 
 
+def apply_call_to_breaker(run_id: str, leg: str, success: bool, dropped_as_straggler: bool) -> bool:
+    """Feed a completed call's outcome to the per-run circuit breaker, EXCEPT straggler-killed calls:
+    those are intentional scheduling drops of a healthy-but-slow leg (the fast-leg-aware quorum reaps
+    codex on purpose), not leg failures, so they must count as neither pass nor fail — otherwise the
+    scheduler's own kills would disable the very slow leg we still want for the deeper phases.
+    Returns True when this result just tripped the breaker."""
+    if dropped_as_straggler:
+        return False
+    return record_leg_result(run_id, leg, success)
+
+
 def force_disable_leg(run_id: str, leg: str, reason: str) -> bool:
     """Instantly disable a leg (quota exhaustion etc.) — no need to burn 3 strikes."""
     with LEG_HEALTH_LOCK:
@@ -147,15 +158,24 @@ def force_disable_leg(run_id: str, leg: str, reason: str) -> bool:
         return True
 
 
-# Gemini's subscription quota is the scarcest resource in the system: parallel hammering
-# exhausts it mid-run. Cap concurrent gemini calls process-wide and give each run a call
-# budget from its effort profile — spend on primary search first (phases run in order).
-GEMINI_CONCURRENCY = threading.Semaphore(max(1, env_int("RESEARCH_GEMINI_CONCURRENCY", 2)))
-# Claude's subscription pool is the most capped — keep it to one concurrent call by default.
-CLAUDE_CONCURRENCY = threading.Semaphore(max(1, env_int("RESEARCH_CLAUDE_CONCURRENCY", 1)))
-# Only the scarce-quota legs get a per-leg concurrency cap. Codex is intentionally absent — its
-# pool tolerates the fan-out, and total concurrency is already bounded by MAX_PRIMARY_WORKERS.
+# Latency reality (measured, runs/*/raw/*.meta.json): codex is the long pole (median 220-330s,
+# tail >450s), while gemini (~15s) and claude (~35s) are 6-20x faster. The wall-clock critical
+# path must therefore be the FAST legs, not codex — so the fast legs get generous concurrency
+# (fire several in parallel per phase) and codex is bounded by fan-out (codex_task_cap) + straggler
+# grace instead. Concurrency caps bound only PARALLELISM; total calls stay bounded by the per-run
+# leg budgets, so raising these does not spend more quota — it just stops the fast legs serializing.
+GEMINI_CONCURRENCY = threading.Semaphore(max(1, env_int("RESEARCH_GEMINI_CONCURRENCY", 3)))
+# Claude's subscription pool is more capped than gemini but a handful of concurrent search calls is
+# well within a Max plan; one-at-a-time (the old default) added up to ~100s of pure queue wait.
+CLAUDE_CONCURRENCY = threading.Semaphore(max(1, env_int("RESEARCH_CLAUDE_CONCURRENCY", 3)))
+# Only the scarce-quota fast legs get a per-leg concurrency cap. Codex is intentionally absent — its
+# footprint is bounded by codex_task_cap (few slow calls per phase) and the fast-leg-aware straggler
+# quorum, so it never has enough concurrent jobs to need a semaphore.
 LEG_SEMAPHORES = {"gemini": GEMINI_CONCURRENCY, "claude": CLAUDE_CONCURRENCY}
+# The slow-frontier legs: excluded from the straggler quorum so a phase declares "enough" the moment
+# the FAST legs have largely returned, then gives these a bounded grace to land (see
+# collect_with_straggler_drop). Membership is by measured latency class, not vendor identity.
+SLOW_LEGS = frozenset({"codex"})
 LEG_BUDGET_LOCK = threading.Lock()
 RUN_LEG_BUDGET: dict[str, dict[str, int]] = {}
 
@@ -514,7 +534,9 @@ EFFORT_PROFILES = {
         "adjudicate_disputes": True,
         "search_timeout_sec": 420,
         "recheck_timeout_sec": 300,
-        "straggler_grace_sec": 90,
+        "straggler_grace_sec": 45,
+        "codex_task_cap": 1,
+        "model_verify_cap": 2,
         "time_budget_sec": 1500,
         "gemini_call_budget": 6,
         "search_legs": ["codex", "gemini", "claude"],
@@ -540,7 +562,9 @@ EFFORT_PROFILES = {
         "adjudicate_disputes": True,
         "search_timeout_sec": 480,
         "recheck_timeout_sec": 360,
-        "straggler_grace_sec": 120,
+        "straggler_grace_sec": 90,
+        "codex_task_cap": 2,
+        "model_verify_cap": 3,
         "time_budget_sec": 2400,
         "gemini_call_budget": 9,
         "search_legs": ["codex", "gemini", "claude"],
@@ -566,7 +590,9 @@ EFFORT_PROFILES = {
         "adjudicate_disputes": True,
         "search_timeout_sec": 600,
         "recheck_timeout_sec": 480,
-        "straggler_grace_sec": 240,
+        "straggler_grace_sec": 200,
+        "codex_task_cap": 3,
+        "model_verify_cap": 4,
         "time_budget_sec": 4200,
         "gemini_call_budget": 12,
         "search_legs": ["codex", "gemini", "claude"],
@@ -592,7 +618,9 @@ EFFORT_PROFILES = {
         "adjudicate_disputes": True,
         "search_timeout_sec": 900,
         "recheck_timeout_sec": 600,
-        "straggler_grace_sec": 360,
+        "straggler_grace_sec": 300,
+        "codex_task_cap": 6,
+        "model_verify_cap": 6,
         "time_budget_sec": 5100,
         "gemini_call_budget": 16,
         "search_legs": ["codex", "gemini", "claude"],
@@ -609,9 +637,10 @@ EFFORT_PROFILES = {
         "adjudicate_samples": 3,
     },
 }
-# Once this fraction of a phase's parallel calls has returned, the remaining stragglers get a
-# bounded grace window (max of the profile grace and half the median completed latency) and are
-# then killed — their items flow into the rescue pool instead of stalling the whole phase.
+# Once this fraction of a phase's FAST-leg calls has returned (the slow frontier legs are excluded
+# from the count — see collect_with_straggler_drop's fast_quorum_total), the remaining stragglers
+# get a bounded grace window (max of the profile grace and half the median completed latency) and
+# are then killed — their items flow into the rescue pool instead of stalling the whole phase.
 STRAGGLER_QUORUM = 0.75
 EFFORT_NAME_TO_LEVEL = {profile["effort"]: level for level, profile in EFFORT_PROFILES.items()}
 DEFAULT_EFFORT_LEVEL = 2
@@ -1542,6 +1571,49 @@ def apply_live_check(item: dict, intent: dict | None = None,
     item["disputed"] = False  # resolved by verified fact, not by vote
 
 
+def apply_model_verdict(item: dict, verdict: dict, intent: dict | None = None) -> dict:
+    """Fold a web-capable model's re-verification verdict (Q1) into a finding, in place, and return
+    the synthetic url_check that stands in for the plain-HTTP liveness probe our client was
+    bot-walled on. On a NOT-live / failed verdict the item stays rejected with the final,
+    non-rescuable reason `model_check_failed`. On a live verdict the item is marked `model_verified`,
+    its fields adopt the model's page-read values where present, and a synthetic live_check carries
+    the page facts so the downstream semantic gates (content_mismatch) still have signal — but the
+    calibrated confidence stays penalized vs a machine-live HTTP check (see calibrate_confidence)."""
+    leg = verdict.get("leg")
+    checked_at = verdict.get("checked_at") or utc_now()
+    if not verdict.get("live"):
+        item["model_verified"] = False
+        return {"ok": False, "reason": "model_check_failed", "method": "model",
+                "model": leg, "checked_at": checked_at}
+    final_url = verdict.get("url")
+    if isinstance(final_url, str) and final_url.strip():
+        item["url"] = final_url.strip()
+    for field in ("availability", "seller", "title"):
+        val = verdict.get(field)
+        if isinstance(val, str) and val.strip():
+            item[field] = val.strip()
+    price = parse_price(verdict.get("price"))
+    if price is not None:
+        cur = canon_currency(verdict.get("currency")) or item.get("currency")
+        usd = to_usd(price, cur)
+        if usd is not None:
+            if item.get("price") is not None and item.get("price") != price:
+                item["price_corrected_from"] = item.get("price")
+            item["price"] = price
+            item["currency"] = cur
+            item["price_usd"] = usd
+            set_monthly_usd(item)
+    item["model_verified"] = True
+    item["model_verified_by"] = leg
+    item["live_check"] = {
+        "ok": True, "method": "model", "model": leg,
+        "live_price": item.get("price"), "live_currency": item.get("currency"),
+        "page_title": verdict.get("title") or item.get("title"),
+        "ad_status": "active", "reason": "model_confirmed",
+    }
+    return {"ok": True, "method": "model", "model": leg, "checked_at": checked_at}
+
+
 def verify_url(url: object, timeout: float = URL_TIMEOUT_SEC,
                host_registry: HostBlockRegistry | None = None,
                cache: UrlCheckCache | None = None) -> dict:
@@ -1612,13 +1684,52 @@ def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[
 # (broken/moved URL, timeout, missing price, 4xx) is a FAILURE TO VERIFY — the item may be exactly
 # what the user wants, so it gets rescue rechecks and an "unconfirmed" slot in the report.
 # off_intent/wrong_tier are final (it is the wrong thing); not_below_official is final (policy);
-# content_mismatch is final (the live page sells something else).
+# content_mismatch is final (the live page sells something else). "excluded_by_keyword" is
+# DELIBERATELY absent: an exclude-keyword hit is the fragile gate that can misfire, so it stays
+# rescuable and lands in "Unverified — check manually" instead of vanishing.
 NON_RESCUABLE_REASONS = {
     "parse_failed", "off_site", "out_of_stock", "adjudicated_reject", "listing_inactive",
     "off_intent", "wrong_tier", "not_below_official", "content_mismatch", "free_excluded",
     "excluded_site",
+    # A web-capable model opened the page and said it is not live / not the product — a stronger
+    # signal than our plain-HTTP failure, so the item is final (and never re-enters model-verify).
+    "model_check_failed",
 }
 SEARCH_LEGS = ("codex", "gemini")
+
+# Network-verification-class rejections: "we could not reach/read the page", NOT "the page is
+# wrong". Our plain-urllib client is bot-walled (403/444) on many marketplaces a web-capable model
+# can still open, so these are the ONLY rejections eligible for model-assisted re-verification (Q1);
+# every semantic reason (off_intent, wrong_tier, content_mismatch, not_below_official, out_of_stock,
+# off_site, excluded_by_keyword, parse_failed, adjudicated_reject, listing_inactive, free_excluded,
+# excluded_site) means the item was disproven and disqualifies it.
+_HTTP_STATUS_REASON_RE = re.compile(r"^http_\d{3}$")
+
+
+def is_network_verify_reason(reason: object) -> bool:
+    reason = str(reason or "")
+    return reason in {"bot_blocked", "timeout", "url_unverified"} or bool(_HTTP_STATUS_REASON_RE.match(reason))
+
+
+def model_verify_eligible(item: dict) -> bool:
+    """True for a rejected item that was NEVER semantically rejected — every rejection reason is a
+    network-verification-class failure (see is_network_verify_reason) — and that carries a URL and a
+    model-claimed price to confirm/rank. `missing_price` is tolerated ONLY alongside a genuine
+    network reason (a price we could not read on an unreachable page is a network artifact, not a
+    semantic reject). Such an item may be exactly what the user wants; a model with its own browser
+    can often open what bot-walled us, so it earns one model-assisted look (Q1)."""
+    reasons = item.get("reasons") or []
+    if not reasons or not item.get("url"):
+        return False
+    if item.get("price_usd") is None and item.get("price") is None:
+        return False
+    saw_network = False
+    for reason in reasons:
+        if is_network_verify_reason(reason):
+            saw_network = True
+        elif reason != "missing_price":
+            return False
+    return saw_network
 
 
 def is_rescuable(item: dict) -> bool:
@@ -1679,7 +1790,11 @@ def verify_findings(
     excluded_sites: list[str] | None = None,
     host_registry: HostBlockRegistry | None = None,
     cache: UrlCheckCache | None = None,
+    model_verdicts: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
+    # `model_verdicts` (Q1) is the run-scoped {dedupe_key -> verdict} store the model-verify stage
+    # fills; consulted per finding below so a promotion (or a model rejection) is DURABLE across every
+    # later re-verify (coverage/frontier rebuild verified/rejected from the full findings list).
     # Fresh per call if the caller didn't share one; execute_research shares it across all rounds
     # so a host that bot-walled in the primary stays throttled through rescue/frontier too.
     host_registry = host_registry or HostBlockRegistry()
@@ -1712,6 +1827,12 @@ def verify_findings(
         # A user-blocked domain is rejected regardless of liveness — skip the network round-trip.
         if excluded_sites and item.get("url") and url_in_sites(item.get("url"), excluded_sites):
             return item, {"ok": False, "reason": "excluded_site"}
+        verdict = model_verdicts.get(dedupe_key(finding)) if model_verdicts else None
+        if verdict is not None:
+            # A web-capable model already opened this page (our plain HTTP is bot-walled here); trust
+            # its liveness verdict and skip the network round-trip. The semantic gates below
+            # (rejection_reasons -> intent/tier/content) still run on the model-updated fields.
+            return item, apply_model_verdict(item, verdict, intent)
         url_check = verify_url(item.get("url"), host_registry=host_registry, cache=cache)
         if url_check.get("ok"):
             apply_live_check(item, intent, host_registry=host_registry, cache=cache)
@@ -1853,8 +1974,12 @@ reorderings. They search the SAME thing, not a new angle.{angle_rule}
 ALSO extract an "intent" object that the verifier and judge will enforce:
 - subject_keywords: words/phrases that a RELEVANT result's title MUST contain (the actual thing
   wanted, e.g. ["macbook air m2"] or ["claude", "max"]). Used to reject wrong products.
-- exclude_keywords: words that mark a WRONG result to reject (other products, "for parts",
-  "запчасти", competing brands the user did not ask for, etc.).
+- exclude_keywords: SPECIFIC disqualifying product/category terms that identify the WRONG thing — a
+  different product line, "for parts", "case only", a competing brand the user did not
+  ask for. NEVER add generic words that co-occur with valid offers (matching is whole-word, so one
+  bad term silently rejects the correct answers): do NOT list "prompt", "free", "trial", "api",
+  "subscription", "cheap", or the subject's own domain words. Good: ["for parts", "refurbished"];
+  bad: ["prompt", "free", "api"].
 - required_tier: if the user demanded a minimum tier/variant (e.g. "Max 5x or higher"), name it
   in lowercase ("max_5x"); else null. Below-tier offers are rejected.
 - official_price / official_currency: the official/reference price the user wants to BEAT (they
@@ -2180,6 +2305,25 @@ def _flag_incomparable_basis(finding: dict, intent: dict) -> None:
         f"{canon_basis(intent.get('official_price_basis'))} — not directly comparable")
 
 
+def keyword_hits(text: object, keywords: list[str] | None) -> list[str]:
+    """Whole-word / whole-phrase keyword matcher, returning which keywords actually occur in `text`
+    at token boundaries. Unicode-aware (\\w spans non-ASCII scripts under re), so "prompt" does NOT
+    fire on "prompts"/"prompt caching", "free" not on "freedom", "voice" not on "invoice", and a
+    non-ASCII keyword not on a longer glued word. Multi-word keywords match across any run of
+    whitespace. A naive substring
+    test here silently rejected valid LLM-API listings (every one mentions "prompt caching")."""
+    hay = str(text or "").lower()
+    hits = []
+    for raw in keywords or []:
+        kw = str(raw or "").strip().lower()
+        if not kw:
+            continue
+        pattern = r"\s+".join(re.escape(part) for part in kw.split())
+        if re.search(rf"(?<!\w){pattern}(?!\w)", hay, re.UNICODE):
+            hits.append(kw)
+    return hits
+
+
 def intent_rejection(finding: dict, intent: dict | None) -> str | None:
     """Reject findings that don't match what the user actually asked for: wrong product
     (exclude keyword / no subject keyword), wrong tier, a free tier when a PAID one was asked for,
@@ -2189,10 +2333,13 @@ def intent_rejection(finding: dict, intent: dict | None) -> str | None:
     if not intent:
         return None
     text = " ".join(str(finding.get(f) or "") for f in ("title", "evidence", "marketplace")).lower()
-    if intent.get("exclude_keywords") and any(kw in text for kw in intent["exclude_keywords"]):
-        return "off_intent"
+    # An exclude-keyword hit is the fragile gate (a wrongly-generic keyword misfires here), so it is
+    # recoverable — distinct reason, NOT final. A missing subject keyword is a genuine wrong-product
+    # signal and stays final (off_intent).
+    if intent.get("exclude_keywords") and keyword_hits(text, intent["exclude_keywords"]):
+        return "excluded_by_keyword"
     subject = intent.get("subject_keywords") or []
-    if subject and not any(kw in text for kw in subject):
+    if subject and not keyword_hits(text, subject):
         return "off_intent"
     req_rank = tier_rank(intent.get("required_tier"))
     if req_rank is not None:
@@ -2259,7 +2406,7 @@ def content_mismatch(finding: dict, intent: dict | None) -> bool:
     if not live_title.strip():
         return False
     live_words = _words(live_title)
-    if intent.get("exclude_keywords") and any(kw in live_title.lower() for kw in intent["exclude_keywords"]):
+    if intent.get("exclude_keywords") and keyword_hits(live_title, intent["exclude_keywords"]):
         return True
     subject = [kw for kw in (intent.get("subject_keywords") or []) if kw]
     if not subject:
@@ -2551,6 +2698,10 @@ def calibrate_confidence(item: dict) -> dict:
     live = item.get("live_check") or {}
     if item.get("listing_inactive"):
         live_score = 0.0; factors.append("listing inactive")
+    elif item.get("model_verified"):
+        # A web-capable model opened the page our HTTP client was bot-walled on (Q1). Trustworthy,
+        # but weaker than a machine-read live page — kept clearly above an unverified item (0.4).
+        live_score = 0.7; factors.append("model-verified (page opened by a model)")
     elif live.get("ok") and live.get("live_price") is not None:
         live_score = 1.0; factors.append("live page confirmed")
         if item.get("price_corrected_from") is not None:
@@ -2582,7 +2733,14 @@ def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: d
                        host_registry: HostBlockRegistry | None = None,
                        url_cache: UrlCheckCache | None = None) -> list[dict]:
     """One frontier sweep: each search leg hunts strictly below the ceiling."""
-    search_legs = config.get("search_legs") or ["codex", "gemini"]
+    run_id = run_dir.name
+    # Skip force-disabled (breaker/quota) and user-disabled legs at assembly time (M2): call_model
+    # would only emit skip records for them. Frontier fires one job per leg, so the slow leg (codex)
+    # already gets at most one call here — inherently within codex_task_cap, no extra cap needed.
+    search_legs = [leg for leg in (config.get("search_legs") or ["codex", "gemini"])
+                   if not leg_disabled(run_id, leg) and not user_disabled(run_id, leg)]
+    if not search_legs:
+        return []
     fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent, config.get("excluded_sites"), known_urls)
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
     if timeout_cap is not None:
@@ -2595,7 +2753,9 @@ def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: d
                                 timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
                 for leg in search_legs
             ]
-            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+            fast_total = sum(1 for leg in search_legs if leg not in SLOW_LEGS)
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
+                                               fast_quorum_total=fast_total)
     finally:
         prefetch_shutdown()
 
@@ -2678,7 +2838,12 @@ def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: lis
     """One coverage sweep, round-robin across legs (negative-space exploration — cross-check still
     happens at verify, so no need for all legs). Fires two kinds of job IN THE SAME executor batch:
     one per empty source-CLASS, plus one per semantic GAP query the auditor flagged. No serial phase."""
-    search_legs = config.get("search_legs") or ["codex", "gemini"]
+    run_id = run_dir.name
+    # Skip force-disabled (breaker/quota) and user-disabled legs at assembly time (M2).
+    search_legs = [leg for leg in (config.get("search_legs") or ["codex", "gemini"])
+                   if not leg_disabled(run_id, leg) and not user_disabled(run_id, leg)]
+    if not search_legs:
+        return []
     run_sites = config.get("sites") or []
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
     if timeout_cap is not None:
@@ -2694,17 +2859,36 @@ def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: lis
             jobs.append(("gap", query, build_gap_search_prompt(prompt, query, avoid_hosts, run_sites, intent, excluded)))
     if not jobs:
         return []
+    # Round-robin across legs, but cap the slow leg (codex) at codex_task_cap jobs per round (P1) —
+    # its coverage calls get straggler-killed most of the time, so beyond the cap its round-robin
+    # turns are handed to fast legs instead of stretching the round by the grace window for nothing.
+    fast_legs = [leg for leg in search_legs if leg not in SLOW_LEGS]
+    codex_cap = int(config.get("codex_task_cap") or 0)
+    job_legs: list[str] = []
+    slow_used = 0
+    fast_rr = 0
+    for i in range(len(jobs)):
+        leg = search_legs[i % len(search_legs)]
+        if leg in SLOW_LEGS:
+            if slow_used < codex_cap:
+                slow_used += 1
+            elif fast_legs:
+                leg = fast_legs[fast_rr % len(fast_legs)]
+                fast_rr += 1
+        job_legs.append(leg)
     on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
             futures = [
-                executor.submit(call_model, search_legs[i % len(search_legs)], built_prompt,
+                executor.submit(call_model, job_legs[i], built_prompt,
                                 run_dir, "coverage", f"{kind}-{key}",
                                 timeout, config["search_effort"],
-                                config.get("claude_search_model") if search_legs[i % len(search_legs)] == "claude" else None)
+                                config.get("claude_search_model") if job_legs[i] == "claude" else None)
                 for i, (kind, key, built_prompt) in enumerate(jobs)
             ]
-            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+            fast_total = sum(1 for leg in job_legs if leg not in SLOW_LEGS)
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
+                                               fast_quorum_total=fast_total)
     finally:
         prefetch_shutdown()
 
@@ -2770,6 +2954,56 @@ Use the same schema:
       "confidence": 0.0
     }}
   ]
+}}
+"""
+
+
+def build_model_verify_prompt(user_prompt: str, item: dict, config: dict) -> str:
+    """Ask a WEB-CAPABLE model to open a candidate our plain-HTTP verifier could not reach (anti-bot
+    wall / timeout / http error) and confirm it first-hand. STRICT JSON out; NO invented data — if it
+    cannot open the page it returns live=false. Same house style as build_recheck_prompt."""
+    compact = json.dumps(
+        {
+            "title": item.get("title"),
+            "price": item.get("price"),
+            "currency": item.get("currency"),
+            "url": item.get("url"),
+            "marketplace": item.get("marketplace"),
+            "seller": item.get("seller"),
+            "reasons": item.get("reasons"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"""You are a live-listing verifier for an offer research system.
+Our automated HTTP client could NOT reach this page (it is behind an anti-bot wall or errored), so we
+need you to open it with your OWN web tooling and report what is actually there.
+Return ONLY valid JSON. No Markdown.
+
+Original user request:
+{user_prompt}
+
+Candidate to verify (open the url yourself):
+{compact}
+
+Your job:
+- OPEN the url. Confirm the page LOADS and is a real, currently-available offer for the SAME product
+  the user wants (right item/tier, honestly described, in stock).
+- Read the CURRENT price and currency straight off the page (not from the data above).
+- If the url redirected, report the FINAL url.
+- NO invented data: if you cannot open the page, or it is dead / sold / a different product, return
+  "live": false and explain why in notes.
+
+Return exactly this JSON shape:
+{{
+  "live": true,
+  "price": 12345,
+  "currency": "USD",
+  "availability": "available / sold / unknown",
+  "seller": "seller or null",
+  "title": "the page's product title",
+  "url": "final url if redirected, else the same url",
+  "notes": "one short sentence of evidence"
 }}
 """
 
@@ -3185,7 +3419,7 @@ def call_model(
         timed_out=timed_out,
         dropped_as_straggler=meta["dropped_as_straggler"],
     )
-    breaker_tripped = record_leg_result(run_id, leg, meta["success"])
+    breaker_tripped = apply_call_to_breaker(run_id, leg, meta["success"], meta["dropped_as_straggler"])
     if rc == 5 and force_disable_leg(run_id, leg, "quota_exhausted"):
         breaker_tripped = True
     if breaker_tripped:
@@ -3582,6 +3816,12 @@ def parse_model_records(records: list[dict]) -> tuple[list[dict], list[dict], li
         cached = record.get("_parsed_findings")  # warmed by findings_from_record during prefetch
         if cached is not None:
             record_findings = cached
+        elif not (record.get("stdout") or "").strip():
+            # Ran successfully but produced NO output (M1): that is an ABSENCE of findings, not a
+            # rejected finding — so it yields no parse_failed placeholder. It still counts as a
+            # completed empty call in the per-model stats (parse_failed=False, no_sources=True). A
+            # real malformed payload (non-empty, unparseable) below still becomes a parse rejection.
+            record_findings = []
         else:
             try:
                 record_findings = _parse_record_findings(record)
@@ -3636,16 +3876,32 @@ def write_model_stats(run_id: str, records: list[dict], rejected: list[dict]) ->
 
 
 def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
-                                on_record: object = None) -> list[dict]:
+                                on_record: object = None, fast_quorum_total: int | None = None) -> list[dict]:
     """Collect fan-out results; once STRAGGLER_QUORUM of calls are in, give the rest a bounded
     grace window, then kill them. Killed calls return as failures and flow into rescue. `on_record`
     (optional) fires for each record the moment its future completes — used to prefetch that
     record's finding URLs into the run URL cache while the slower calls are still running. It runs on
-    the collecting thread and must never block or raise (failures are swallowed here)."""
+    the collecting thread and must never block or raise (failures are swallowed here).
+
+    `fast_quorum_total`, when given, is the number of FAST-leg (non-SLOW_LEGS) calls in this batch:
+    the quorum is then measured only against fast-leg completions, so a slow frontier leg (codex)
+    can never gate the phase. The grace window opens as soon as the fast legs have largely returned,
+    and the slow stragglers get the profile grace on top before being killed. Falls back to the old
+    all-calls quorum when it is None or 0 (e.g. a phase with no fast legs), preserving prior behaviour."""
     records: list[dict] = []
     latencies: list[float] = []
     deadline: float | None = None
     pending = set(futures)
+    use_fast = bool(fast_quorum_total)
+    # Quorum hygiene (S1): only a call that RAN AND SUCCEEDED can deliver findings, so only such
+    # calls advance the quorum. A skipped-without-running call (disabled leg / no budget / cancelled)
+    # or a ran-and-FAILED call (rc != 0, e.g. rc=5 quota) will never deliver — it shrinks the
+    # effective quorum base (the still-live jobs are the real denominator) instead of counting as
+    # progress. In fast-quorum mode only fast legs count toward the base at all (the slow frontier
+    # legs never gate the phase); the legacy no-fast-total path applies the same rule over every leg.
+    ok = 0    # calls that ran AND succeeded (fast-only under use_fast; all legs in the legacy path)
+    dead = 0  # calls skipped-without-running or ran-and-failed (same leg scope as `ok`)
+    base = fast_quorum_total if use_fast else len(futures)
     while pending:
         wait_timeout = max(1.0, deadline - time.monotonic()) if deadline is not None else None
         done, pending = concurrent.futures.wait(
@@ -3655,6 +3911,11 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
             record = future.result()
             records.append(record)
             latencies.append(record.get("latency_sec") or 0.0)
+            if (not use_fast) or record.get("leg") not in SLOW_LEGS:
+                if record.get("success"):
+                    ok += 1
+                else:
+                    dead += 1
             if on_record is not None:
                 try:
                     on_record(record)
@@ -3663,14 +3924,29 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
             update_run(run_dir, progress={"done": len(records), "total": len(futures)})
         if not pending:
             break
-        quorum = max(1, math.ceil(len(futures) * STRAGGLER_QUORUM))
-        if deadline is None and len(records) >= quorum:
+        # The effective base shrinks as jobs prove they cannot deliver. When it reaches 0 (every job
+        # that could have delivered is dead) the quorum DISENGAGES — no deadline is armed, so the
+        # phase waits for the remaining (slow) calls up to their own per-call timeouts instead of
+        # letting a grace timer kill the one leg still capable of delivering. This is intentional:
+        # when only the slow leg can deliver, we wait for it.
+        effective_base = base - dead
+        if deadline is None and effective_base > 0 and ok >= max(1, math.ceil(effective_base * STRAGGLER_QUORUM)):
             median = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
             deadline = time.monotonic() + max(config["straggler_grace_sec"], median * 0.5)
         if deadline is not None and time.monotonic() >= deadline:
-            killed = kill_stragglers(run_dir.name)
-            if killed:
-                emit_event(run_dir, "stragglers_killed", record_ids=killed)
+            # Zero-findings reaper guard (S2): killing the still-pending calls while NOTHING has been
+            # found would guarantee an empty phase (a useless run). Extend the grace window instead and
+            # let the pending calls keep working; the natural bound is each call's own subprocess
+            # timeout — when they finish, `pending` empties and the loop exits (so this cannot spin
+            # forever, and a cancel that reaps the calls also completes their futures). Once ANY finding
+            # is in, revert to the normal reap so a healthy phase is not stretched by one slow leg.
+            found = sum(len(findings_from_record(r)) for r in records)
+            if found == 0:
+                emit_event(run_dir, "straggler_grace_extended", waiting_for=len(pending))
+            else:
+                killed = kill_stragglers(run_dir.name)
+                if killed:
+                    emit_event(run_dir, "stragglers_killed", record_ids=killed)
             # Re-arm every grace interval: a job that spawned its subprocess AFTER the first sweep
             # (e.g. a late audit-added task) is reaped on the next pass, so the post-quorum wait stays
             # bounded to the grace window instead of stretching to the full phase timeout.
@@ -3768,14 +4044,31 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
     differentiate = bool(config.get("differentiate_legs"))
     classes = list(SOURCE_CLASS_HINTS)
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
+    # Codex is the slow long-pole leg: rather than one slow call per task (which used to gate the
+    # whole phase), it covers only the BASE query of the first codex_task_cap tasks — a few
+    # high-value calls the fast-leg-aware quorum never blocks on. The fast legs carry full breadth.
+    codex_cap = int(config.get("codex_task_cap") or 0)
 
-    def make_jobs(task_list: list[dict], n_var: int, n_ang: int) -> list[tuple]:
-        expanded = [tv for task in task_list for tv in task_query_set(task, n_var, n_ang)]
-        return [
-            (leg, tv, (classes[(l_idx + t_idx) % len(classes)] if differentiate else None))
-            for t_idx, tv in enumerate(expanded)
-            for l_idx, leg in enumerate(search_legs)
-        ]
+    def make_jobs(task_list: list[dict], n_var: int, n_ang: int, slow_used: int = 0) -> tuple[list[tuple], int]:
+        # codex_task_cap is a per-PHASE budget, so the count of slow-leg jobs already emitted is
+        # THREADED through (main tasks -> late audit tasks). Without this, the audit call restarted
+        # rank at 0 and fired codex again on audit tasks even after the cap was spent on main tasks.
+        jobs: list[tuple] = []
+        g_idx = 0  # index over flattened task-variants; drives the differentiate class rotation
+        for task in task_list:
+            for v_i, tv in enumerate(task_query_set(task, n_var, n_ang)):
+                for l_idx, leg in enumerate(search_legs):
+                    if leg in SLOW_LEGS:
+                        if v_i != 0 or slow_used >= codex_cap:
+                            continue  # codex: base query only, until the per-phase cap is spent
+                        slow_used += 1
+                    focus = classes[(l_idx + g_idx) % len(classes)] if differentiate else None
+                    jobs.append((leg, tv, focus))
+                g_idx += 1
+        # Slow legs first so codex spawns immediately (max time to land inside its grace) while the
+        # fast legs — bounded by their own semaphores — fill the remaining worker slots behind it.
+        jobs.sort(key=lambda j: j[0] not in SLOW_LEGS)
+        return jobs, slow_used
 
     def submit(executor, job_list: list[tuple]) -> list:
         return [
@@ -3793,7 +4086,7 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
             for leg, tv, focus in job_list
         ]
 
-    jobs = make_jobs(tasks, n_variants, n_angle)
+    jobs, slow_used = make_jobs(tasks, n_variants, n_angle)
     # Provision extra worker slots up front (the pool size is fixed at creation) so any late
     # audit-added tasks (<=2, 1 variant each, all search legs) run alongside the initial fan-out.
     # The reserve rides ON TOP of MAX_PRIMARY_WORKERS: a plain min(MAX, jobs+reserve) would zero it
@@ -3804,19 +4097,24 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = submit(executor, jobs)
+            submitted = list(jobs)
             # Concurrent plan auditor: the initial jobs are already running, so a BOUNDED wait for the
             # audit costs ~0 extra wall-clock (searches progress meanwhile). collect_with_straggler_drop
             # fixes its totals/quorum at call time, so we submit the late jobs BEFORE collecting.
             if extra_tasks_supplier is not None:
                 extra_tasks = wait_for_extra_tasks(extra_tasks_supplier, timeout)
                 if extra_tasks:
-                    futures += submit(executor, make_jobs(extra_tasks, 1, 0))
+                    extra_jobs, slow_used = make_jobs(extra_tasks, 1, 0, slow_used)
+                    futures += submit(executor, extra_jobs)
+                    submitted += extra_jobs
                     if extra_tasks_sink is not None:
                         # Only the tasks that were actually SEARCHED — a late audit that missed the
                         # bounded wait yields nothing here, so the coverage grid / tasks.json never lists
                         # a source_class that was never queried.
                         extra_tasks_sink.extend(extra_tasks)
-            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+            fast_total = sum(1 for leg, _, _ in submitted if leg not in SLOW_LEGS)
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
+                                               fast_quorum_total=fast_total)
     finally:
         prefetch_shutdown()
 
@@ -3851,8 +4149,21 @@ def run_rechecks(
     seen_keys: set[str] = set()
     items_used = 0
     dropped = 0
+    run_id = run_dir.name
+    # Per-phase slow-leg (codex) cap (P1): those calls get straggler-killed most of the time, so an
+    # unbounded share just stretches the round by the grace window for nothing. Hand codex only the
+    # first codex_task_cap items (the cheapest — items arrive price-sorted); the rest cycle fast legs.
+    codex_cap = int(config.get("codex_task_cap") or 0)
+    slow_used = 0
+    # Only the network-blocked items the model-verify stage (Q1) will actually take (same selector,
+    # so the two sets agree) skip rescue — re-searching THOSE via an LLM wastes a call re-finding the
+    # same bot-walled URL. Eligible items BEYOND the model_verify_cap keep the rescue path: dropping
+    # them from both would leave them with zero recovery attempts.
+    model_verify_keys = {dedupe_key(it) for it in select_model_verify_candidates(items, config)}
     for item in items:
         if not (item.get("disputed") or is_rescuable(item)):
+            continue
+        if dedupe_key(item) in model_verify_keys:
             continue
         key = dedupe_key(item)
         if key in seen_keys:
@@ -3863,8 +4174,10 @@ def run_rechecks(
         # Prefer a leg that has NOT tried this item yet, and that differs from its source.
         untried = [
             leg for leg in search_legs
-            if leg not in tried and not leg_disabled(run_dir.name, leg)
+            if leg not in tried and not leg_disabled(run_id, leg) and not user_disabled(run_id, leg)
         ]
+        if slow_used >= codex_cap:
+            untried = [leg for leg in untried if leg not in SLOW_LEGS]
         untried.sort(key=lambda leg: leg == item.get("source_model"))  # non-source first
         legs = untried if config["recheck_legs"] >= len(search_legs) else untried[: config["recheck_legs"]]
         if not legs:
@@ -3875,6 +4188,8 @@ def run_rechecks(
         items_used += 1
         for leg in legs:
             tried.add(leg)
+            if leg in SLOW_LEGS:
+                slow_used += 1
             jobs.append((leg, item, f"recheck-{round_no}-{items_used}-{leg}"))
     if not jobs:
         return [], dropped
@@ -3899,10 +4214,108 @@ def run_rechecks(
                 )
                 for leg, item, task_id in jobs
             ]
-            records = collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+            fast_total = sum(1 for leg, _, _ in jobs if leg not in SLOW_LEGS)
+            records = collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
+                                                  fast_quorum_total=fast_total)
     finally:
         prefetch_shutdown()
     return records, dropped
+
+
+def select_model_verify_candidates(items: list[dict], config: dict) -> list[dict]:
+    """The top-model_verify_cap cheapest network-blocked candidates (USD-ranked via sort_by_usd so
+    mixed currencies compare correctly; native-price-only items sort last rather than as huge
+    pseudo-USD numbers). SHARED between run_model_verify (which verifies exactly this set) and
+    run_rechecks (which excludes exactly this set from LLM rescue) — the two must agree, or an
+    item beyond the cap would lose both recovery paths."""
+    cap = int(config.get("model_verify_cap") or 0)
+    if cap <= 0:
+        return []
+    return sort_by_usd([it for it in items if model_verify_eligible(it)])[:cap]
+
+
+def run_model_verify(prompt: str, rejected: list[dict], run_dir: Path, config: dict,
+                     intent: dict | None, model_verdicts: dict,
+                     host_registry: HostBlockRegistry | None = None,
+                     url_cache: UrlCheckCache | None = None) -> int:
+    """Model-assisted verification of network-blocked candidates (Q1). Takes the top-K cheapest
+    rejected items whose failures are ALL network-verification-class (model_verify_eligible) and fires
+    one web-capable model call per candidate to open the page first-hand. Each verdict is recorded in
+    `model_verdicts` (keyed by dedupe_key) so the caller's re-verify promotes the live ones DURABLY
+    (apply_model_verdict / verify_findings). One leg for the whole stage: prefer claude, else gemini,
+    else skip. Returns the number of candidates that produced a usable verdict."""
+    run_id = run_dir.name
+    candidates = select_model_verify_candidates(rejected, config)
+    if not candidates:
+        return 0
+
+    # One web-capable leg for the whole stage. call_model does NOT budget-gate task_type=model_verify,
+    # so each candidate reserves its OWN leg-budget slot here; the stage is skipped when neither leg is
+    # available (disabled/quota) or has any budget left.
+    leg = None
+    for cand_leg in ("claude", "gemini"):
+        if user_disabled(run_id, cand_leg) or leg_disabled(run_id, cand_leg):
+            continue
+        if consume_leg_budget(run_id, cand_leg):
+            leg = cand_leg
+            break
+    if leg is None:
+        return 0
+    jobs = [candidates[0]]  # the pick above already reserved this candidate's slot
+    for cand in candidates[1:]:
+        if consume_leg_budget(run_id, leg):
+            jobs.append(cand)
+        else:
+            break
+
+    emit_event(run_dir, "model_verify_started", count=len(jobs), leg=leg)
+    timeout = min(config["recheck_timeout_sec"], 240)
+    by_task: dict[str, dict] = {}
+    call_jobs: list[tuple[str, dict]] = []
+    for i, item in enumerate(jobs):
+        task_id = f"mv-{i}"
+        by_task[task_id] = item
+        call_jobs.append((task_id, item))
+    on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(call_jobs))) as executor:
+            futures = [
+                executor.submit(call_model, leg, build_model_verify_prompt(prompt, item, config),
+                                run_dir, "model_verify", task_id, timeout, config["search_effort"],
+                                config.get("claude_search_model") if leg == "claude" else None)
+                for task_id, item in call_jobs
+            ]
+            fast_total = sum(1 for _ in call_jobs if leg not in SLOW_LEGS)
+            records = collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
+                                                  fast_quorum_total=fast_total)
+    finally:
+        prefetch_shutdown()
+
+    checked = 0
+    for record in records:
+        item = by_task.get(record.get("task_id"))
+        if item is None or not record.get("success"):
+            continue  # the model call itself failed/skipped — leave the item's network rejection as-is
+        try:
+            payload = extract_json(record.get("stdout") or "")
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        checked += 1
+        model_verdicts[dedupe_key(item)] = {
+            "live": bool(payload.get("live")),
+            "price": payload.get("price"),
+            "currency": payload.get("currency"),
+            "availability": payload.get("availability"),
+            "seller": payload.get("seller"),
+            "title": payload.get("title"),
+            "url": payload.get("url"),
+            "notes": payload.get("notes"),
+            "leg": leg,
+            "checked_at": utc_now(),
+        }
+    return checked
 
 
 def aggregate_adjudications(verdicts: list[dict]) -> dict | None:
@@ -4244,6 +4657,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
     emitted_findings: dict = {}  # shared across rounds so a finding streams once (not every re-verify)
     host_blocks = HostBlockRegistry()  # shared across rounds: a bot-walled host stays throttled all run
     url_cache = UrlCheckCache()  # shared across rounds: search-phase prefetch warms it for the batch verify
+    model_verdicts: dict = {}  # Q1: {dedupe_key -> verdict} fed to every verify_findings so a model
+    # promotion (or model rejection) of a network-blocked item is durable across later re-verifies.
     ACTIVE_RUNS.add(run_id)
     init_leg_health(run_id)
     set_user_disabled(run_id, config.get("disabled_legs") or [])
@@ -4353,7 +4768,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         check_cancel()
 
         update_run(run_dir, phase="verifying", progress=None)
-        verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="primary", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
+        verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="primary", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
         record_stage_results(run_dir, "primary", verified, rejected)
         check_cancel()
 
@@ -4393,7 +4808,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             all_parsed_records.extend(recheck_parsed)
             findings = findings + recheck_findings
             parse_rejections = parse_rejections + recheck_parse_rejections
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"rescue {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"rescue {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
             record_stage_results(run_dir, f"rescue {round_no}", verified, rejected)
             check_cancel()
         if recheck_dropped:
@@ -4408,6 +4823,27 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
                 gap_queries = gap_future.result() or []
             except Exception:
                 gap_queries = []
+
+        # ---- model-assisted verification of network-blocked candidates (Q1) ----
+        # Right after rescue + gap-audit collection, BEFORE coverage/gap/frontier, so a promoted offer
+        # lifts the frontier ceiling and informs coverage. Only items whose failures are ALL
+        # network-verification-class qualify (model_verify_eligible) — those our plain-HTTP client
+        # bot-walled, never a semantic reject — and they are ALSO kept out of the rescue loop so we do
+        # not waste an LLM call re-finding the same blocked URL. Advisory: wrapped like gap_audit so a
+        # failure here never faults the paid run, and gated by stage_fits_budget.
+        if config.get("model_verify_cap") and rejected and stage_fits_budget(started, config):
+            update_run(run_dir, phase="model_verifying", progress=None)
+            before = len(verified)
+            try:
+                checked = run_model_verify(prompt, rejected, run_dir, config, intent, model_verdicts,
+                                           host_registry=host_blocks, url_cache=url_cache)
+            except Exception:
+                checked = 0  # advisory: a model-verify failure never faults the run
+            if checked:
+                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="model_verify", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
+                record_stage_results(run_dir, "model_verify", verified, rejected)
+            emit_event(run_dir, "model_verify_finished", promoted=max(0, len(verified) - before), checked=checked)
+            check_cancel()
 
         # Coverage-gap rounds (effort >=3): search the (structured) source-classes that produced
         # nothing credible, steering away from saturated hosts. Distinct from rescue (recovers
@@ -4437,7 +4873,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             findings = findings + c_findings
             parse_rejections = parse_rejections + c_parse_rej
             prev_keys = {dedupe_key(v) for v in verified}
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"coverage {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"coverage {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
             record_stage_results(run_dir, f"coverage {round_no}", verified, rejected)
             check_cancel()
             if not ({dedupe_key(v) for v in verified} - prev_keys):  # novelty-exhausted: stop
@@ -4458,7 +4894,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
                 all_parsed_records.extend(g_parsed)
                 findings = findings + g_findings
                 parse_rejections = parse_rejections + g_parse_rej
-                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="gap", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
+                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="gap", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
                 record_stage_results(run_dir, "gap", verified, rejected)
                 check_cancel()
 
@@ -4483,7 +4919,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             all_parsed_records.extend(f_parsed)
             findings = findings + f_findings
             parse_rejections = parse_rejections + f_parse_rej
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"frontier {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"frontier {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache, model_verdicts=model_verdicts)
             record_stage_results(run_dir, f"frontier {round_no}", verified, rejected)
             new_floor = credible_floor_usd(verified)
             check_cancel()
