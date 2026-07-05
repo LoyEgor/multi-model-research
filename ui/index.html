@@ -313,15 +313,24 @@
   .lane { display: grid; grid-template-columns: 116px 1fr; gap: 12px; align-items: start; }
   .lane-head { display: flex; flex-direction: column; gap: 4px; padding-top: 2px; }
   .lane-head .lane-count { font-size: 12px; color: var(--muted); }
-  .lane-cells { display: flex; flex-wrap: wrap; gap: 6px; }
-  .cell { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; background: var(--surface-2); color: var(--ink-2); }
-  .cell.ok { background: var(--good-soft); color: var(--good); }
-  .cell.fail { background: var(--bad-soft); color: var(--bad); }
-  .cell.killed, .cell.skipped { background: var(--warn-soft); color: var(--warn); }
-  .cell.run { background: var(--accent-soft); color: var(--accent-ink); }
-  .cell .cell-x { cursor: pointer; font-weight: 700; opacity: .65; margin-left: 2px; }
-  .cell .cell-x:hover { opacity: 1; }
-  .cell .qw { opacity: .6; font-style: italic; }
+  /* Absolute-time Gantt: bars sit on a shared clock so parallelism and queue-waits read truthfully.
+     Track height is set inline (rows * 24px) since concurrent calls in one leg pack into sub-rows. */
+  .lane-track { position: relative; min-height: 24px; border-radius: var(--r-sm); background: var(--track); overflow: hidden; }
+  .bar { position: absolute; height: 20px; min-width: 4px; box-sizing: border-box; border-radius: 5px; display: flex; align-items: center; gap: 5px; padding: 0 6px; font-size: 11px; font-weight: 500; overflow: hidden; white-space: nowrap; background: var(--surface-2); color: var(--ink-2); }
+  .bar.ok { background: var(--good-soft); color: var(--good); }
+  .bar.fail { background: var(--bad-soft); color: var(--bad); }
+  .bar.killed, .bar.skipped { background: var(--warn-soft); color: var(--warn); }
+  .bar.running { background: var(--accent-soft); color: var(--accent-ink); animation: bar-pulse 1.6s ease-in-out infinite; }
+  .bar .bar-wait { position: absolute; left: 0; top: 0; bottom: 0; background-image: repeating-linear-gradient(45deg, currentColor 0 2px, transparent 2px 5px); opacity: .3; pointer-events: none; }
+  .bar .bar-label { overflow: hidden; text-overflow: ellipsis; }
+  .bar .cell-x { cursor: pointer; font-weight: 700; opacity: .7; margin-left: auto; z-index: 1; }
+  .bar .cell-x:hover { opacity: 1; }
+  @keyframes bar-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+  .lane-axis { display: grid; grid-template-columns: 116px 1fr; gap: 12px; }
+  .axis-track { position: relative; height: 15px; }
+  .axis-track .tick { position: absolute; top: 0; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; transform: translateX(-50%); white-space: nowrap; }
+  .axis-track .tick.first { transform: none; }
+  .axis-track .tick.last { transform: translateX(-100%); }
 
   /* Run details */
   .details-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 16px; }
@@ -602,7 +611,7 @@ const state = {
   detail: null,
   pollTimer: null,
   es: null,
-  activity: new Map(),       // record_id -> {leg, task_type, task_id, state, latency}
+  activity: new Map(),       // record_id -> {leg, task_type, task_id, state, latency, queue_wait, started_ts, finished_ts}
   degraded: new Set(),       // live-updated via SSE
   skippedPhases: new Set(),  // phase indices skipped to stay within the time budget (SSE)
   reachedPhases: new Set(),  // phase indices the run actually became active at (distinguishes a
@@ -1621,22 +1630,49 @@ async function cancelCall(recordId) {
   try { await fetch(`/api/runs/${encodeURIComponent(state.current)}/calls/${encodeURIComponent(recordId)}/cancel`, { method: 'POST' }); }
   catch (e) { toast('Could not cancel call'); }
 }
-function activityCell(id, a) {
-  const cell = el('span', 'cell ' + (a.state || 'run'));
-  cell.appendChild(el('span', null, [a.task_type, a.task_id].filter(Boolean).join(' ') || id));
-  if (a.state === 'ok') cell.appendChild(el('span', null, '✓' + (a.latency ? ` ${Math.round(a.latency)}s` : '')));
-  else if (a.state === 'fail') cell.appendChild(el('span', null, '✗' + (a.latency ? ` ${Math.round(a.latency)}s` : '')));
-  else if (a.state === 'killed') cell.appendChild(el('span', null, '◌ killed'));
-  else if (a.state === 'skipped') cell.appendChild(el('span', null, 'skipped'));
-  else {
-    cell.appendChild(el('span', 'spinner'));
-    if (a.queue_wait && a.queue_wait > 1) cell.appendChild(el('span', 'qw', `queued ${Math.round(a.queue_wait)}s`));
+const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+function fmtOffset(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  return Math.floor(sec / 60) + ':' + String(Math.floor(sec % 60)).padStart(2, '0');
+}
+// Place a call on the shared clock. ts is only second-precise, so a finished call is anchored on
+// its finish ts and walked back by the ms-precise latency + queue_wait (matches call_started within
+// rounding). Running calls have no end yet — the caller extends them to the axis end.
+function callSpan(a) {
+  const qw = Math.max(0, Number(a.queue_wait) || 0);
+  const lat = Number(a.latency);
+  const fin = Number(a.finished_ts);
+  const started = Number(a.started_ts);
+  if (isFinite(fin)) {
+    const start = isFinite(lat) ? fin - (lat + qw) * 1000 : (isFinite(started) ? started : fin);
+    return { start, end: fin, qw };
+  }
+  return { start: isFinite(started) ? started : NaN, end: NaN, qw };
+}
+function activityBar(id, a, span, runStart, axisEnd, total, row) {
+  const start = isFinite(span.start) ? span.start : runStart;
+  const end = isFinite(span.end) ? span.end : axisEnd;  // running: extend to now/axis
+  const bar = el('div', 'bar ' + (a.state || 'running'));
+  bar.style.left = (clamp01((start - runStart) / total) * 100) + '%';
+  bar.style.width = (clamp01((end - start) / total) * 100) + '%';
+  bar.style.top = (row * 24 + 2) + 'px';
+  if (span.qw > 0 && end > start) {
+    const w = el('div', 'bar-wait');
+    w.style.width = (clamp01(span.qw * 1000 / (end - start)) * 100) + '%';
+    bar.appendChild(w);
+  }
+  bar.appendChild(el('span', 'bar-label', a.task_id || id));
+  const statusTxt = { ok: 'done', fail: 'failed', killed: 'killed', skipped: 'skipped', running: 'running' }[a.state] || 'running';
+  bar.title = ([a.task_type, a.task_id].filter(Boolean).join(' ') || id) + ' · ' + statusTxt
+    + (isFinite(a.latency) ? ' · ' + Math.round(a.latency) + 's' : '')
+    + (span.qw > 1 ? ' · queued ' + Math.round(span.qw) + 's' : '');
+  if (!a.state || a.state === 'running') {
     const x = el('span', 'cell-x', '✕');
     x.title = 'Cancel this call';
-    x.addEventListener('click', () => cancelCall(id));
-    cell.appendChild(x);
+    x.addEventListener('click', (e) => { e.stopPropagation(); cancelCall(id); });
+    bar.appendChild(x);
   }
-  return cell;
+  return bar;
 }
 function renderActivity() {
   const panel = $('activityPanel');
@@ -1645,7 +1681,12 @@ function renderActivity() {
   const running = state.detail && state.detail.run && state.detail.run.status === 'running';
   panel.hidden = !entries.length && !running;
   $('activityCount').textContent = String(state.activity.size);
-  const sig = JSON.stringify(entries.map(([id, a]) => [id, a.state, a.latency, a.queue_wait])) + '|' + [...state.degraded].sort().join(',');
+  // A live run's axis grows toward "now", so the running-bar edges move even with no new event;
+  // fold a 2s tick into the signature (only while calls are still running) to drive that re-render.
+  const hasRunning = entries.some(([, a]) => !a.state || a.state === 'running');
+  const liveTick = running && hasRunning ? Math.floor(Date.now() / 2000) : 0;
+  const sig = JSON.stringify(entries.map(([id, a]) => [id, a.state, a.latency, a.queue_wait])) + '|'
+    + [...state.degraded].sort().join(',') + '|' + liveTick;
   if (unchanged('activity', sig)) return;
   renderLegSummary();
   list.replaceChildren();
@@ -1653,6 +1694,20 @@ function renderActivity() {
     list.appendChild(el('div', 'panel-note', 'Per-call activity will appear here while the run streams events.'));
     return;
   }
+  // Shared clock: run start is the earliest bar start; the axis ends at the last event, or "now"
+  // for a live run (clamped so client/server clock skew can't blow the scale up).
+  const spans = new Map(entries.map(([id, a]) => [id, callSpan(a)]));
+  const starts = [...spans.values()].map((s) => s.start).filter(isFinite);
+  const ends = [...spans.values()].map((s) => (isFinite(s.end) ? s.end : s.start)).filter(isFinite);
+  const runStart = starts.length ? Math.min(...starts) : Date.now();
+  const lastEvent = ends.length ? Math.max(...ends) : runStart;
+  let axisEnd = lastEvent;
+  if (running) {
+    const now = Date.now();
+    if (now > lastEvent && now - lastEvent < 6 * 3600 * 1000) axisEnd = now;
+  }
+  const total = axisEnd - runStart > 0 ? axisEnd - runStart : 1;
+
   const byLeg = new Map();
   entries.forEach(([id, a]) => {
     const leg = a.leg || '?';
@@ -1672,11 +1727,36 @@ function renderActivity() {
     head.appendChild(modelChip(leg));
     head.appendChild(el('span', 'lane-count', `${done}/${calls.length} done` + (state.degraded.has(leg) ? ' · down' : '')));
     lane.appendChild(head);
-    const cells = el('div', 'lane-cells');
-    calls.forEach(([id, a]) => cells.appendChild(activityCell(id, a)));
-    lane.appendChild(cells);
+    // Greedy interval packing: concurrent calls in one leg stack into sub-rows so overlap is visible.
+    const packed = calls.map(([id, a]) => {
+      const s = spans.get(id);
+      return { id, a, start: isFinite(s.start) ? s.start : runStart, end: isFinite(s.end) ? s.end : axisEnd, span: s };
+    }).sort((p, q) => p.start - q.start);
+    const rowEnds = [];
+    packed.forEach((p) => {
+      let r = rowEnds.findIndex((e) => e <= p.start);
+      if (r < 0) { r = rowEnds.length; }
+      rowEnds[r] = p.end;
+      p.row = r;
+    });
+    const track = el('div', 'lane-track');
+    track.style.height = ((rowEnds.length || 1) * 24) + 'px';
+    packed.forEach((p) => track.appendChild(activityBar(p.id, p.a, p.span, runStart, axisEnd, total, p.row)));
+    lane.appendChild(track);
     lanes.appendChild(lane);
   });
+  const axis = el('div', 'lane-axis');
+  axis.appendChild(el('div'));
+  const axisTrack = el('div', 'axis-track');
+  const TICKS = 4;
+  for (let i = 0; i <= TICKS; i++) {
+    const frac = i / TICKS;
+    const tick = el('span', 'tick' + (i === 0 ? ' first' : i === TICKS ? ' last' : ''), fmtOffset(frac * total / 1000));
+    tick.style.left = (frac * 100) + '%';
+    axisTrack.appendChild(tick);
+  }
+  axis.appendChild(axisTrack);
+  lanes.appendChild(axis);
   list.appendChild(lanes);
 }
 
@@ -1792,7 +1872,8 @@ function handleEvent(f) {
       updateProgress({ done: f.done, total: f.total });
       break;
     case 'call_started':
-      activityUpsert(f.record_id, { leg: f.leg, task_type: f.task_type, task_id: f.task_id, state: 'running' });
+      activityUpsert(f.record_id, { leg: f.leg, task_type: f.task_type, task_id: f.task_id, state: 'running',
+        started_ts: f.ts ? Date.parse(f.ts) : Date.now() });
       break;
     case 'call_finished': {
       const skipped = Object.keys(f).some((k) => /skip/i.test(k) && f[k]);
@@ -1800,6 +1881,7 @@ function handleEvent(f) {
         leg: f.leg, task_type: f.task_type, task_id: f.task_id,
         state: skipped ? 'skipped' : (f.success ? 'ok' : (f.dropped_as_straggler ? 'killed' : 'fail')),
         latency: f.latency_sec, queue_wait: f.queue_wait_sec, skipped,
+        finished_ts: f.ts ? Date.parse(f.ts) : Date.now(),
       });
       break;
     }
