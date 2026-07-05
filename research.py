@@ -60,6 +60,9 @@ RAW_TIMEOUT_SEC = max(60, env_int("RESEARCH_MODEL_TIMEOUT_SEC", 900))
 URL_TIMEOUT_SEC = max(2, env_int("RESEARCH_URL_TIMEOUT_SEC", 12))
 MAX_PRIMARY_WORKERS = max(2, env_int("RESEARCH_MAX_PRIMARY_WORKERS", 6))
 MAX_VERIFY_WORKERS = max(2, env_int("RESEARCH_MAX_VERIFY_WORKERS", 8))
+# Small pool that warms the run URL cache concurrently with the still-running search calls, so the
+# batch verify hits a warm cache instead of starting all network I/O only after the slowest call.
+MAX_PREFETCH_WORKERS = max(1, env_int("RESEARCH_MAX_PREFETCH_WORKERS", 4))
 # A run with no heartbeat for longer than one full model call + slack is dead, not "running".
 STALE_AFTER_SEC = RAW_TIMEOUT_SEC + 600
 # Wall-clock budget guard. Each effort profile sets time_budget_sec (TOTAL run cap). Optional rounds
@@ -188,27 +191,35 @@ def clear_leg_budget(run_id: str) -> None:
         RUN_LEG_BUDGET.pop(run_id, None)
 
 
+def iter_jsonl_rows(path: object):
+    """Tolerant reader for our append-only JSONL logs (served-models / model-stats): yields one
+    parsed object per line, silently skipping blank and unparseable lines (a writer may be mid-append
+    or a line got truncated) and yielding nothing for a missing/unreadable file. Single reader shared
+    by every log scan so their corruption tolerance can never drift apart."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return
+
+
 def daily_call_counts(day: str | None = None) -> dict[str, int]:
     """Count successful leg calls logged today (UTC) in served-models.jsonl — the basis for
     quota-aware pacing. day defaults to today's UTC date (YYYY-MM-DD)."""
     day = day or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     counts: dict[str, int] = {}
-    try:
-        with SERVED_MODELS.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or day not in line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if str(row.get("ts", "")).startswith(day):
-                    leg = row.get("leg")
-                    if leg:
-                        counts[leg] = counts.get(leg, 0) + 1
-    except OSError:
-        pass
+    for row in iter_jsonl_rows(SERVED_MODELS):
+        if str(row.get("ts", "")).startswith(day):
+            leg = row.get("leg")
+            if leg:
+                counts[leg] = counts.get(leg, 0) + 1
     return counts
 
 
@@ -1178,7 +1189,28 @@ def dedupe_findings(findings: list[dict]) -> list[dict]:
 LIVE_PRICE_RE = re.compile(r'"price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?')
 LIVE_AD_STATUS_RE = re.compile(r'\\?"status\\?"\s*:\s*\\?"([a-z_]+)\\?"')
 LIVE_PRICE_TOLERANCE = 1.10
-BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+# One stable desktop UA for every verify/live-check fetch. NOT rotated: at our request volume a
+# rotating UA reads as MORE bot-like (and makes behavior nondeterministic across a run).
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+BROWSER_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+LIVE_BODY_CAP = 2_500_000
+# Anti-bot backoff: retry an anti-bot response (429, bot-wall 403, once for 503) a couple of times
+# with growing delay, so a protected portal's throttle is a soft "couldn't verify" (rescuable),
+# not a false disproof. Bounded so worst-case added latency per URL stays ~20s.
+BOT_BLOCK_MAX_RETRIES = 2
+BOT_BLOCK_BACKOFF = (2.0, 5.0)      # seconds before retry 1, retry 2
+BOT_BLOCK_RETRY_AFTER_CAP = 15.0    # honor a sane Retry-After, but never wait longer than this
+BOT_BLOCK_TOTAL_CAP = 18.0          # cumulative backoff budget per URL (keeps worst case bounded)
+BOT_WALL_TINY_BODY = 512            # a 403 with a body this small smells like a challenge stub
+BOT_WALL_MARKERS = ("cloudflare", "captcha", "cf-chl", "just a moment", "attention required",
+                    "checking your browser", "access denied", "are you a robot",
+                    "verify you are human", "px-captcha", "datadome",
+                    "please enable javascript and cookies")
 LDJSON_RE = re.compile(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
 OG_PRICE_RE = re.compile(r'<meta[^>]+(?:og:price:amount|product:price:amount)[^>]+content="([0-9][0-9.,\s]*)"', re.IGNORECASE)
 OG_CUR_RE = re.compile(r'<meta[^>]+(?:og:price:currency|product:price:currency)[^>]+content="([A-Za-z₴$€£]{1,4})"', re.IGNORECASE)
@@ -1204,18 +1236,215 @@ def _offer_from_ldjson(obj: object) -> tuple[float | None, str | None, str | Non
     return found_price, (str(found_cur) if found_cur else None), found_avail
 
 
-def live_listing_check(url: object, timeout: float | None = None) -> dict:
+class HostBlockRegistry:
+    """Run-scoped, thread-safe set of hosts that already returned a bot-wall this run. Once a host
+    has bot-walled, further URLs on it get a single polite attempt with no retries (don't hammer)."""
+
+    def __init__(self) -> None:
+        self._hosts: set[str] = set()
+        self._lock = threading.Lock()
+
+    def is_blocked(self, host: str) -> bool:
+        with self._lock:
+            return host in self._hosts
+
+    def mark(self, host: str) -> None:
+        with self._lock:
+            self._hosts.add(host)
+
+
+class _CacheFlight:
+    """One in-progress compute for a key: waiters block on `done`, then read `result` once."""
+    __slots__ = ("done", "result")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: dict | None = None
+
+
+class UrlCheckCache:
+    """Run-scoped, thread-safe memo of URL-check network I/O so the batch verify can hit a warm cache
+    that the concurrent prefetch (make_prefetch_collector) filled while the search calls were still
+    running. Two namespaces per NORMALIZED URL: 'verify' (verify_url results) and 'live'
+    (live_listing_check results).
+
+    ONLY definitive successes are retained (verify: result['ok']; live: the page fetch succeeded).
+    Transient failures — timeout, 503, bot_blocked, network errors, and even a 4xx — are NOT
+    retained, because a later rescue/coverage/frontier round must be free to re-fetch a URL that
+    failed once (retaining the failure would make such an item impossible to ever verify this run).
+
+    Single-flight per key: while one thread computes a key, concurrent waiters block and share that
+    flight's result exactly once (even a failure) instead of issuing duplicate fetches; a failure is
+    still not retained, so the NEXT lookup after the flight recomputes it. Unbounded on purpose: a
+    run sees at most a few hundred URLs."""
+
+    def __init__(self) -> None:
+        self._store: dict[tuple[str, str], dict] = {}
+        self._inflight: dict[tuple[str, str], _CacheFlight] = {}
+        self._guard = threading.Lock()
+
+    @staticmethod
+    def _retainable(result: object) -> bool:
+        # Both namespaces converge on ok==True as "definitive success worth keeping for the run".
+        return isinstance(result, dict) and result.get("ok") is True
+
+    def get_or_compute(self, namespace: str, url: object, compute) -> dict:
+        key = (namespace, normalize_url_for_key(url) or str(url))
+        while True:
+            with self._guard:
+                if key in self._store:
+                    return self._store[key]
+                flight = self._inflight.get(key)
+                if flight is None:
+                    flight = _CacheFlight()
+                    self._inflight[key] = flight
+                    leader = True
+                else:
+                    leader = False
+            if leader:
+                result = None
+                produced = False
+                try:
+                    result = compute()
+                    produced = True
+                finally:
+                    with self._guard:
+                        if produced and self._retainable(result):
+                            self._store[key] = result
+                        self._inflight.pop(key, None)
+                    flight.result = result if produced else None
+                    flight.done.set()
+                return result
+            # Waiter: share the in-flight leader's result once. A retained success is now in
+            # _store; a non-retained failure is read from the flight (and never cached), so any
+            # lookup that arrives AFTER this flight starts a fresh compute.
+            flight.done.wait()
+            with self._guard:
+                if key in self._store:
+                    return self._store[key]
+            if flight.result is not None:
+                return flight.result
+            # Leader raised before producing a result — retry as a fresh flight.
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
+    """Retry-After in seconds when the header is present and a sane non-negative number (capped);
+    None otherwise — the HTTP-date form is ignored and we fall back to fixed backoff."""
+    try:
+        raw = exc.headers.get("Retry-After") if getattr(exc, "headers", None) else None
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        secs = float(str(raw).strip())
+    except ValueError:
+        return None
+    if not (secs >= 0):  # rejects negatives AND nan (nan >= 0 is False) in one shot
+        return None
+    return min(secs, BOT_BLOCK_RETRY_AFTER_CAP)
+
+
+def _smells_like_bot_wall(exc: urllib.error.HTTPError) -> bool:
+    """A 403 that is a genuine anti-bot CHALLENGE, not an ordinary authorization denial. Cloudflare
+    (and other CDNs) front EVERY response on a proxied site, so `Server: cloudflare` / cf-ray alone
+    is NOT evidence — origin 403s carry them too, and treating every CF-fronted 403 as a wall burns
+    retries and wrongly blocks the whole host. We require POSITIVE challenge signal: a
+    `cf-mitigated: challenge` header, a challenge marker in the body, or a tiny body TOGETHER WITH a
+    CDN edge marker (cloudflare / cf-ray). A plain CF-proxied 403 with a normal body is a real 403."""
+    try:
+        headers = getattr(exc, "headers", None)
+        cf_mitigated = edge_marker = False
+        if headers is not None:
+            server = str(headers.get("Server") or "").lower()
+            cf_mitigated = "challenge" in str(headers.get("cf-mitigated") or "").lower()
+            edge_marker = "cloudflare" in server or bool(headers.get("cf-ray"))
+        if cf_mitigated:
+            return True
+        body = exc.read(BOT_WALL_TINY_BODY * 4) if hasattr(exc, "read") else b""
+    except Exception:
+        return False
+    text = body.decode("utf-8", errors="replace").lower()
+    if any(marker in text for marker in BOT_WALL_MARKERS):
+        return True
+    return edge_marker and 0 < len(body) <= BOT_WALL_TINY_BODY
+
+
+def http_fetch(url: object, method: str = "GET", timeout: float = URL_TIMEOUT_SEC,
+               read_body: bool = False, retry: bool = True,
+               host_registry: HostBlockRegistry | None = None) -> dict:
+    """Single fetch path for verify/live-check: realistic browser headers + bounded anti-bot
+    backoff. Returns {ok, status, body, reason, bot_blocked}. Retries only anti-bot responses
+    (429, bot-wall 403, and once for 503); 404/other 4xx-5xx are real signals and pass straight
+    through. When a host already bot-walled this run it gets one attempt with no retries."""
+    host = urllib.parse.urlsplit(str(url)).netloc.lower()
+    def throttled() -> bool:
+        # Re-read per attempt, not once up front: a concurrent fetch may bot-wall this host
+        # mid-flight, and once it does we must stop spending our retry budget immediately.
+        return bool(retry and host_registry and host and host_registry.is_blocked(host))
+    slept = 0.0
+    retries_used = 0
+    while True:
+        request = urllib.request.Request(str(url), headers=BROWSER_HEADERS, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                body = response.read(LIVE_BODY_CAP).decode("utf-8", errors="replace") if read_body else None
+                ok = 200 <= status < 400
+                return {"ok": ok, "status": status, "body": body, "bot_blocked": False,
+                        "reason": "ok" if ok else f"http_{status}"}
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            wall = status == 429 or (status == 403 and _smells_like_bot_wall(exc))
+            if throttled() or not retry:
+                allowed = 0
+            elif wall:
+                allowed = BOT_BLOCK_MAX_RETRIES
+            elif status == 503:  # often an anti-bot / warm-up gate — give it one shot, not a full retry budget
+                allowed = 1
+            else:
+                allowed = 0
+            if retries_used < allowed and slept < BOT_BLOCK_TOTAL_CAP:
+                delay = _retry_after_seconds(exc)
+                if delay is None:
+                    delay = BOT_BLOCK_BACKOFF[min(retries_used, len(BOT_BLOCK_BACKOFF) - 1)]
+                delay = min(delay, BOT_BLOCK_TOTAL_CAP - slept)
+                if delay > 0:
+                    time.sleep(delay)
+                slept += delay
+                retries_used += 1
+                continue
+            if wall:
+                if host_registry and host:
+                    host_registry.mark(host)
+                return {"ok": False, "status": status, "body": None, "bot_blocked": True, "reason": "bot_blocked"}
+            return {"ok": False, "status": status, "body": None, "bot_blocked": False, "reason": f"http_{status}"}
+        except urllib.error.URLError as exc:
+            reason = exc.reason.__class__.__name__ if not isinstance(exc.reason, str) else exc.reason
+            return {"ok": False, "status": None, "body": None, "bot_blocked": False, "reason": reason}
+        except TimeoutError:
+            return {"ok": False, "status": None, "body": None, "bot_blocked": False, "reason": "timeout"}
+        except Exception as exc:
+            return {"ok": False, "status": None, "body": None, "bot_blocked": False, "reason": exc.__class__.__name__}
+
+
+def live_listing_check(url: object, timeout: float | None = None,
+                       host_registry: HostBlockRegistry | None = None,
+                       cache: UrlCheckCache | None = None) -> dict:
     """Adapter chain for live page facts: OLX embedded state → JSON-LD Offer → OpenGraph meta →
     generic price regex. Returns price, native currency, ad status, and the page <title>."""
+    if cache is not None:
+        return cache.get_or_compute(
+            "live", url, lambda: live_listing_check(url, timeout=timeout, host_registry=host_registry))
     result: dict = {"ok": False, "live_price": None, "live_currency": None, "ad_status": None,
                     "page_title": None, "live_variants": {}, "reason": None}
-    request = urllib.request.Request(str(url), headers={"User-Agent": BROWSER_UA})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout or URL_TIMEOUT_SEC * 2) as response:
-            html_body = response.read(2_500_000).decode("utf-8", errors="replace")
-    except Exception as exc:
-        result["reason"] = exc.__class__.__name__
+    fetched = http_fetch(url, method="GET", timeout=timeout or URL_TIMEOUT_SEC * 2,
+                         read_body=True, retry=True, host_registry=host_registry)
+    if not fetched["ok"]:
+        result["reason"] = fetched["reason"]
+        result["bot_blocked"] = fetched.get("bot_blocked", False)
         return result
+    html_body = fetched["body"] or ""
     result["ok"] = True
 
     title_match = TITLE_RE.search(html_body)
@@ -1259,7 +1488,9 @@ def live_listing_check(url: object, timeout: float | None = None) -> dict:
     return result
 
 
-def apply_live_check(item: dict, intent: dict | None = None) -> None:
+def apply_live_check(item: dict, intent: dict | None = None,
+                     host_registry: HostBlockRegistry | None = None,
+                     cache: UrlCheckCache | None = None) -> None:
     """Mutates a finding after its page was read: inactive ads get flagged for rejection,
     live price (compared in USD) overrides the model's claim, audit trail kept in
     price_candidates. Only runs for URLs with a known marketplace listing key.
@@ -1269,7 +1500,7 @@ def apply_live_check(item: dict, intent: dict | None = None) -> None:
     'cheap Pro masquerading as Max 5x' failure."""
     if not listing_key(item.get("url")):
         return
-    live = live_listing_check(item.get("url"))
+    live = live_listing_check(item.get("url"), host_registry=host_registry, cache=cache)
     item["live_check"] = live
     if not live["ok"]:
         return
@@ -1311,40 +1542,30 @@ def apply_live_check(item: dict, intent: dict | None = None) -> None:
     item["disputed"] = False  # resolved by verified fact, not by vote
 
 
-def verify_url(url: object, timeout: float = URL_TIMEOUT_SEC) -> dict:
+def verify_url(url: object, timeout: float = URL_TIMEOUT_SEC,
+               host_registry: HostBlockRegistry | None = None,
+               cache: UrlCheckCache | None = None) -> dict:
     if not url:
         return {"ok": False, "reason": "missing_url", "status": None}
     parsed = urllib.parse.urlsplit(str(url))
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return {"ok": False, "reason": "invalid_url", "status": None}
+    # Cache only the network result (the two cheap early rejections above stay uncached and free).
+    if cache is not None:
+        return cache.get_or_compute(
+            "verify", url, lambda: verify_url(url, timeout=timeout, host_registry=host_registry))
 
-    headers = {"User-Agent": "multi-model-research/1.0"}
-    methods = ("HEAD", "GET")
-    last_reason = "url_unverified"
-    last_status = None
-
-    for method in methods:
-        request = urllib.request.Request(str(url), headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status = getattr(response, "status", response.getcode())
-                if 200 <= int(status) < 400:
-                    return {"ok": True, "reason": "ok", "status": int(status), "method": method}
-                last_reason = f"http_{status}"
-                last_status = int(status)
-        except urllib.error.HTTPError as exc:
-            last_status = exc.code
-            last_reason = f"http_{exc.code}"
-            if exc.code in {405, 403, 429} and method == "HEAD":
-                continue
-        except urllib.error.URLError as exc:
-            last_reason = exc.reason.__class__.__name__ if not isinstance(exc.reason, str) else exc.reason
-        except TimeoutError:
-            last_reason = "timeout"
-        except Exception as exc:
-            last_reason = exc.__class__.__name__
-
-    return {"ok": False, "reason": last_reason, "status": last_status}
+    # HEAD is a cheap liveness probe; many hosts 405/403/429 it, so a failed HEAD just falls through
+    # to GET, which carries the anti-bot retry + per-host politeness (the HEAD probe never retries
+    # and never marks the host, so it can't pre-throttle the real GET).
+    head = http_fetch(url, method="HEAD", timeout=timeout, retry=False, host_registry=None)
+    if head["ok"]:
+        return {"ok": True, "reason": "ok", "status": head["status"], "method": "HEAD"}
+    get = http_fetch(url, method="GET", timeout=timeout, retry=True, host_registry=host_registry)
+    if get["ok"]:
+        return {"ok": True, "reason": "ok", "status": get["status"], "method": "GET"}
+    return {"ok": False, "reason": get["reason"], "status": get["status"],
+            "method": "GET", "bot_blocked": get.get("bot_blocked", False)}
 
 
 def rejection_reasons(finding: dict, url_check: dict | None = None, sites: list[str] | None = None,
@@ -1456,7 +1677,12 @@ def verify_findings(
     stage: str | None = None,
     emitted: dict | None = None,
     excluded_sites: list[str] | None = None,
+    host_registry: HostBlockRegistry | None = None,
+    cache: UrlCheckCache | None = None,
 ) -> tuple[list[dict], list[dict]]:
+    # Fresh per call if the caller didn't share one; execute_research shares it across all rounds
+    # so a host that bot-walled in the primary stays throttled through rescue/frontier too.
+    host_registry = host_registry or HostBlockRegistry()
     unique = dedupe_findings(findings)
     verified: list[dict] = []
     rejected: list[dict] = list(parse_rejections or [])
@@ -1486,9 +1712,9 @@ def verify_findings(
         # A user-blocked domain is rejected regardless of liveness — skip the network round-trip.
         if excluded_sites and item.get("url") and url_in_sites(item.get("url"), excluded_sites):
             return item, {"ok": False, "reason": "excluded_site"}
-        url_check = verify_url(item.get("url"))
+        url_check = verify_url(item.get("url"), host_registry=host_registry, cache=cache)
         if url_check.get("ok"):
-            apply_live_check(item, intent)
+            apply_live_check(item, intent, host_registry=host_registry, cache=cache)
         return item, url_check
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_VERIFY_WORKERS, max(1, len(unique)))) as executor:
@@ -2352,20 +2578,26 @@ def apply_confidence(verified: list[dict]) -> None:
 
 
 def run_frontier_round(prompt: str, ceiling_usd: float, run_dir: Path, config: dict, intent: dict | None, round_no: int,
-                       known_urls: list[str] | None = None, timeout_cap: int | None = None) -> list[dict]:
+                       known_urls: list[str] | None = None, timeout_cap: int | None = None,
+                       host_registry: HostBlockRegistry | None = None,
+                       url_cache: UrlCheckCache | None = None) -> list[dict]:
     """One frontier sweep: each search leg hunts strictly below the ceiling."""
     search_legs = config.get("search_legs") or ["codex", "gemini"]
     fp = build_frontier_prompt(prompt, ceiling_usd, config.get("sites") or [], intent, config.get("excluded_sites"), known_urls)
     timeout = min(RAW_TIMEOUT_SEC, config["search_timeout_sec"])
     if timeout_cap is not None:
         timeout = min(timeout, timeout_cap)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(search_legs))) as executor:
-        futures = [
-            executor.submit(call_model, leg, fp, run_dir, "frontier", f"frontier-{round_no}",
-                            timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
-            for leg in search_legs
-        ]
-        return collect_with_straggler_drop(futures, run_dir, config)
+    on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(search_legs))) as executor:
+            futures = [
+                executor.submit(call_model, leg, fp, run_dir, "frontier", f"frontier-{round_no}",
+                                timeout, config["search_effort"], config.get("claude_search_model") if leg == "claude" else None)
+                for leg in search_legs
+            ]
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+    finally:
+        prefetch_shutdown()
 
 
 def covered_source_classes(verified: list[dict], tasks: list[dict]) -> set[str]:
@@ -2440,7 +2672,9 @@ Schema:
 
 def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: list[str],
                        run_dir: Path, config: dict, intent: dict | None, timeout_cap: int | None = None,
-                       gap_queries: list[dict] | None = None) -> list[dict]:
+                       gap_queries: list[dict] | None = None,
+                       host_registry: HostBlockRegistry | None = None,
+                       url_cache: UrlCheckCache | None = None) -> list[dict]:
     """One coverage sweep, round-robin across legs (negative-space exploration — cross-check still
     happens at verify, so no need for all legs). Fires two kinds of job IN THE SAME executor batch:
     one per empty source-CLASS, plus one per semantic GAP query the auditor flagged. No serial phase."""
@@ -2460,15 +2694,19 @@ def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: lis
             jobs.append(("gap", query, build_gap_search_prompt(prompt, query, avoid_hosts, run_sites, intent, excluded)))
     if not jobs:
         return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
-        futures = [
-            executor.submit(call_model, search_legs[i % len(search_legs)], built_prompt,
-                            run_dir, "coverage", f"{kind}-{key}",
-                            timeout, config["search_effort"],
-                            config.get("claude_search_model") if search_legs[i % len(search_legs)] == "claude" else None)
-            for i, (kind, key, built_prompt) in enumerate(jobs)
-        ]
-        return collect_with_straggler_drop(futures, run_dir, config)
+    on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
+            futures = [
+                executor.submit(call_model, search_legs[i % len(search_legs)], built_prompt,
+                                run_dir, "coverage", f"{kind}-{key}",
+                                timeout, config["search_effort"],
+                                config.get("claude_search_model") if search_legs[i % len(search_legs)] == "claude" else None)
+                for i, (kind, key, built_prompt) in enumerate(jobs)
+            ]
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+    finally:
+        prefetch_shutdown()
 
 
 def build_recheck_prompt(user_prompt: str, rejected_item: dict, config: dict,
@@ -3284,6 +3522,34 @@ def gap_audit(prompt: str, intent: dict, verified: list[dict], host_dist: dict[s
     return gaps
 
 
+def _parse_record_findings(record: dict) -> list[dict]:
+    """extract_json + coerce_findings for one SUCCESSFUL record's stdout. Raises ValueError on a bad
+    payload (parse_model_records turns that into a parse rejection). Single source of the per-record
+    parse so the prefetch warmer and the batch parser can never diverge."""
+    payload = extract_json(record.get("stdout") or "")
+    return coerce_findings(payload, record["leg"], record["task_id"], record["record_id"])
+
+
+def findings_from_record(record: dict) -> list[dict]:
+    """Best-effort findings for the prefetch path: [] for a failed call or unparseable payload
+    (the batch parse_model_records still records those as parse rejections). A successful parse is
+    memoized on the record under `_parsed_findings` so the later parse_model_records batch reuses it
+    instead of parsing the same stdout a second time. The key is private (underscored) and stripped
+    from any serialized copy (see parse_model_records) so it never leaks into JSON artifacts.
+    A ValueError is NOT memoized, so parse_model_records still sees the failure and rejects it."""
+    if not record.get("success"):
+        return []
+    cached = record.get("_parsed_findings")
+    if cached is not None:
+        return cached
+    try:
+        parsed = _parse_record_findings(record)
+    except ValueError:
+        return []
+    record["_parsed_findings"] = parsed
+    return parsed
+
+
 def parse_model_records(records: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     findings: list[dict] = []
     parse_rejections: list[dict] = []
@@ -3291,6 +3557,7 @@ def parse_model_records(records: list[dict]) -> tuple[list[dict], list[dict], li
 
     for record in records:
         parsed = dict(record)
+        parsed.pop("_parsed_findings", None)  # private parse memo — never persist it (write_model_stats)
         parsed["parse_failed"] = False
         parsed["finding_count"] = 0
         parsed["no_sources"] = True
@@ -3312,23 +3579,28 @@ def parse_model_records(records: list[dict]) -> tuple[list[dict], list[dict], li
             parsed_records.append(parsed)
             continue
 
-        try:
-            payload = extract_json(record.get("stdout") or "")
-            record_findings = coerce_findings(payload, record["leg"], record["task_id"], record["record_id"])
-        except ValueError as exc:
-            parsed["parse_failed"] = True
-            parsed["parse_error"] = str(exc)
-            record_findings = []
-            parse_rejections.append(
-                {
-                    "parse_failed": True,
-                    "source_model": record.get("leg"),
-                    "task_id": record.get("task_id"),
-                    "record_id": record.get("record_id"),
-                    "reasons": ["parse_failed"],
-                    "raw_file": record.get("stdout_file"),
-                }
-            )
+        cached = record.get("_parsed_findings")  # warmed by findings_from_record during prefetch
+        if cached is not None:
+            record_findings = cached
+        else:
+            try:
+                record_findings = _parse_record_findings(record)
+            except ValueError as exc:
+                parsed["parse_failed"] = True
+                parsed["parse_error"] = str(exc)
+                record_findings = []
+                parse_rejections.append(
+                    {
+                        "parse_failed": True,
+                        "source_model": record.get("leg"),
+                        "task_id": record.get("task_id"),
+                        "record_id": record.get("record_id"),
+                        "reasons": ["parse_failed"],
+                        "raw_file": record.get("stdout_file"),
+                    }
+                )
+            else:
+                record["_parsed_findings"] = record_findings
 
         parsed["finding_count"] = len(record_findings)
         parsed["no_sources"] = not record_findings or all(not item.get("url") for item in record_findings)
@@ -3363,9 +3635,13 @@ def write_model_stats(run_id: str, records: list[dict], rejected: list[dict]) ->
         )
 
 
-def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> list[dict]:
+def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
+                                on_record: object = None) -> list[dict]:
     """Collect fan-out results; once STRAGGLER_QUORUM of calls are in, give the rest a bounded
-    grace window, then kill them. Killed calls return as failures and flow into rescue."""
+    grace window, then kill them. Killed calls return as failures and flow into rescue. `on_record`
+    (optional) fires for each record the moment its future completes — used to prefetch that
+    record's finding URLs into the run URL cache while the slower calls are still running. It runs on
+    the collecting thread and must never block or raise (failures are swallowed here)."""
     records: list[dict] = []
     latencies: list[float] = []
     deadline: float | None = None
@@ -3379,6 +3655,11 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
             record = future.result()
             records.append(record)
             latencies.append(record.get("latency_sec") or 0.0)
+            if on_record is not None:
+                try:
+                    on_record(record)
+                except Exception:
+                    pass
             update_run(run_dir, progress={"done": len(records), "total": len(futures)})
         if not pending:
             break
@@ -3395,6 +3676,47 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict) -> l
             # bounded to the grace window instead of stretching to the full phase timeout.
             deadline = time.monotonic() + max(1.0, config["straggler_grace_sec"])
     return records
+
+
+def prefetch_url(url: object, host_registry: HostBlockRegistry, cache: UrlCheckCache) -> None:
+    """Warm the run URL cache for one finding URL exactly as the batch verify would touch it:
+    verify_url, then live_listing_check only when reachable AND a marketplace listing (mirrors
+    check_one / apply_live_check). All failures swallowed — the batch path redoes/reads the cached
+    result per normal semantics; this only changes timing, never outcomes."""
+    try:
+        check = verify_url(url, host_registry=host_registry, cache=cache)
+        if check.get("ok") and listing_key(url):
+            live_listing_check(url, host_registry=host_registry, cache=cache)
+    except Exception:
+        pass
+
+
+def make_prefetch_collector(config: dict, host_registry: HostBlockRegistry | None,
+                            cache: UrlCheckCache | None) -> tuple[object, object]:
+    """Build (on_record, shutdown) for collect_with_straggler_drop's prefetch. on_record parses a
+    just-completed record's findings and submits each URL to a small pool that warms the shared URL
+    cache while slower calls still run. shutdown() is non-blocking (wait=False) AND drops the queued
+    backlog (cancel_futures=True): in-flight prefetches only populate a cache, so on phase end / run
+    cancel the queue must be abandoned rather than keep fetching for minutes (a cancelled server) or
+    wedging interpreter exit on non-daemon join (one-shot CLI). Already-running fetches finish
+    naturally (they are bounded). Returns (None, no-op) when prefetch isn't wired, leaving
+    collect_with_straggler_drop's original behaviour."""
+    if host_registry is None or cache is None:
+        return None, (lambda: None)
+    excluded = config.get("excluded_sites") or []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PREFETCH_WORKERS)
+
+    def on_record(record: dict) -> None:
+        for finding in findings_from_record(record):
+            url = finding.get("url")
+            if not url or (excluded and url_in_sites(url, excluded)):
+                continue
+            try:
+                executor.submit(prefetch_url, url, host_registry, cache)
+            except RuntimeError:
+                return  # pool already shut down for this phase; stop submitting
+
+    return on_record, (lambda: executor.shutdown(wait=False, cancel_futures=True))
 
 
 def task_query_set(task: dict, n: int, n_angle: int = 0) -> list[dict]:
@@ -3426,7 +3748,9 @@ def task_query_set(task: dict, n: int, n_angle: int = 0) -> list[dict]:
 
 
 def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: dict,
-                       extra_tasks_supplier: object = None, extra_tasks_sink: list | None = None) -> list[dict]:
+                       extra_tasks_supplier: object = None, extra_tasks_sink: list | None = None,
+                       host_registry: HostBlockRegistry | None = None,
+                       url_cache: UrlCheckCache | None = None) -> list[dict]:
     # All three families search in parallel at every level. Claude searches at the per-profile
     # claude_search_model tier (opus) under its own tight concurrency + per-run budget, so the
     # capped daily pool isn't drained (paced_budget trims it, drop-from-search removes Claude when
@@ -3476,21 +3800,25 @@ def run_primary_search(prompt: str, tasks: list[dict], run_dir: Path, config: di
     # out whenever the base fan-out already saturates the cap, leaving late audit jobs queued behind.
     reserve = 2 * len(search_legs) if extra_tasks_supplier is not None else 0
     workers = max(1, min(len(jobs) + reserve, MAX_PRIMARY_WORKERS + reserve))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = submit(executor, jobs)
-        # Concurrent plan auditor: the initial jobs are already running, so a BOUNDED wait for the
-        # audit costs ~0 extra wall-clock (searches progress meanwhile). collect_with_straggler_drop
-        # fixes its totals/quorum at call time, so we submit the late jobs BEFORE collecting.
-        if extra_tasks_supplier is not None:
-            extra_tasks = wait_for_extra_tasks(extra_tasks_supplier, timeout)
-            if extra_tasks:
-                futures += submit(executor, make_jobs(extra_tasks, 1, 0))
-                if extra_tasks_sink is not None:
-                    # Only the tasks that were actually SEARCHED — a late audit that missed the
-                    # bounded wait yields nothing here, so the coverage grid / tasks.json never lists
-                    # a source_class that was never queried.
-                    extra_tasks_sink.extend(extra_tasks)
-        return collect_with_straggler_drop(futures, run_dir, config)
+    on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = submit(executor, jobs)
+            # Concurrent plan auditor: the initial jobs are already running, so a BOUNDED wait for the
+            # audit costs ~0 extra wall-clock (searches progress meanwhile). collect_with_straggler_drop
+            # fixes its totals/quorum at call time, so we submit the late jobs BEFORE collecting.
+            if extra_tasks_supplier is not None:
+                extra_tasks = wait_for_extra_tasks(extra_tasks_supplier, timeout)
+                if extra_tasks:
+                    futures += submit(executor, make_jobs(extra_tasks, 1, 0))
+                    if extra_tasks_sink is not None:
+                        # Only the tasks that were actually SEARCHED — a late audit that missed the
+                        # bounded wait yields nothing here, so the coverage grid / tasks.json never lists
+                        # a source_class that was never queried.
+                        extra_tasks_sink.extend(extra_tasks)
+            return collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+    finally:
+        prefetch_shutdown()
 
 
 def wait_for_extra_tasks(supplier: object, search_timeout: int) -> list[dict]:
@@ -3513,6 +3841,8 @@ def run_rechecks(
     attempts: dict[str, set[str]],
     known_urls: list[str] | None = None,
     timeout_cap: int | None = None,
+    host_registry: HostBlockRegistry | None = None,
+    url_cache: UrlCheckCache | None = None,
 ) -> tuple[list[dict], int]:
     """Rescue pass for rejected/disputed items. `attempts` maps canonical item key -> legs that
     already tried it, so each round can hand the item to a model that has NOT tried yet (the
@@ -3552,22 +3882,26 @@ def run_rechecks(
     timeout = min(RAW_TIMEOUT_SEC, config["recheck_timeout_sec"])
     if timeout_cap is not None:
         timeout = min(timeout, timeout_cap)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
-        futures = [
-            executor.submit(
-                call_model,
-                leg,
-                build_recheck_prompt(prompt, item, config, known_urls_minus_item(known_urls, item)),
-                run_dir,
-                "recheck",
-                task_id,
-                timeout,
-                config["search_effort"],
-                config.get("claude_search_model") if leg == "claude" else None,
-            )
-            for leg, item, task_id in jobs
-        ]
-        records = collect_with_straggler_drop(futures, run_dir, config)
+    on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+            futures = [
+                executor.submit(
+                    call_model,
+                    leg,
+                    build_recheck_prompt(prompt, item, config, known_urls_minus_item(known_urls, item)),
+                    run_dir,
+                    "recheck",
+                    task_id,
+                    timeout,
+                    config["search_effort"],
+                    config.get("claude_search_model") if leg == "claude" else None,
+                )
+                for leg, item, task_id in jobs
+            ]
+            records = collect_with_straggler_drop(futures, run_dir, config, on_record=on_record)
+    finally:
+        prefetch_shutdown()
     return records, dropped
 
 
@@ -3908,6 +4242,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
     rejected: list[dict] = []
     gap_queries: list[dict] = []  # semantic-gap follow-up queries, filled after the recheck loop
     emitted_findings: dict = {}  # shared across rounds so a finding streams once (not every re-verify)
+    host_blocks = HostBlockRegistry()  # shared across rounds: a bot-walled host stays throttled all run
+    url_cache = UrlCheckCache()  # shared across rounds: search-phase prefetch warms it for the batch verify
     ACTIVE_RUNS.add(run_id)
     init_leg_health(run_id)
     set_user_disabled(run_id, config.get("disabled_legs") or [])
@@ -4006,7 +4342,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         audit_added: list[dict] = []
         primary_records = run_primary_search(prompt, tasks, run_dir, config,
                                              extra_tasks_supplier=audit_future,
-                                             extra_tasks_sink=audit_added)
+                                             extra_tasks_sink=audit_added,
+                                             host_registry=host_blocks, url_cache=url_cache)
         if audit_added:
             tasks = tasks + audit_added
             write_json(run_dir / "tasks.json", {"tasks": tasks, "intent": intent})
@@ -4016,7 +4353,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
         check_cancel()
 
         update_run(run_dir, phase="verifying", progress=None)
-        verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="primary", emitted=emitted_findings)
+        verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="primary", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
         record_stage_results(run_dir, "primary", verified, rejected)
         check_cancel()
 
@@ -4047,7 +4384,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             cap = clamp_round_timeout(config["recheck_timeout_sec"], started, config) if round_no > 1 else None
             known = [v.get("url") for v in verified if v.get("url")]
             recheck_records, dropped = run_rechecks(prompt, rejected + disputed, run_dir, config, round_no,
-                                                    rescue_attempts, known_urls=known, timeout_cap=cap)
+                                                    rescue_attempts, known_urls=known, timeout_cap=cap,
+                                                    host_registry=host_blocks, url_cache=url_cache)
             recheck_dropped += dropped
             if not recheck_records:
                 break
@@ -4055,7 +4393,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             all_parsed_records.extend(recheck_parsed)
             findings = findings + recheck_findings
             parse_rejections = parse_rejections + recheck_parse_rejections
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"rescue {round_no}", emitted=emitted_findings)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"rescue {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
             record_stage_results(run_dir, f"rescue {round_no}", verified, rejected)
             check_cancel()
         if recheck_dropped:
@@ -4090,7 +4428,8 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             avoid_hosts = [h for h, _ in sorted(host_distribution(verified).items(), key=lambda kv: -kv[1])[:3]]
             cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
             coverage_records = run_coverage_round(prompt, missing, avoid_hosts, run_dir, config, intent,
-                                                  timeout_cap=cap, gap_queries=round_gaps)
+                                                  timeout_cap=cap, gap_queries=round_gaps,
+                                                  host_registry=host_blocks, url_cache=url_cache)
             if not coverage_records:
                 break
             c_findings, c_parse_rej, c_parsed = parse_model_records(coverage_records)
@@ -4098,7 +4437,7 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             findings = findings + c_findings
             parse_rejections = parse_rejections + c_parse_rej
             prev_keys = {dedupe_key(v) for v in verified}
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"coverage {round_no}", emitted=emitted_findings)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"coverage {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
             record_stage_results(run_dir, f"coverage {round_no}", verified, rejected)
             check_cancel()
             if not ({dedupe_key(v) for v in verified} - prev_keys):  # novelty-exhausted: stop
@@ -4112,13 +4451,14 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             avoid_hosts = [h for h, _ in sorted(host_distribution(verified).items(), key=lambda kv: -kv[1])[:3]]
             cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
             gap_records = run_coverage_round(prompt, [], avoid_hosts, run_dir, config, intent,
-                                             timeout_cap=cap, gap_queries=gap_queries)
+                                             timeout_cap=cap, gap_queries=gap_queries,
+                                             host_registry=host_blocks, url_cache=url_cache)
             if gap_records:
                 g_findings, g_parse_rej, g_parsed = parse_model_records(gap_records)
                 all_parsed_records.extend(g_parsed)
                 findings = findings + g_findings
                 parse_rejections = parse_rejections + g_parse_rej
-                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="gap", emitted=emitted_findings)
+                verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage="gap", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
                 record_stage_results(run_dir, "gap", verified, rejected)
                 check_cancel()
 
@@ -4135,14 +4475,15 @@ def execute_research(run_dir: Path, prompt: str, config: dict) -> None:
             cap = clamp_round_timeout(config["search_timeout_sec"], started, config)
             known = [v.get("url") for v in verified if v.get("url")]
             frontier_records = run_frontier_round(prompt, ceiling, run_dir, config, intent, round_no,
-                                                  known_urls=known, timeout_cap=cap)
+                                                  known_urls=known, timeout_cap=cap,
+                                                  host_registry=host_blocks, url_cache=url_cache)
             if not frontier_records:
                 break
             f_findings, f_parse_rej, f_parsed = parse_model_records(frontier_records)
             all_parsed_records.extend(f_parsed)
             findings = findings + f_findings
             parse_rejections = parse_rejections + f_parse_rej
-            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"frontier {round_no}", emitted=emitted_findings)
+            verified, rejected = verify_findings(findings, parse_rejections, sites, intent, run_dir=run_dir, excluded_sites=excluded, stage=f"frontier {round_no}", emitted=emitted_findings, host_registry=host_blocks, cache=url_cache)
             record_stage_results(run_dir, f"frontier {round_no}", verified, rejected)
             new_floor = credible_floor_usd(verified)
             check_cancel()
@@ -4328,50 +4669,29 @@ def build_scoreboard() -> dict:
             "rejected_total": 0, "latency_sum": 0.0, "latency_n": 0,
         })
 
-    try:
-        with MODEL_STATS.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                leg = row.get("leg")
-                if not leg:
-                    continue
-                s = slot(leg)
-                s["calls"] += 1
-                s["success"] += 1 if row.get("success") else 0
-                s["parse_failed"] += 1 if row.get("parse_failed") else 0
-                s["no_sources"] += 1 if row.get("no_sources") else 0
-                s["rejected_total"] += int(row.get("rejected_count") or 0)
-                lat = row.get("latency_sec")
-                if isinstance(lat, (int, float)):
-                    s["latency_sum"] += lat
-                    s["latency_n"] += 1
-    except OSError:
-        pass
+    for row in iter_jsonl_rows(MODEL_STATS):
+        leg = row.get("leg")
+        if not leg:
+            continue
+        s = slot(leg)
+        s["calls"] += 1
+        s["success"] += 1 if row.get("success") else 0
+        s["parse_failed"] += 1 if row.get("parse_failed") else 0
+        s["no_sources"] += 1 if row.get("no_sources") else 0
+        s["rejected_total"] += int(row.get("rejected_count") or 0)
+        lat = row.get("latency_sec")
+        if isinstance(lat, (int, float)):
+            s["latency_sum"] += lat
+            s["latency_n"] += 1
 
     today = daily_call_counts()
     weak_today: dict[str, int] = {}
     day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    try:
-        with SERVED_MODELS.open("r", encoding="utf-8") as f:
-            for line in f:
-                if day not in line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if str(row.get("ts", "")).startswith(day) and (row.get("weak_tier") or str(row.get("served", "")).upper() in {"QUOTA_EXHAUSTED", "FAILED"}):
-                    leg = row.get("leg")
-                    if leg:
-                        weak_today[leg] = weak_today.get(leg, 0) + 1
-    except OSError:
-        pass
+    for row in iter_jsonl_rows(SERVED_MODELS):
+        if str(row.get("ts", "")).startswith(day) and (row.get("weak_tier") or str(row.get("served", "")).upper() in {"QUOTA_EXHAUSTED", "FAILED"}):
+            leg = row.get("leg")
+            if leg:
+                weak_today[leg] = weak_today.get(leg, 0) + 1
 
     legs = []
     for leg in sorted(set(agg) | set(today) | set(DAILY_CAPS)):
@@ -4393,6 +4713,73 @@ def build_scoreboard() -> dict:
             "weak_or_quota_today": weak_today.get(leg, 0),
         })
     return {"legs": legs, "generated_at": utc_now()}
+
+
+def scoreboard_history(days: int = 14, today: str | None = None) -> dict:
+    """Per UTC-day x per-leg health history for the scoreboard (read-only, no side effects).
+    Buckets model-stats.jsonl (quality rows: calls / success / latency) and served-models.jsonl
+    (served-call counts + weak/quota events) by UTC day, returning the last `days` days up to
+    `today` (defaults to now UTC), oldest-first and DENSE (one point per day per leg, zero-filled).
+    Bounded scan: each append-only file is read once and filtered to the date window."""
+    days = max(1, days)
+    today = today or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    end = dt.datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+    day_list = [(end - dt.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
+    window = set(day_list)
+
+    agg: dict[tuple[str, str], dict] = {}
+
+    def slot(day: str, leg: str) -> dict:
+        return agg.setdefault((day, leg), {
+            "calls": 0, "success": 0, "latency_sum": 0.0, "latency_n": 0,
+            "served_calls": 0, "weak_or_quota": 0,
+        })
+
+    for row in iter_jsonl_rows(MODEL_STATS):
+        day = str(row.get("ts", ""))[:10]
+        leg = row.get("leg")
+        if day not in window or not leg:
+            continue
+        s = slot(day, leg)
+        s["calls"] += 1
+        s["success"] += 1 if row.get("success") else 0
+        lat = row.get("latency_sec")
+        if isinstance(lat, (int, float)):
+            s["latency_sum"] += lat
+            s["latency_n"] += 1
+
+    for row in iter_jsonl_rows(SERVED_MODELS):
+        day = str(row.get("ts", ""))[:10]
+        leg = row.get("leg")
+        if day not in window or not leg:
+            continue
+        s = slot(day, leg)
+        s["served_calls"] += 1
+        if row.get("weak_tier") or str(row.get("served", "")).upper() in {"QUOTA_EXHAUSTED", "FAILED"}:
+            s["weak_or_quota"] += 1
+
+    series = []
+    for leg in sorted({leg for (_, leg) in agg}):
+        points = []
+        for day in day_list:
+            s = agg.get((day, leg))
+            if s:
+                calls = s["calls"]
+                points.append({
+                    "day": day,
+                    "calls": calls,
+                    "success_rate": round(s["success"] / calls, 3) if calls else None,
+                    "avg_latency_sec": round(s["latency_sum"] / s["latency_n"], 1) if s["latency_n"] else None,
+                    "served_calls": s["served_calls"],
+                    "weak_or_quota": s["weak_or_quota"],
+                })
+            else:
+                points.append({
+                    "day": day, "calls": 0, "success_rate": None, "avg_latency_sec": None,
+                    "served_calls": 0, "weak_or_quota": 0,
+                })
+        series.append({"leg": leg, "points": points})
+    return {"days": day_list, "legs": series, "generated_at": utc_now()}
 
 
 def collect_run_payload(run_id: str) -> dict:
@@ -4476,6 +4863,14 @@ class ResearchHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/scoreboard":
             self.send_json(200, build_scoreboard())
+            return
+
+        if path == "/api/scoreboard/history":
+            try:
+                days = int(urllib.parse.parse_qs(parsed.query).get("days", ["14"])[0])
+            except (ValueError, TypeError):
+                days = 14
+            self.send_json(200, scoreboard_history(max(1, min(90, days))))
             return
 
         match = re.fullmatch(r"/api/runs/([^/]+)/events", path)

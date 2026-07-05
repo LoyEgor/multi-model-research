@@ -1,4 +1,4 @@
-# HANDOFF — current state & next steps (updated 2026-07-04, search quality & latency)
+# HANDOFF — current state & next steps (updated 2026-07-05, resilience & latency)
 
 For the next model continuing this project. Read `README.md` first (the stable spec: goal,
 token-economy rule, verified CLI facts, smoke tests). Read `ROADMAP.md` for the agreed phase
@@ -66,12 +66,54 @@ done: sharing findings between parallel search legs mid-flight — research show
 independent cross-check signal (sycophancy up to 85.5%); only coverage state (searched URLs) is
 shared, via the existing "do not re-report these URLs" prompt block.
 
+Improvement round 4 — resilience & latency (2026-07-05): (1) every verify/live-check fetch now
+goes through one `http_fetch` helper with stable browser headers (`BROWSER_UA`/`BROWSER_HEADERS`,
+deliberately NOT rotated — rotation reads as more bot-like at our volume) and bounded anti-bot
+backoff: 429s and cloudflare-style bot-wall 403s get up to 2 retries (`Retry-After` honored, capped
+at 15s; ~18s total sleep budget per URL), a 503 gets one retry, and 404/other 4xx-5xx pass straight
+through unretried; a persistent bot-wall classifies as the new SOFT reason `bot_blocked`
+(rescuable — lands in "Unverified — check manually", never treated as a disproof), and a run-scoped
+`HostBlockRegistry` gives every URL on an already-blocked host a single polite attempt for the rest
+of the run. `verify_url`/`live_listing_check`/`apply_live_check`/`verify_findings` all route through
+it; the UI has a `bot_blocked` reason label. (2) `scoreboard_history(days=14)` buckets
+`model-stats.jsonl` + `served-models.jsonl` by UTC day × leg (calls, success_rate, avg_latency_sec,
+served_calls, weak_or_quota), served at `GET /api/scoreboard/history?days=N` (clamped 1-90); the UI
+scoreboard panel gained per-leg 14-day sparklines (inline SVG calls polyline + a success-rate
+colored dot row, hover titles) — still a health indicator only, not routing; this closes the
+"scoreboard has no time-series view" open item from Phase 7. (3) streaming verification: a
+run-scoped `UrlCheckCache` (thread-safe, single-flight per normalized URL, separate verify/live
+namespaces) is shared across rounds; `collect_with_straggler_drop` gained an optional `on_record`
+callback, and all four round runners (`run_primary_search`, `run_rechecks`, `run_coverage_round`,
+`run_frontier_round`) now parse each completed record's findings as it lands and prefetch its URLs
+on a small pool (`RESEARCH_MAX_PREFETCH_WORKERS`, default 4) sharing the same `HostBlockRegistry` —
+so by the time the batch `verify_findings` pass runs, the cache is already warm. This removes the
+serial URL-check tail that used to follow the slowest search call, without changing verification
+semantics (tests assert identical output with and without a warm cache). (4) `lib/legs/ask_gemini.sh`
+fix, **uncommitted in the llm-legs submodule**: measured live 2026-07-05 — when the Antigravity
+individual quota is exhausted, `agy --print` silently returns rc 0 with EMPTY stdout+stderr (the
+`RESOURCE_EXHAUSTED` 429 "Resets in Nh" error only reaches agy's internal log). The wrapper now
+passes `--log-file` to a temp file and, on empty output, greps stderr+log with `QUOTA_RE` for an
+instant exit 5 (quota — the orchestrator drops the leg) carrying the reset hint, with no fallback
+attempt; plain-empty output still exits 1 after the chain. Self-contained stub test at
+`lib/legs/tests/test_gemini_quota_detect.sh`. **Open action item:** this fix is not yet
+committed/pushed to `LoyEgor/llm-legs` and the pin in this repo is not bumped. (5) Round 3 live
+validation (2026-07-05, run concurrently with a gemini quota exhaustion mid-window and codex
+user-disabled): plan_audit confirmed live (ran alongside primary search, verdict "gaps", added 2
+tasks — flagged Russian-only queries, added Ukrainian phrasing + a Facebook Marketplace angle);
+clarify no-question path confirmed (`clarify_resolved` with `asked: false`); clarify ASK path
+confirmed on a claude-only effort-1 run (a real Russian ambiguity question with 3 alternatives,
+answered via `POST /api/runs/<id>/clarify`, triggering a re-decompose, all recorded in
+`run.json.clarify`); resilience confirmed (gemini breaker tripped, claude-only continuation still
+produced a report). Not yet live-validated: the gap_audit happy path (needs ≥1 healthy search-leg
+pair) and the deferred `bench/harness.py` benchmark run — both blocked on the gemini quota reset
+(~2026-07-09).
+
 Live-page verification (minimal Stage 2): `apply_live_check` fetches verified marketplace
 listings, rejects non-active ads (`listing_inactive`), and overrides the model-claimed price
 with the live page price (`price_corrected_from`). Currently OLX-only (listing-ID patterns +
 generic price regex) — Plati/Prom/JSON-LD adapters are the open Stage 2 work.
 
-Tests: `python3 -m unittest discover tests` — 129 tests, all passing.
+Tests: `python3 -m unittest discover tests` — 150 tests, all passing.
 
 Git: public repos github.com/LoyEgor/{multi-model-research, llm-legs}; find-truth private. The
 owner controls git — do NOT commit/push without explicit per-action instruction.
@@ -95,14 +137,22 @@ Phase 7 (capacity), being executed sequentially. The owner approved the order 20
   cancel endpoint + UI ✕. UI per-leg swimlanes from SSE.
 - **Domain generalization (Phase 6) — DONE 2026-06-13:** validated on a housing query — decompose
   picked real-estate portals on its own, intent auto-extracted housing exclusions, USD ranked
-  mixed UAH/USD, report was optimal-first with reasons. Open: DOM.RIA-style HTTP 429 anti-bot on
-  the live-check fetcher (Stage-2 adapter backoff/UA, not a logic bug).
+  mixed UAH/USD, report was optimal-first with reasons. The DOM.RIA-style HTTP 429 anti-bot on the
+  live-check fetcher is closed by round 4's `http_fetch` backoff (see above) — not yet re-validated
+  live against DOM.RIA specifically.
 - **Capacity (Phase 7) — DONE 2026-06-13:** quota-aware pacing (daily_call_counts + per-run
   budget clamped to DAILY_CAPS remaining); model scoreboard (build_scoreboard → GET
   /api/scoreboard + UI panel; health indicator, NOT routing); Claude reserve via agy
   (call_agy_claude — last fallback for arbiter + synthesis judge when the Anthropic pool is
-  exhausted; separate quota pool, audited as leg "claude-agy"). Open: scoreboard has no
-  time-series view; DAILY_CAPS are static soft caps (no provider quota API).
+  exhausted; separate quota pool, audited as leg "claude-agy"). Open: DAILY_CAPS are static soft
+  caps (no provider quota API). Scoreboard time-series — DONE round 4 (`scoreboard_history`).
+- **Gemini quota (llm-legs submodule fix pending commit):** the agy individual quota is exhausted
+  until ~2026-07-09. The round-4 `ask_gemini.sh` fix for the silent-empty exhaustion trap (see
+  above) lives uncommitted in the `lib/legs` submodule checkout — commit + push it to
+  `LoyEgor/llm-legs`, then bump the pin here. The gap_audit happy-path live validation (needs ≥1
+  healthy search-leg pair) and the deferred `bench/harness.py` benchmark run are both blocked on
+  the same reset. Side note: agy's model list now also shows a "Gemini 3.5 Flash" family — worth
+  checking for a 3.5 Pro tier once the quota resets.
 
 ## Trap ledger (why code-verifies-claims is non-negotiable)
 

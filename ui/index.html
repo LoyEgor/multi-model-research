@@ -339,6 +339,11 @@
   .scoreboard td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .scoreboard .sb-low { color: var(--bad); font-weight: 600; }
   .scoreboard .sb-ok { color: var(--good); font-weight: 600; }
+  .sb-trend { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+  .sb-trend th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 4px 10px; }
+  .sb-trend td { padding: 5px 10px; border-top: 1px solid var(--track); vertical-align: middle; }
+  .sb-trend .sb-spark { display: block; }
+  .sb-trend .sb-spark title { pointer-events: none; }
 
   /* Toast */
   #toast { position: fixed; bottom: 26px; left: 50%; transform: translate(-50%, 0); background: var(--ink); color: #f8fafd; padding: 12px 22px; border-radius: 999px; font-size: 13px; font-weight: 500; box-shadow: var(--shadow-md); opacity: 0; pointer-events: none; z-index: 50; }
@@ -1386,6 +1391,7 @@ $('verifiedTools').addEventListener('click', (e) => {
 const REASON_LABELS = {
   http_404: 'Dead link — 404 not found',
   http_410: 'Dead link — 410 gone',
+  bot_blocked: 'Blocked by anti-bot wall — verify manually',
   parse_failed: 'Model output unparseable',
   timeout: 'Verification timed out',
   content_mismatch: 'Live page sells something else',
@@ -1518,7 +1524,76 @@ async function renderScoreboard() {
     table.appendChild(tr);
   });
   body.appendChild(table);
+  const trendWrap = el('div');
+  body.appendChild(trendWrap);
   body.appendChild(el('div', 'panel-note', 'Health indicator only — not used for routing. Updated ' + (data.generated_at || '').slice(11, 19) + ' UTC.'));
+  renderScoreboardTrend(trendWrap);
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs, title) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (title) {
+    const t = document.createElementNS(SVG_NS, 'title');
+    t.textContent = title;
+    n.appendChild(t);
+  }
+  return n;
+}
+function sparkPointTitle(p) {
+  return p.day + ': ' + p.calls + ' calls, ' +
+    (p.success_rate == null ? 'no data' : Math.round(p.success_rate * 100) + '% ok');
+}
+function callsSparkline(points) {
+  const W = 116, H = 24, pad = 3;
+  const n = points.length;
+  const max = Math.max(1, ...points.map((p) => p.calls || 0));
+  const x = (i) => (n <= 1 ? W / 2 : pad + (i * (W - 2 * pad)) / (n - 1));
+  const y = (v) => H - pad - (v / max) * (H - 2 * pad);
+  const svg = svgEl('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, class: 'sb-spark' });
+  if (n > 1) {
+    svg.appendChild(svgEl('polyline', {
+      points: points.map((p, i) => `${x(i).toFixed(1)},${y(p.calls || 0).toFixed(1)}`).join(' '),
+      fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.5,
+      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+    }));
+  }
+  points.forEach((p, i) => {
+    svg.appendChild(svgEl('circle', { cx: x(i).toFixed(1), cy: y(p.calls || 0).toFixed(1), r: 1.7, fill: 'var(--accent)' }, sparkPointTitle(p)));
+  });
+  return svg;
+}
+function successDots(points) {
+  const W = 116, H = 24, r = 3.2;
+  const n = points.length;
+  const x = (i) => (n <= 1 ? W / 2 : (r + 1) + (i * (W - 2 * (r + 1))) / (n - 1));
+  const svg = svgEl('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, class: 'sb-spark' });
+  points.forEach((p, i) => {
+    const fill = p.success_rate == null ? 'var(--track)' : (p.success_rate >= 0.8 ? 'var(--good)' : 'var(--bad)');
+    svg.appendChild(svgEl('circle', { cx: x(i).toFixed(1), cy: H / 2, r, fill }, sparkPointTitle(p)));
+  });
+  return svg;
+}
+async function renderScoreboardTrend(wrap) {
+  let hist;
+  try { hist = await (await fetch('/api/scoreboard/history')).json(); }
+  catch (e) { return; }
+  const legs = (hist && hist.legs) || [];
+  if (!legs.length) return;
+  const span = (hist.days || []).length;
+  const table = el('table', 'sb-trend');
+  const head = el('tr');
+  [span ? span + '-day trend' : 'Trend', 'Calls/day', 'Success/day'].forEach((h) => head.appendChild(el('th', null, h)));
+  table.appendChild(head);
+  legs.forEach((lg) => {
+    const tr = el('tr');
+    tr.appendChild(el('td', null, lg.leg));
+    const c1 = el('td'); c1.appendChild(callsSparkline(lg.points || [])); tr.appendChild(c1);
+    const c2 = el('td'); c2.appendChild(successDots(lg.points || [])); tr.appendChild(c2);
+    table.appendChild(tr);
+  });
+  wrap.replaceChildren(table);
 }
 
 /* ---------------- activity (SSE) ---------------- */

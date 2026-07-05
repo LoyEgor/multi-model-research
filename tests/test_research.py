@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import http.server
 import threading
+import time
 import unittest
 
 import research
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
+    hits: dict = {}                # request path -> count of GET requests served
+    captured_headers: dict = {}    # request path -> {header: value} snapshot
+    _lock = threading.Lock()
+
+    @classmethod
+    def reset(cls, *paths):
+        with cls._lock:
+            for p in paths:
+                cls.hits.pop(p, None)
+                cls.captured_headers.pop(p, None)
+
+    def _bump_get(self):
+        with _Handler._lock:
+            _Handler.hits[self.path] = _Handler.hits.get(self.path, 0) + 1
+            return _Handler.hits[self.path]
+
     def do_HEAD(self):
         self._handle(head_only=True)
 
@@ -15,6 +32,94 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._handle(head_only=False)
 
     def _handle(self, head_only):
+        if self.path == "/hdr":
+            with _Handler._lock:
+                _Handler.captured_headers[self.path] = {
+                    "User-Agent": self.headers.get("User-Agent"),
+                    "Accept": self.headers.get("Accept"),
+                    "Accept-Language": self.headers.get("Accept-Language"),
+                }
+            self.send_response(200)
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(b"ok")
+            return
+        if self.path == "/bot-then-ok":
+            # 429 (with Retry-After) on the first GET, then 200 — the retry must recover it.
+            if head_only:
+                self.send_response(429)
+                self.send_header("Retry-After", "0")
+                self.end_headers()
+                return
+            if self._bump_get() < 2:
+                self.send_response(429)
+                self.send_header("Retry-After", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"recovered")
+            return
+        if self.path == "/bot-forever":
+            if not head_only:
+                self._bump_get()
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.end_headers()
+            return
+        if self.path == "/cf-403":
+            # A real Cloudflare CHALLENGE: cf-mitigated: challenge header + challenge body markers.
+            if not head_only:
+                self._bump_get()
+            self.send_response(403)
+            self.send_header("Server", "cloudflare")
+            self.send_header("cf-ray", "abc123-IAD")
+            self.send_header("cf-mitigated", "challenge")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(b"<html><body>Attention Required! | Cloudflare. Please enable "
+                                 b"javascript and cookies</body></html>")
+            return
+        if self.path == "/cf-plain-403":
+            # CF-proxied but a genuine origin 403: edge headers present, normal body, NO challenge.
+            if not head_only:
+                self._bump_get()
+            self.send_response(403)
+            self.send_header("Server", "cloudflare")
+            self.send_header("cf-ray", "def456-IAD")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(b"x" * 1200)  # normal-size origin 403, no markers -> not a wall
+            return
+        if self.path == "/plain-403":
+            if not head_only:
+                self._bump_get()
+            self.send_response(403)
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(b"x" * 800)  # large, no markers -> a genuine 403, not a bot wall
+            return
+        if self.path == "/verify-recover":
+            # First verify_url call fails hard (500, not retried); a later call gets 200. Proves the
+            # run URL cache does NOT memoize a transient failure (rescue can re-fetch and recover).
+            if head_only:
+                self.send_response(405)
+                self.end_headers()
+                return
+            if self._bump_get() < 2:
+                self.send_response(500)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if self.path == "/count-404":
+            if not head_only:
+                self._bump_get()
+            self.send_response(404)
+            self.end_headers()
+            return
         if self.path == "/ok":
             self.send_response(200)
             self.end_headers()
@@ -76,6 +181,29 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 if not head_only:
                     self.wfile.write(b"ok")
+        elif self.path in ("/count-verify", "/count-slow"):
+            # HEAD 405 forces verify_url onto its GET path (the only path that bumps the hit count),
+            # so a prefetch that already GET'd this URL means the batch verify must add zero GETs.
+            if head_only:
+                self.send_response(405)
+                self.end_headers()
+                return
+            if self.path == "/count-slow":
+                time.sleep(0.2)  # widen the window so concurrent single-flight callers pile on one fetch
+            self._bump_get()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        elif self.path == "/count-live":
+            # live_listing_check is GET-only; count every page fetch so the cache's single fetch shows.
+            if head_only:
+                self.send_response(405)
+                self.end_headers()
+                return
+            self._bump_get()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'<html>state: {\\"status\\":\\"active\\"} "price": 30000 </html>')
         else:
             self.send_response(404)
             self.end_headers()
@@ -142,6 +270,295 @@ class ResearchTests(unittest.TestCase):
         invalid = research.verify_url("not-a-url", timeout=2)
         self.assertFalse(invalid["ok"])
         self.assertEqual(invalid["reason"], "invalid_url")
+
+    def test_verify_fetch_sends_browser_headers(self):
+        research.verify_url(self.base_url + "/hdr", timeout=2)
+        sent = _Handler.captured_headers.get("/hdr") or {}
+        self.assertEqual(sent.get("User-Agent"), research.BROWSER_UA)
+        self.assertIn("Chrome", research.BROWSER_UA)
+        self.assertEqual(sent.get("User-Agent"), research.BROWSER_HEADERS["User-Agent"])
+        self.assertTrue(sent.get("Accept"))
+        self.assertTrue(sent.get("Accept-Language"))
+
+    def test_verify_url_retries_bot_block_then_succeeds(self):
+        from unittest import mock
+        _Handler.reset("/bot-then-ok")
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            res = research.verify_url(self.base_url + "/bot-then-ok", timeout=2)
+        self.assertTrue(res["ok"])
+        self.assertGreaterEqual(_Handler.hits.get("/bot-then-ok", 0), 2)  # first GET 429, retry 200
+
+    def test_verify_url_persistent_bot_block_is_soft_reason(self):
+        from unittest import mock
+        _Handler.reset("/bot-forever")
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            res = research.verify_url(self.base_url + "/bot-forever", timeout=2)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "bot_blocked")
+        self.assertTrue(res.get("bot_blocked"))
+        # bot_blocked is a failure to verify, NOT a disproof: rescuable, never a hard rejection.
+        self.assertNotIn("bot_blocked", research.NON_RESCUABLE_REASONS)
+        self.assertTrue(research.is_rescuable({"reasons": ["bot_blocked"]}))
+        self.assertIn("bot_blocked", research.rejection_reasons({"url": "https://x/y", "price": 1}, res))
+        # three GETs = one real attempt + two retries (bounded).
+        self.assertEqual(_Handler.hits.get("/bot-forever", 0), 3)
+
+    def test_verify_url_404_not_retried(self):
+        from unittest import mock
+        _Handler.reset("/count-404")
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            res = research.verify_url(self.base_url + "/count-404", timeout=2)
+        self.assertEqual(res["reason"], "http_404")
+        self.assertFalse(res.get("bot_blocked"))
+        self.assertEqual(_Handler.hits.get("/count-404", 0), 1)  # a real signal, fetched once
+
+    def test_http_fetch_cloudflare_403_is_bot_wall_plain_403_is_not(self):
+        from unittest import mock
+        _Handler.reset("/cf-403", "/plain-403")
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            cf = research.http_fetch(self.base_url + "/cf-403", method="GET", timeout=2, retry=True)
+            plain = research.http_fetch(self.base_url + "/plain-403", method="GET", timeout=2, retry=True)
+        self.assertTrue(cf["bot_blocked"])
+        self.assertEqual(cf["reason"], "bot_blocked")
+        self.assertEqual(_Handler.hits.get("/cf-403", 0), 3)   # bot wall retried
+        self.assertFalse(plain["bot_blocked"])
+        self.assertEqual(plain["reason"], "http_403")
+        self.assertEqual(_Handler.hits.get("/plain-403", 0), 1)  # genuine 403 not retried
+
+    def test_http_fetch_cf_proxied_plain_403_not_a_wall(self):
+        # A CF-fronted origin 403 (Server: cloudflare + cf-ray, normal body, no challenge) is a
+        # REAL 403: not retried, not bot_blocked, and the host must NOT be marked in the registry.
+        from unittest import mock
+        _Handler.reset("/cf-plain-403")
+        registry = research.HostBlockRegistry()
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            res = research.http_fetch(self.base_url + "/cf-plain-403", method="GET", timeout=2,
+                                      retry=True, host_registry=registry)
+        self.assertFalse(res["bot_blocked"])
+        self.assertEqual(res["reason"], "http_403")
+        self.assertEqual(_Handler.hits.get("/cf-plain-403", 0), 1)  # no useless anti-bot retries
+        host = research.urllib.parse.urlsplit(self.base_url).netloc.lower()
+        self.assertFalse(registry.is_blocked(host))  # whole host not condemned by one origin 403
+
+    def test_http_fetch_stops_retrying_when_host_blocked_midflight(self):
+        # The retry loop must re-read the registry each attempt: if a concurrent fetch bot-walls the
+        # host between attempts, we stop spending the retry budget instead of running it to the end.
+        from unittest import mock
+        _Handler.reset("/bot-forever")
+
+        class FlipRegistry(research.HostBlockRegistry):
+            def __init__(self):
+                super().__init__()
+                self.checks = 0
+
+            def is_blocked(self, host):  # not blocked at attempt 1's decision, blocked thereafter
+                self.checks += 1
+                return self.checks > 1
+
+        reg = FlipRegistry()
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            res = research.http_fetch(self.base_url + "/bot-forever", method="GET", timeout=2,
+                                      retry=True, host_registry=reg)
+        self.assertTrue(res["bot_blocked"])
+        # attempt 1 (429) -> retry allowed; attempt 2 (429) -> re-check sees blocked -> stop.
+        # Without the per-attempt re-check this would run the full budget (3 GETs).
+        self.assertEqual(_Handler.hits.get("/bot-forever", 0), 2)
+
+    def test_http_fetch_per_host_skip_retries_after_block(self):
+        from unittest import mock
+        _Handler.reset("/bot-forever")
+        registry = research.HostBlockRegistry()
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            first = research.http_fetch(self.base_url + "/bot-forever", method="GET", timeout=2,
+                                        retry=True, host_registry=registry)
+            second = research.http_fetch(self.base_url + "/bot-forever", method="GET", timeout=2,
+                                         retry=True, host_registry=registry)
+        self.assertTrue(first["bot_blocked"])
+        self.assertTrue(second["bot_blocked"])
+        # First call: 1 attempt + 2 retries = 3. Second call on the now-blocked host: 1 attempt only.
+        self.assertEqual(_Handler.hits.get("/bot-forever", 0), 4)
+
+    def test_url_cache_single_flight_concurrent(self):
+        # Four threads race to warm the SAME url; the per-key single-flight collapses them to one fetch.
+        import concurrent.futures
+        _Handler.reset("/count-slow")
+        cache = research.UrlCheckCache()
+        reg = research.HostBlockRegistry()
+        url = self.base_url + "/count-slow"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(research.prefetch_url, url, reg, cache) for _ in range(4)]
+            for f in concurrent.futures.as_completed(futs):
+                f.result()
+        self.assertEqual(_Handler.hits.get("/count-slow", 0), 1)
+
+    def test_verify_url_reads_warm_cache_without_refetch(self):
+        _Handler.reset("/count-verify")
+        cache = research.UrlCheckCache()
+        first = research.verify_url(self.base_url + "/count-verify", timeout=2, cache=cache)
+        second = research.verify_url(self.base_url + "/count-verify", timeout=2, cache=cache)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first, second)
+        self.assertEqual(_Handler.hits.get("/count-verify", 0), 1)  # HEAD 405 -> one GET, then cached
+
+    def test_url_cache_does_not_memoize_transient_failure(self):
+        # A URL that fails once then recovers must NOT stay cached as a failure: a later round
+        # (sharing the run cache) has to be free to re-fetch and verify it — otherwise rescue is dead.
+        _Handler.reset("/verify-recover")
+        cache = research.UrlCheckCache()
+        first = research.verify_url(self.base_url + "/verify-recover", timeout=2, cache=cache)
+        self.assertFalse(first["ok"])  # round 1: 500, hard fail
+        second = research.verify_url(self.base_url + "/verify-recover", timeout=2, cache=cache)
+        self.assertTrue(second["ok"])  # round 2: failure was not retained -> re-fetched -> 200
+        self.assertEqual(_Handler.hits.get("/verify-recover", 0), 2)
+
+    def test_live_listing_check_reads_warm_cache_without_refetch(self):
+        _Handler.reset("/count-live")
+        cache = research.UrlCheckCache()
+        a = research.live_listing_check(self.base_url + "/count-live", cache=cache)
+        b = research.live_listing_check(self.base_url + "/count-live", cache=cache)
+        self.assertTrue(a["ok"])
+        self.assertEqual(a["live_price"], b["live_price"])
+        self.assertEqual(_Handler.hits.get("/count-live", 0), 1)
+
+    def test_prefetch_via_on_record_then_batch_verify_fetches_once(self):
+        # End-to-end: collect_with_straggler_drop fires on_record for a completed search record, which
+        # parses its findings and warms the cache; the later batch verify then adds zero fetches.
+        import concurrent.futures
+        import json
+        import tempfile
+        _Handler.reset("/count-verify")
+        cache = research.UrlCheckCache()
+        reg = research.HostBlockRegistry()
+        url = self.base_url + "/count-verify"
+        record = {"success": True, "leg": "codex", "task_id": "t1", "record_id": "r1", "latency_sec": 0.1,
+                  "stdout": json.dumps({"findings": [{"title": "x", "price": 10, "currency": "USD", "url": url}]})}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        submitted = []
+
+        def on_record(rec):
+            for f in research.findings_from_record(rec):
+                if f.get("url"):
+                    submitted.append(pool.submit(research.prefetch_url, f["url"], reg, cache))
+
+        fut = concurrent.futures.Future()
+        fut.set_result(record)
+        config = dict(research.make_config("quick", None))
+        config["straggler_grace_sec"] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "prefetch-run"
+            run_dir.mkdir()
+            research.collect_with_straggler_drop([fut], run_dir, config, on_record=on_record)
+        for s in submitted:
+            s.result()  # wait for the prefetch to warm the cache
+        pool.shutdown(wait=True)
+        verified, _ = research.verify_findings(research.findings_from_record(record),
+                                               cache=cache, host_registry=reg)
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(_Handler.hits.get("/count-verify", 0), 1)
+
+    def test_verify_findings_identical_with_and_without_warm_cache(self):
+        # Warming the cache changes only TIMING: the verified/rejected split and reasons must match.
+        def mk(url, price):
+            return research.normalize_finding(
+                {"title": "x", "price": price, "currency": "USD", "url": url}, "codex", "t", "r")
+        urls = [self.base_url + "/ok", self.base_url + "/missing", self.base_url + "/listing-live"]
+        findings = [mk(urls[0], 10), mk(urls[1], 20), mk(urls[2], 30)]
+
+        cold_v, cold_r = research.verify_findings([dict(f) for f in findings])
+
+        cache = research.UrlCheckCache()
+        reg = research.HostBlockRegistry()
+        for f in findings:
+            research.prefetch_url(f["url"], reg, cache)
+        warm_v, warm_r = research.verify_findings([dict(f) for f in findings], cache=cache, host_registry=reg)
+
+        def sig(items):
+            return sorted((i.get("url"), tuple(i.get("reasons") or [])) for i in items)
+        self.assertEqual(sig(cold_v), sig(warm_v))
+        self.assertEqual(sig(cold_r), sig(warm_r))
+        self.assertEqual({i.get("url") for i in warm_v}, {urls[0], urls[2]})
+        self.assertEqual({i.get("url") for i in warm_r}, {urls[1]})
+
+    def test_prefetch_cache_respects_host_block_registry(self):
+        # The SAME registry is shared by prefetch and the batch: once /bot-forever marks the host,
+        # a DIFFERENT bot-walling URL on that host gets a single polite GET attempt (no retries).
+        from unittest import mock
+        _Handler.reset("/bot-forever", "/cf-403")
+        cache = research.UrlCheckCache()
+        reg = research.HostBlockRegistry()
+        with mock.patch.object(research, "BOT_BLOCK_BACKOFF", (0.0, 0.0)):
+            research.prefetch_url(self.base_url + "/bot-forever", reg, cache)  # marks host blocked
+            finding = research.normalize_finding(
+                {"title": "y", "price": 5, "currency": "USD", "url": self.base_url + "/cf-403"},
+                "codex", "t", "r")
+            research.verify_findings([finding], cache=cache, host_registry=reg)
+        self.assertEqual(_Handler.hits.get("/bot-forever", 0), 3)  # 1 attempt + 2 retries before mark
+        self.assertEqual(_Handler.hits.get("/cf-403", 0), 1)       # throttled host -> single attempt
+
+    def test_collect_straggler_invokes_on_record_per_record(self):
+        import concurrent.futures
+        import tempfile
+        seen = []
+        futs = []
+        for i in range(3):
+            f = concurrent.futures.Future()
+            f.set_result({"record_id": f"r{i}", "latency_sec": 0.1, "success": True})
+            futs.append(f)
+        config = dict(research.make_config("quick", None))
+        config["straggler_grace_sec"] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "on-record-run"
+            run_dir.mkdir()
+            records = research.collect_with_straggler_drop(
+                futs, run_dir, config, on_record=lambda r: seen.append(r["record_id"]))
+        self.assertEqual(sorted(seen), ["r0", "r1", "r2"])
+        self.assertEqual(len(records), 3)
+
+    def test_prefetch_shutdown_cancels_queued_backlog(self):
+        # shutdown(cancel_futures=True): a task already running finishes, but tasks still queued
+        # behind it must be dropped, not keep fetching after phase end / run cancel.
+        import json
+        import threading as th
+        from unittest import mock
+        config = dict(research.make_config("quick", None))
+        cache = research.UrlCheckCache()
+        reg = research.HostBlockRegistry()
+        ran = []
+        started = th.Event()
+        release = th.Event()
+
+        def fake_prefetch(url, host_registry, cache):
+            ran.append(url)
+            if url.endswith("/block"):
+                started.set()
+                release.wait(5)
+
+        with mock.patch.object(research, "MAX_PREFETCH_WORKERS", 1), \
+             mock.patch.object(research, "prefetch_url", fake_prefetch):
+            on_record, shutdown = research.make_prefetch_collector(config, reg, cache)
+            rec = {"success": True, "leg": "codex", "task_id": "t", "record_id": "r",
+                   "stdout": json.dumps({"findings": [
+                       {"title": "a", "price": 1, "currency": "USD", "url": "http://h.test/block"},
+                       {"title": "b", "price": 2, "currency": "USD", "url": "http://h.test/queued1"},
+                       {"title": "c", "price": 3, "currency": "USD", "url": "http://h.test/queued2"}]})}
+            on_record(rec)
+            self.assertTrue(started.wait(5))  # first task holds the single worker
+            shutdown()                        # cancel_futures drops the two still-queued tasks
+            release.set()
+        self.assertIn("http://h.test/block", ran)          # already-running task finished
+        self.assertNotIn("http://h.test/queued1", ran)     # queued backlog cancelled
+        self.assertNotIn("http://h.test/queued2", ran)
+
+    def test_retry_after_seconds_rejects_nan_and_negative(self):
+        class _Exc:
+            def __init__(self, val):
+                self.headers = {"Retry-After": val}
+        self.assertIsNone(research._retry_after_seconds(_Exc("nan")))   # nan must not poison backoff
+        self.assertIsNone(research._retry_after_seconds(_Exc("-5")))
+        self.assertIsNone(research._retry_after_seconds(_Exc("junk")))
+        self.assertEqual(research._retry_after_seconds(_Exc("3")), 3.0)
+        self.assertEqual(research._retry_after_seconds(_Exc("99999")),
+                         research.BOT_BLOCK_RETRY_AFTER_CAP)
 
     def test_dedupe_same_olx_listing_across_language_prefixes(self):
         items = [
@@ -1365,6 +1782,111 @@ class ResearchTests(unittest.TestCase):
             self.assertIn("success_rate", legs[leg])
             self.assertIn("daily_cap", legs[leg])
 
+    def test_scoreboard_history_bucketing(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = research.Path(tmp) / "model-stats.jsonl"
+            served = research.Path(tmp) / "served-models.jsonl"
+            stats_rows = [
+                {"ts": "2026-03-15T00:00:00Z", "leg": "codex", "success": True, "latency_sec": 10.0},
+                {"ts": "2026-03-15T09:00:00Z", "leg": "codex", "success": False, "latency_sec": 20.0},
+                {"ts": "2026-03-15T09:30:00Z", "leg": "gemini", "success": True, "latency_sec": 30.0},
+                {"ts": "2026-03-14T23:59:59Z", "leg": "codex", "success": True, "latency_sec": 40.0},
+                {"ts": "2026-03-01T12:00:00Z", "leg": "codex", "success": True, "latency_sec": 99.0},  # outside window
+                {"ts": "2026-03-15T10:00:00Z", "success": True},  # no leg -> ignored
+            ]
+            served_rows = [
+                {"ts": "2026-03-15T00:10:00Z", "leg": "codex", "weak_tier": 1},
+                {"ts": "2026-03-15T00:20:00Z", "leg": "codex", "weak_tier": 0},
+                {"ts": "2026-03-15T00:30:00Z", "leg": "gemini", "served": "QUOTA_EXHAUSTED"},
+            ]
+            stats.write_text("\n".join(research.json.dumps(r) for r in stats_rows) + "\n")
+            served.write_text("\n".join(research.json.dumps(r) for r in served_rows) + "\n")
+            with mock.patch.object(research, "MODEL_STATS", stats), mock.patch.object(research, "SERVED_MODELS", served):
+                h = research.scoreboard_history(days=7, today="2026-03-15")
+
+            self.assertEqual(len(h["days"]), 7)
+            self.assertEqual(h["days"][0], "2026-03-09")
+            self.assertEqual(h["days"][-1], "2026-03-15")
+            legs = {s["leg"]: s for s in h["legs"]}
+            self.assertEqual(set(legs), {"codex", "gemini"})
+            for s in h["legs"]:                       # dense: one point per day per leg
+                self.assertEqual(len(s["points"]), 7)
+            codex = {p["day"]: p for p in legs["codex"]["points"]}
+            self.assertEqual(codex["2026-03-15"]["calls"], 2)
+            self.assertEqual(codex["2026-03-15"]["success_rate"], 0.5)
+            self.assertEqual(codex["2026-03-15"]["avg_latency_sec"], 15.0)
+            self.assertEqual(codex["2026-03-15"]["served_calls"], 2)
+            self.assertEqual(codex["2026-03-15"]["weak_or_quota"], 1)
+            # UTC day boundary: 23:59:59Z lands on 03-14, not 03-15
+            self.assertEqual(codex["2026-03-14"]["calls"], 1)
+            self.assertEqual(codex["2026-03-14"]["success_rate"], 1.0)
+            self.assertNotIn("2026-03-01", codex)     # older than the 7-day window
+            self.assertEqual(codex["2026-03-10"]["calls"], 0)   # zero-filled gap day
+            self.assertIsNone(codex["2026-03-10"]["success_rate"])
+            gemini = {p["day"]: p for p in legs["gemini"]["points"]}
+            self.assertEqual(gemini["2026-03-15"]["weak_or_quota"], 1)   # QUOTA_EXHAUSTED served
+            self.assertEqual(gemini["2026-03-15"]["success_rate"], 1.0)
+
+    def test_scoreboard_history_empty(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = research.Path(tmp) / "model-stats.jsonl"
+            served = research.Path(tmp) / "served-models.jsonl"
+            stats.write_text("")
+            served.write_text("")
+            with mock.patch.object(research, "MODEL_STATS", stats), mock.patch.object(research, "SERVED_MODELS", served):
+                h = research.scoreboard_history(days=2, today="2026-03-15")
+            self.assertEqual(h["legs"], [])
+            self.assertEqual(h["days"], ["2026-03-14", "2026-03-15"])
+            self.assertIn("generated_at", h)
+            # missing files entirely must also degrade to an empty (but well-formed) history
+            with mock.patch.object(research, "MODEL_STATS", research.Path(tmp) / "absent.jsonl"), \
+                 mock.patch.object(research, "SERVED_MODELS", research.Path(tmp) / "absent2.jsonl"):
+                h2 = research.scoreboard_history(days=1, today="2026-03-15")
+            self.assertEqual(h2["legs"], [])
+            self.assertEqual(len(h2["days"]), 1)
+
+    def test_scoreboard_history_endpoint(self):
+        import tempfile
+        import threading
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = research.Path(tmp) / "model-stats.jsonl"
+            served = research.Path(tmp) / "served-models.jsonl"
+            today = research.dt.datetime.now(research.dt.timezone.utc).strftime("%Y-%m-%d")
+            stats.write_text(research.json.dumps({"ts": f"{today}T01:00:00Z", "leg": "codex", "success": True, "latency_sec": 5.0}) + "\n")
+            served.write_text(research.json.dumps({"ts": f"{today}T01:05:00Z", "leg": "codex", "weak_tier": 0}) + "\n")
+            with mock.patch.object(research, "MODEL_STATS", stats), mock.patch.object(research, "SERVED_MODELS", served):
+                server = research.http.server.ThreadingHTTPServer(("127.0.0.1", 0), research.ResearchHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                    conn.request("GET", "/api/scoreboard/history?days=5")
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("application/json", response.getheader("Content-Type", ""))
+                    payload = research.json.loads(response.read().decode("utf-8"))
+                    conn.close()
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=3)
+        self.assertEqual(len(payload["days"]), 5)
+        legs = {s["leg"]: s for s in payload["legs"]}
+        self.assertIn("codex", legs)
+        # Midnight-safe: locate the point by the day we actually stamped the row with, rather than
+        # asserting on points[-1] (the server's own "today" can differ if the clock rolls over UTC
+        # midnight between writing the fixture and the endpoint computing the window).
+        by_day = {p["day"]: p for p in legs["codex"]["points"]}
+        self.assertIn(today, by_day)
+        self.assertEqual(by_day[today]["calls"], 1)
+
     def test_agy_claude_reserve_absent_cli(self):
         import tempfile
         from unittest import mock
@@ -1515,13 +2037,13 @@ class ResearchTests(unittest.TestCase):
              "availability": "available", "source_model": "codex"},
         ]
 
-        def fake_verify_url(url):
+        def fake_verify_url(url, **kwargs):
             return {"ok": True} if "ok.example" in (url or "") else {"ok": False, "reason": "http_404"}
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = research.Path(tmp)
             with mock.patch.object(research, "verify_url", side_effect=fake_verify_url), \
-                 mock.patch.object(research, "apply_live_check", lambda item, intent=None: None):
+                 mock.patch.object(research, "apply_live_check", lambda item, intent=None, **kwargs: None):
                 verified, rejected = research.verify_findings(
                     findings, [], None, None, run_dir=run_dir, stage="primary")
             rows = [research.json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
@@ -1539,7 +2061,7 @@ class ResearchTests(unittest.TestCase):
     def test_verify_findings_silent_without_run_dir(self):
         # Back-compat: callers without a run_dir (and the unit tests) must not require an events file.
         from unittest import mock
-        with mock.patch.object(research, "verify_url", lambda url: {"ok": False, "reason": "x"}):
+        with mock.patch.object(research, "verify_url", lambda url, **kwargs: {"ok": False, "reason": "x"}):
             verified, rejected = research.verify_findings(
                 [{"title": "A", "url": "https://e/1", "price": 1, "availability": "available"}])
         self.assertEqual(verified, [])
@@ -1577,8 +2099,8 @@ class ResearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = research.Path(tmp)
             emitted = {}
-            with mock.patch.object(research, "verify_url", lambda url: {"ok": True}), \
-                 mock.patch.object(research, "apply_live_check", lambda item, intent=None: None):
+            with mock.patch.object(research, "verify_url", lambda url, **kwargs: {"ok": True}), \
+                 mock.patch.object(research, "apply_live_check", lambda item, intent=None, **kwargs: None):
                 # Round 1: 1 finding + 1 parse failure -> 2 finding_settled events.
                 research.verify_findings([good], parse_rej, None, None,
                                          run_dir=run_dir, stage="primary", emitted=emitted)

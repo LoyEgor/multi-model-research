@@ -277,3 +277,64 @@ mid-flight — research shows it destroys the independent cross-check signal (sy
 per-item verification was deferred (a seconds-level win for high implementation complexity).
 
 Tests: 101 → 129, all green.
+
+## Improvement round 4 — resilience & latency (2026-07-05)
+
+Follow-up focused on live-fetch resilience against anti-bot walls and cutting the serial
+URL-verification tail off the end of a run.
+
+### R4.1 — Anti-bot live-check fetching — DONE 2026-07-05
+Every verify/live-check network call now goes through one `http_fetch` helper with stable browser
+headers (`BROWSER_UA`/`BROWSER_HEADERS`, deliberately NOT rotated — at our request volume a
+rotating UA reads as MORE bot-like) and bounded anti-bot backoff: 429s and cloudflare-style
+bot-wall 403s (`_smells_like_bot_wall`) get up to 2 retries (`Retry-After` honored via
+`_retry_after_seconds`, capped at 15s; ~18s total sleep budget per URL via `BOT_BLOCK_TOTAL_CAP`),
+a 503 gets one retry, and 404/other 4xx-5xx pass straight through unretried. A persistent bot-wall
+is the new SOFT reason `bot_blocked` — rescuable, lands in "Unverified — check manually", never a
+disproof. A run-scoped `HostBlockRegistry` gives every subsequent URL on an already-blocked host a
+single polite attempt (no retries) for the rest of the run. `verify_url`, `live_listing_check`,
+`apply_live_check`, and `verify_findings` all route through `http_fetch`; the UI got a `bot_blocked`
+reason label. Closes the DOM.RIA-style HTTP 429 open item noted in Phase 6.
+
+### R4.2 — Scoreboard time-series — DONE 2026-07-05
+`scoreboard_history(days=14)` buckets `model-stats.jsonl` + `served-models.jsonl` by UTC day × leg
+(calls, success_rate, avg_latency_sec, served_calls, weak_or_quota), dense and zero-filled, served
+at `GET /api/scoreboard/history?days=N` (clamped 1-90). The UI scoreboard panel gained per-leg
+14-day sparklines (inline SVG: a calls polyline plus a success-rate colored dot row, with hover
+titles). Still a health indicator only, never used for routing — closes the "scoreboard has no
+time-series view" open item from Phase 7.
+
+### R4.3 — Streaming verification (prefetch) — DONE 2026-07-05
+A run-scoped `UrlCheckCache` (thread-safe, single-flight per normalized URL, separate `verify`/
+`live` namespaces) is shared across all rounds. `collect_with_straggler_drop` gained an optional
+`on_record` callback; `make_prefetch_collector` builds one that parses each just-completed record's
+findings and submits their URLs (via `prefetch_url`) to a small pool (`RESEARCH_MAX_PREFETCH_WORKERS`
+env, default 4, `MAX_PREFETCH_WORKERS`) sharing the same `HostBlockRegistry`. All four round runners
+(`run_primary_search`, `run_rechecks`, `run_coverage_round`, `run_frontier_round`) are wired to it,
+so the cache is already warm by the time the batch `verify_findings` pass runs — removing the
+serial URL-check tail that used to follow the slowest search call, with no change to verification
+semantics (tests assert identical `verify_findings` output with and without a warm cache).
+
+### R4.4 — llm-legs: silent Gemini quota exhaustion (submodule) — DONE 2026-07-05
+Measured live 2026-07-05: when the Antigravity individual quota is exhausted, `agy --print`
+silently returns rc 0 with EMPTY stdout+stderr — the `RESOURCE_EXHAUSTED` (429) "Resets in Nh"
+error only reaches agy's internal log, never stdout/stderr. `lib/legs/ask_gemini.sh` now passes
+`--log-file` to a temp file and, on empty output, greps stderr+log against `QUOTA_RE` for an
+instant exit 5 (quota — the orchestrator drops the leg) carrying the reset hint, with no fallback
+attempt; plain-empty output still exits 1 after the existing fallback chain. Self-contained stub
+test (stubs `agy`, no real model call) at `lib/legs/tests/test_gemini_quota_detect.sh`. **Not yet
+committed/pushed to `LoyEgor/llm-legs`, and the submodule pin in this repo is not bumped** — see
+HANDOFF Known-open.
+
+### Validation — Round 3 live-checked 2026-07-05
+Concurrent with a gemini quota exhaustion mid-window and codex user-disabled: plan_audit confirmed
+live (rode the primary search wave, verdict "gaps", added 2 tasks — flagged Russian-only queries,
+added Ukrainian phrasing + a Facebook Marketplace angle); clarify no-question path confirmed
+(`clarify_resolved` with `asked: false`); clarify ASK path confirmed on a claude-only effort-1 run
+(a real Russian ambiguity question with 3 alternatives, answered via `POST /api/runs/<id>/clarify`,
+triggering one re-decompose, all recorded in `run.json.clarify`); resilience confirmed (gemini
+circuit breaker tripped, claude-only continuation still produced a report). Not yet live-validated:
+the gap_audit happy path (needs ≥1 healthy search-leg pair) and the deferred `bench/harness.py`
+benchmark run — both blocked on the gemini quota reset (~2026-07-09).
+
+Tests: 134 → 150, all green.

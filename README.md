@@ -133,6 +133,11 @@ What v1 does:
   (`listing_inactive`), and the live page price overrides the model's claim
   (`price_corrected_from` keeps the trail). Search-index caches feed models stale prices that
   BOTH vendors agree on — only the page is the truth;
+- guards against anti-bot walls on the verify/live-check path: bounded backoff retries a 429 or a
+  cloudflare-style bot-wall 403 (`Retry-After` honored, capped total wait ~18s per URL), and a
+  host that bot-walled once gets a single polite attempt for the rest of the run
+  (`HostBlockRegistry`). A persistent block is the soft reason `bot_blocked` — rescuable, never a
+  disproof — so the item lands in "Unverified — check manually";
 - **never silently discards a failed-verification item** — a broken/moved URL, timeout, or
   missing price is a *failure to verify*, not a disproof. Such items get RESCUE rounds: a model
   that has not tried yet (other vendor first, then the originator; BOTH legs at effort 4) hunts
@@ -184,6 +189,8 @@ Useful local tuning knobs:
 - `RESEARCH_MAX_TASKS` — overrides the effort profile's task count when set (capped 3-6);
 - `RESEARCH_MAX_RECHECK_ITEMS` — overrides the effort profile's per-round recheck cap when set;
 - `RESEARCH_MAX_PRIMARY_WORKERS=6` — primary fan-out concurrency;
+- `RESEARCH_MAX_PREFETCH_WORKERS=4` — pool size for the streaming URL-check prefetch that warms
+  verification's cache while search calls are still running;
 - `RESEARCH_SYNTHESIS_RESERVE_SEC=900` — wall-clock reserved for synthesis; optional stages stop
   once the run's time budget has only this much left;
 - `RESEARCH_CLARIFY_TIMEOUT_SEC=45` — how long an interactive run waits for an answer to the
