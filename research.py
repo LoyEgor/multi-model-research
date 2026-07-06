@@ -1582,12 +1582,20 @@ def apply_model_verdict(item: dict, verdict: dict, intent: dict | None = None) -
     leg = verdict.get("leg")
     checked_at = verdict.get("checked_at") or utc_now()
     if not verdict.get("live"):
+        # "Could not OPEN the page" (opened=false) is NOT evidence the offer is dead — the model's
+        # own web tooling may be bot-walled exactly like our HTTP client. Only a verdict from a model
+        # that actually READ the page may finalize; otherwise return None so the caller falls back to
+        # the normal HTTP path and the item keeps its rescuable network rejection ("Unverified" slot).
+        if not verdict.get("opened"):
+            return None
         item["model_verified"] = False
         return {"ok": False, "reason": "model_check_failed", "method": "model",
                 "model": leg, "checked_at": checked_at}
     final_url = verdict.get("url")
-    if isinstance(final_url, str) and final_url.strip():
-        item["url"] = final_url.strip()
+    if isinstance(final_url, str) and final_url.strip() and final_url.strip() != item.get("url"):
+        # Keep item["url"] as the canonical key: rewriting it would change finding_dedupe_key and the
+        # already-streamed rejected card for this offer would never reconcile with the promoted one.
+        item["final_url"] = final_url.strip()
     for field in ("availability", "seller", "title"):
         val = verdict.get(field)
         if isinstance(val, str) and val.strip():
@@ -1832,7 +1840,11 @@ def verify_findings(
             # A web-capable model already opened this page (our plain HTTP is bot-walled here); trust
             # its liveness verdict and skip the network round-trip. The semantic gates below
             # (rejection_reasons -> intent/tier/content) still run on the model-updated fields.
-            return item, apply_model_verdict(item, verdict, intent)
+            mv_check = apply_model_verdict(item, verdict, intent)
+            if mv_check is not None:
+                return item, mv_check
+            # None = the model could not OPEN the page either; fall through to the HTTP path so the
+            # item keeps its original (rescuable) network rejection instead of a false final verdict.
         url_check = verify_url(item.get("url"), host_registry=host_registry, cache=cache)
         if url_check.get("ok"):
             apply_live_check(item, intent, host_registry=host_registry, cache=cache)
@@ -2305,13 +2317,17 @@ def _flag_incomparable_basis(finding: dict, intent: dict) -> None:
         f"{canon_basis(intent.get('official_price_basis'))} — not directly comparable")
 
 
-def keyword_hits(text: object, keywords: list[str] | None) -> list[str]:
-    """Whole-word / whole-phrase keyword matcher, returning which keywords actually occur in `text`
-    at token boundaries. Unicode-aware (\\w spans non-ASCII scripts under re), so "prompt" does NOT
-    fire on "prompts"/"prompt caching", "free" not on "freedom", "voice" not on "invoice", and a
-    non-ASCII keyword not on a longer glued word. Multi-word keywords match across any run of
-    whitespace. A naive substring
-    test here silently rejected valid LLM-API listings (every one mentions "prompt caching")."""
+def keyword_hits(text: object, keywords: list[str] | None, prefix: bool = False) -> list[str]:
+    """Keyword matcher returning which keywords occur in `text` at token boundaries. Unicode-aware
+    (\\w spans non-ASCII scripts under re). Multi-word keywords match across any run of whitespace.
+    Two modes, chosen by which failure direction is harmful:
+    - prefix=False (whole-word): for EXCLUDE keywords, where a false hit kills a valid result —
+      "free" must not fire on "freedom", "voice" not on "invoice". (A naive substring test here
+      silently rejected valid LLM-API listings.)
+    - prefix=True (word-start, suffix allowed): for SUBJECT keywords, where a false MISS kills a
+      valid result — a base-form subject must still hit the inflected/declined variants that
+      dominate RU/UA listing titles, "credit" must hit "credits". Only the trailing boundary is
+      relaxed; the leading boundary still blocks "voice" from firing on "invoice"."""
     hay = str(text or "").lower()
     hits = []
     for raw in keywords or []:
@@ -2319,7 +2335,8 @@ def keyword_hits(text: object, keywords: list[str] | None) -> list[str]:
         if not kw:
             continue
         pattern = r"\s+".join(re.escape(part) for part in kw.split())
-        if re.search(rf"(?<!\w){pattern}(?!\w)", hay, re.UNICODE):
+        tail = "" if prefix else r"(?!\w)"
+        if re.search(rf"(?<!\w){pattern}{tail}", hay, re.UNICODE):
             hits.append(kw)
     return hits
 
@@ -2339,7 +2356,7 @@ def intent_rejection(finding: dict, intent: dict | None) -> str | None:
     if intent.get("exclude_keywords") and keyword_hits(text, intent["exclude_keywords"]):
         return "excluded_by_keyword"
     subject = intent.get("subject_keywords") or []
-    if subject and not keyword_hits(text, subject):
+    if subject and not keyword_hits(text, subject, prefix=True):
         return "off_intent"
     req_rank = tier_rank(intent.get("required_tier"))
     if req_rank is not None:
@@ -2405,7 +2422,6 @@ def content_mismatch(finding: dict, intent: dict | None) -> bool:
     live_title = str(live.get("page_title") or "")
     if not live_title.strip():
         return False
-    live_words = _words(live_title)
     if intent.get("exclude_keywords") and keyword_hits(live_title, intent["exclude_keywords"]):
         return True
     subject = [kw for kw in (intent.get("subject_keywords") or []) if kw]
@@ -2413,8 +2429,9 @@ def content_mismatch(finding: dict, intent: dict | None) -> bool:
         return False
     finding_title = str(finding.get("title") or "").lower()
     indexed_on_subject = any(kw in finding_title for kw in subject)
-    # subject keyword present as a whole word in the live title (handles multi-word subjects too)
-    live_has_subject = any(all(part in live_words for part in _words(kw)) for kw in subject)
+    # Prefix mode, same as the intent_rejection subject gate: the live title's inflected/plural
+    # forms must still count as the subject being present.
+    live_has_subject = bool(keyword_hits(live_title, subject, prefix=True))
     return indexed_on_subject and not live_has_subject
 
 
@@ -2864,10 +2881,10 @@ def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: lis
     # turns are handed to fast legs instead of stretching the round by the grace window for nothing.
     fast_legs = [leg for leg in search_legs if leg not in SLOW_LEGS]
     codex_cap = int(config.get("codex_task_cap") or 0)
-    job_legs: list[str] = []
+    assigned: list[tuple[str, tuple]] = []  # (leg, job) — jobs past the slow cap with no fast leg are DROPPED
     slow_used = 0
     fast_rr = 0
-    for i in range(len(jobs)):
+    for i, job in enumerate(jobs):
         leg = search_legs[i % len(search_legs)]
         if leg in SLOW_LEGS:
             if slow_used < codex_cap:
@@ -2875,7 +2892,15 @@ def run_coverage_round(prompt: str, missing_classes: list[str], avoid_hosts: lis
             elif fast_legs:
                 leg = fast_legs[fast_rr % len(fast_legs)]
                 fast_rr += 1
-        job_legs.append(leg)
+            else:
+                # No fast leg to hand the turn to (e.g. only codex survives) — dropping the job is the
+                # cap working as intended; keeping it on codex would rebuild the unbounded slow fan-out.
+                continue
+        assigned.append((leg, job))
+    if not assigned:
+        return []
+    jobs = [job for _, job in assigned]
+    job_legs = [leg for leg, _ in assigned]
     on_record, prefetch_shutdown = make_prefetch_collector(config, host_registry, url_cache)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PRIMARY_WORKERS, len(jobs))) as executor:
@@ -2991,11 +3016,14 @@ Your job:
   the user wants (right item/tier, honestly described, in stock).
 - Read the CURRENT price and currency straight off the page (not from the data above).
 - If the url redirected, report the FINAL url.
-- NO invented data: if you cannot open the page, or it is dead / sold / a different product, return
+- "opened" MUST be honest: true ONLY if you actually loaded and read the page content. If your own
+  web tooling was also blocked / errored, return "opened": false, "live": false — do NOT guess.
+- NO invented data: if the page is dead / sold / a different product, return "opened": true,
   "live": false and explain why in notes.
 
 Return exactly this JSON shape:
 {{
+  "opened": true,
   "live": true,
   "price": 12345,
   "currency": "USD",
@@ -3876,7 +3904,8 @@ def write_model_stats(run_id: str, records: list[dict], rejected: list[dict]) ->
 
 
 def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
-                                on_record: object = None, fast_quorum_total: int | None = None) -> list[dict]:
+                                on_record: object = None, fast_quorum_total: int | None = None,
+                                expect_findings: bool = True) -> list[dict]:
     """Collect fan-out results; once STRAGGLER_QUORUM of calls are in, give the rest a bounded
     grace window, then kill them. Killed calls return as failures and flow into rescue. `on_record`
     (optional) fires for each record the moment its future completes — used to prefetch that
@@ -3940,7 +3969,9 @@ def collect_with_straggler_drop(futures: list, run_dir: Path, config: dict,
             # timeout — when they finish, `pending` empties and the loop exits (so this cannot spin
             # forever, and a cancel that reaps the calls also completes their futures). Once ANY finding
             # is in, revert to the normal reap so a healthy phase is not stretched by one slow leg.
-            found = sum(len(findings_from_record(r)) for r in records)
+            # expect_findings=False (verdict-shaped batches, e.g. model_verify) skips the guard —
+            # those records NEVER parse as findings, so the guard would suppress the reaper entirely.
+            found = sum(len(findings_from_record(r)) for r in records) if expect_findings else 1
             if found == 0:
                 emit_event(run_dir, "straggler_grace_extended", waiting_for=len(pending))
             else:
@@ -4155,15 +4186,13 @@ def run_rechecks(
     # first codex_task_cap items (the cheapest — items arrive price-sorted); the rest cycle fast legs.
     codex_cap = int(config.get("codex_task_cap") or 0)
     slow_used = 0
-    # Only the network-blocked items the model-verify stage (Q1) will actually take (same selector,
-    # so the two sets agree) skip rescue — re-searching THOSE via an LLM wastes a call re-finding the
-    # same bot-walled URL. Eligible items BEYOND the model_verify_cap keep the rescue path: dropping
-    # them from both would leave them with zero recovery attempts.
-    model_verify_keys = {dedupe_key(it) for it in select_model_verify_candidates(items, config)}
+    # Network-blocked items are NOT excluded from rescue even though the model-verify stage (Q1) will
+    # also look at the cheapest of them: that stage is conditional (time budget, web-leg availability,
+    # leg budget) and selects from a LATER snapshot of the rejected pool, so any exclusion here can
+    # strand an item with zero recovery paths. The double-spend is bounded by max_recheck_items and
+    # model_verify_cap; model-verify stays purely additive.
     for item in items:
         if not (item.get("disputed") or is_rescuable(item)):
-            continue
-        if dedupe_key(item) in model_verify_keys:
             continue
         key = dedupe_key(item)
         if key in seen_keys:
@@ -4225,9 +4254,9 @@ def run_rechecks(
 def select_model_verify_candidates(items: list[dict], config: dict) -> list[dict]:
     """The top-model_verify_cap cheapest network-blocked candidates (USD-ranked via sort_by_usd so
     mixed currencies compare correctly; native-price-only items sort last rather than as huge
-    pseudo-USD numbers). SHARED between run_model_verify (which verifies exactly this set) and
-    run_rechecks (which excludes exactly this set from LLM rescue) — the two must agree, or an
-    item beyond the cap would lose both recovery paths."""
+    pseudo-USD numbers). Model-verify is purely ADDITIVE on top of rescue: rescue deliberately does
+    NOT exclude these items, because this stage is conditional and selects from a later snapshot of
+    the rejected pool — coupling the two sets stranded items with zero recovery paths."""
     cap = int(config.get("model_verify_cap") or 0)
     if cap <= 0:
         return []
@@ -4287,7 +4316,8 @@ def run_model_verify(prompt: str, rejected: list[dict], run_dir: Path, config: d
             ]
             fast_total = sum(1 for _ in call_jobs if leg not in SLOW_LEGS)
             records = collect_with_straggler_drop(futures, run_dir, config, on_record=on_record,
-                                                  fast_quorum_total=fast_total)
+                                                  fast_quorum_total=fast_total,
+                                                  expect_findings=False)
     finally:
         prefetch_shutdown()
 
@@ -4295,15 +4325,22 @@ def run_model_verify(prompt: str, rejected: list[dict], run_dir: Path, config: d
     for record in records:
         item = by_task.get(record.get("task_id"))
         if item is None or not record.get("success"):
-            continue  # the model call itself failed/skipped — leave the item's network rejection as-is
+            # The model call itself failed/skipped — leave the item's network rejection as-is and
+            # return the pre-consumed budget slot (call_model does not refund model_verify calls).
+            if item is not None:
+                refund_leg_budget(run_id, leg)
+            continue
         try:
             payload = extract_json(record.get("stdout") or "")
         except ValueError:
+            refund_leg_budget(run_id, leg)
             continue
         if not isinstance(payload, dict):
+            refund_leg_budget(run_id, leg)
             continue
         checked += 1
         model_verdicts[dedupe_key(item)] = {
+            "opened": bool(payload.get("opened")),
             "live": bool(payload.get("live")),
             "price": payload.get("price"),
             "currency": payload.get("currency"),

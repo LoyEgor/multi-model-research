@@ -902,6 +902,21 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(research.keyword_hits("аккаунтище большой", ["аккаунт"]), [])
         # a genuine standalone match still fires
         self.assertEqual(research.keyword_hits("MacBook Air for parts", ["for parts"]), ["for parts"])
+        # prefix mode (subject gate): inflected/plural forms DO match; leading boundary still holds
+        self.assertEqual(research.keyword_hits("продажа аккаунта claude", ["аккаунт"], prefix=True), ["аккаунт"])
+        self.assertEqual(research.keyword_hits("1000 credits for claude", ["credit"], prefix=True), ["credit"])
+        self.assertEqual(research.keyword_hits("MacBook Airs on sale", ["macbook air"], prefix=True), ["macbook air"])
+        self.assertEqual(research.keyword_hits("send us an invoice", ["voice"], prefix=True), [])
+
+    def test_intent_rejection_subject_matches_inflected_forms(self):
+        # The whole-word fix was for EXCLUDE keywords; the subject gate must stay lenient — a
+        # genitive/plural title is the normal marketplace phrasing and must NOT be final-rejected.
+        intent = {"subject_keywords": ["аккаунт"], "exclude_keywords": []}
+        finding = {"title": "Продажа аккаунта Claude Max", "evidence": "", "marketplace": "OLX"}
+        self.assertIsNone(research.intent_rejection(finding, intent))
+        plural = {"subject_keywords": ["console"], "exclude_keywords": []}
+        self.assertIsNone(research.intent_rejection(
+            {"title": "PS5 consoles for sale", "evidence": "", "marketplace": ""}, plural))
 
     def test_intent_rejection_word_boundary_no_false_reject(self):
         # Root-cause: an OpenRouter Fable 5 listing must NOT be nuked by the bad generic exclude
@@ -1628,6 +1643,27 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(all(tt == "coverage" for _, tt, _ in calls))
         self.assertTrue(any(i.startswith("class-classifieds") for i in ids))
         self.assertEqual(sum(1 for i in ids if i.startswith("gap-")), 2)  # both gap queries fanned out
+
+    def test_run_coverage_round_slow_cap_holds_without_fast_legs(self):
+        import tempfile
+        from unittest import mock
+
+        calls = []
+
+        def fake_call(leg, prompt, run_dir, task_type, task_id, timeout=900, effort="medium", claude_model=None):
+            calls.append(leg)
+            return {"success": True, "stdout": '{"findings": []}', "leg": leg, "task_id": task_id, "record_id": "x"}
+
+        # Only the slow leg survives (gemini+claude disabled): the codex cap must DROP the overflow
+        # jobs, not silently hand every round-robin turn back to codex (unbounded slow fan-out).
+        cfg = dict(research.make_config("deep", None))
+        cfg["search_legs"] = ["codex"]
+        self.assertEqual(cfg["codex_task_cap"], 3)
+        gaps = [{"query": f"q{i}", "reason": "r"} for i in range(6)]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research, "call_model", side_effect=fake_call):
+                research.run_coverage_round("p", [], [], research.Path(tmp), cfg, None, gap_queries=gaps)
+        self.assertEqual(calls.count("codex"), 3)  # exactly the cap; 3 jobs dropped
 
     def test_run_coverage_round_no_jobs_without_gaps_or_classes(self):
         import tempfile
@@ -2978,15 +3014,34 @@ class ResearchTests(unittest.TestCase):
         self.assertLess(v["confidence_calibrated"]["score"], research.calibrate_confidence(live_equiv)["score"])
 
     def test_apply_model_verdict_rejects_on_not_live(self):
+        # opened=true + live=false: the model READ the page and it is dead/wrong — final rejection.
         finding = research.normalize_finding(
             {"title": "x", "url": "https://e.com/1", "price": 50, "currency": "USD"}, "gemini", "t", "r")
-        mv = {research.dedupe_key(finding): {"live": False, "leg": "gemini", "notes": "could not open"}}
+        mv = {research.dedupe_key(finding): {"opened": True, "live": False, "leg": "gemini",
+                                             "notes": "page shows sold out"}}
         verified, rejected = research.verify_findings([finding], None, None, None, model_verdicts=mv)
         self.assertEqual(len(verified), 0)
         self.assertEqual(len(rejected), 1)
         self.assertIn("model_check_failed", rejected[0]["reasons"])
         self.assertFalse(research.is_rescuable(rejected[0]))          # final — will not loop back
         self.assertFalse(research.model_verify_eligible(rejected[0]))  # nor re-enter model-verify
+
+    def test_apply_model_verdict_could_not_open_is_not_final(self):
+        # opened=false + live=false: the verifying model was bot-walled too — that is NOT evidence the
+        # offer is dead. apply_model_verdict returns None and verify_findings falls back to the HTTP
+        # path, so the item keeps a rescuable network rejection instead of a false final verdict.
+        finding = research.normalize_finding(
+            {"title": "x", "url": "https://e.com/1", "price": 50, "currency": "USD"}, "gemini", "t", "r")
+        verdict = {"opened": False, "live": False, "leg": "gemini", "notes": "fetch denied"}
+        self.assertIsNone(research.apply_model_verdict(dict(finding), verdict))
+        from unittest import mock
+        mv = {research.dedupe_key(finding): verdict}
+        with mock.patch.object(research, "verify_url",
+                               return_value={"ok": False, "reason": "bot_blocked", "bot_blocked": True}):
+            verified, rejected = research.verify_findings([finding], None, None, None, model_verdicts=mv)
+        self.assertEqual(len(rejected), 1)
+        self.assertNotIn("model_check_failed", rejected[0]["reasons"])
+        self.assertTrue(research.is_rescuable(rejected[0]))
 
     def test_run_model_verify_records_verdicts_top_k_and_leg_fallback(self):
         import tempfile
@@ -3056,7 +3111,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(verdicts, {})
 
-    def test_run_rechecks_excludes_model_verify_eligible(self):
+    def test_run_rechecks_keeps_model_verify_eligible_in_rescue(self):
         import tempfile
         from unittest import mock
 
@@ -3066,12 +3121,11 @@ class ResearchTests(unittest.TestCase):
             prompts.append(prompt)
             return {"success": True, "leg": leg, "task_id": task_id, "record_id": task_id, "stdout": '{"findings": []}'}
 
-        # 4 network-only items against model_verify_cap=3: the top-3 cheapest go to model-verify
-        # (excluded from rescue), the overflow item must KEEP the rescue path — otherwise it would
-        # lose both recovery attempts.
-        net_items = [{"reasons": ["bot_blocked"], "url": f"https://e.com/net{i}", "price": 100 + i,
-                      "price_usd": 100 + i, "title": f"net{i}", "source_model": "gemini"}
-                     for i in range(4)]
+        # Model-verify is ADDITIVE: network-blocked items are NOT excluded from rescue (the verify
+        # stage is conditional and selects from a later snapshot — coupling the sets stranded items
+        # with zero recovery paths). Both network and semantic rejects keep the rescue path.
+        net_item = {"reasons": ["bot_blocked"], "url": "https://e.com/net", "price": 100,
+                    "price_usd": 100, "title": "net", "source_model": "gemini"}
         sem_item = {"reasons": ["excluded_by_keyword"], "url": "https://e.com/sem", "price": 100,
                     "price_usd": 100, "title": "sem", "source_model": "gemini"}
         cfg = dict(research.make_config("standard", None))
@@ -3081,11 +3135,9 @@ class ResearchTests(unittest.TestCase):
             run_dir = research.Path(tmp) / run_id
             run_dir.mkdir()
             with mock.patch.object(research, "call_model", side_effect=fake_call):
-                research.run_rechecks("p", net_items + [sem_item], run_dir, cfg, 1, {})
-        self.assertTrue(any("e.com/sem" in p for p in prompts))     # semantic reject -> still rescued
-        for i in range(3):
-            self.assertFalse(any(f"e.com/net{i}" in p for p in prompts))  # top-K -> model-verify
-        self.assertTrue(any("e.com/net3" in p for p in prompts))   # beyond the cap -> rescue kept
+                research.run_rechecks("p", [net_item, sem_item], run_dir, cfg, 1, {})
+        self.assertTrue(any("e.com/sem" in p for p in prompts))
+        self.assertTrue(any("e.com/net" in p for p in prompts))
 
     def test_select_model_verify_candidates_usd_ranking(self):
         # Mixed currencies must rank by USD, not raw native numbers: 4500 (UAH, no USD conversion)

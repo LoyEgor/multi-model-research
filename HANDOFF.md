@@ -132,9 +132,13 @@ url its own way and return strict JSON. Verdicts land in a run-scoped `model_ver
 {dedupe_key→verdict} store threaded into every `verify_findings` so a promotion is DURABLE across
 later re-verifies (`apply_model_verdict`): live=true → promoted to verified, `model_verified` flag,
 url_check `{ok, method:"model"}`, fields adopted from the page-read, re-run through the SAME
-semantic gates; live=false → final non-rescuable reason `model_check_failed`. `calibrate_confidence`
-gives model-verified items live_score 0.7 (below machine-live 1.0, well above unverified 0.4).
-Eligible items are EXCLUDED from the rescue loop (no wasted re-search of the same blocked URL).
+semantic gates; opened=true + live=false → final non-rescuable `model_check_failed`; opened=false
+("my web tooling was blocked too") is NOT final — the verdict is ignored and the item keeps its
+rescuable network rejection. `calibrate_confidence` gives model-verified items live_score 0.7
+(below machine-live 1.0, well above unverified 0.4). The stage is purely ADDITIVE: rescue does NOT
+exclude eligible items (the stage is conditional and selects from a later snapshot of the rejected
+pool — coupling the sets stranded items with zero recovery paths). A model-reported redirect URL is
+kept as `final_url`, never overwriting the dedupe-key-bearing `url`.
 (4) **P1 — slow-leg cap in follow-up rounds**: `run_rechecks` and `run_coverage_round` now cap
 codex at `codex_task_cap` jobs per phase (highest-value first, rest cycle fast legs); the primary
 main+audit `make_jobs` threads the consumed slow count so the cap is per-PHASE, not per-call
@@ -151,7 +155,7 @@ listings, rejects non-active ads (`listing_inactive`), and overrides the model-c
 with the live page price (`price_corrected_from`). Currently OLX-only (listing-ID patterns +
 generic price regex) — Plati/Prom/JSON-LD adapters are the open Stage 2 work.
 
-Tests: `python3 -m unittest discover tests` — 176 tests, all passing.
+Tests: `python3 -m unittest discover tests` — 179 tests, all passing.
 
 Git: public repos github.com/LoyEgor/{multi-model-research, llm-legs}; find-truth private. The
 owner controls git — do NOT commit/push without explicit per-action instruction.

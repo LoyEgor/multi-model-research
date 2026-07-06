@@ -19,6 +19,9 @@ port_free() {
   python3 - "$1" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# The real server (ThreadingHTTPServer) binds with allow_reuse_address, so this probe must too —
+# otherwise lingering TIME_WAIT sockets after a quick restart read as "port taken by a foreign app".
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(("127.0.0.1", int(sys.argv[1])))
 except OSError:
