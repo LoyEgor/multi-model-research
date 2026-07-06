@@ -155,7 +155,7 @@ listings, rejects non-active ads (`listing_inactive`), and overrides the model-c
 with the live page price (`price_corrected_from`). Currently OLX-only (listing-ID patterns +
 generic price regex) — Plati/Prom/JSON-LD adapters are the open Stage 2 work.
 
-Tests: `python3 -m unittest discover tests` — 179 tests, all passing.
+Tests: `python3 -m unittest discover tests` — 180 tests, all passing.
 
 Git: public repos github.com/LoyEgor/{multi-model-research, llm-legs}; find-truth private. The
 owner controls git — do NOT commit/push without explicit per-action instruction.

@@ -2985,7 +2985,10 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(research.model_verify_eligible(item(["off_intent"])))        # semantic
         self.assertFalse(research.model_verify_eligible(item(["bot_blocked", "wrong_tier"])))  # mixed
         self.assertFalse(research.model_verify_eligible(item(["bot_blocked"], url=None)))       # no url
-        self.assertFalse(research.model_verify_eligible({"reasons": ["bot_blocked"], "url": "https://e.com/1"}))  # no price
+        # No price is OK when the failure is network-class: the verifying model reads the price
+        # first-hand off the page; the item just ranks last in the top-K selection.
+        self.assertTrue(research.model_verify_eligible(
+            {"reasons": ["bot_blocked", "missing_price"], "url": "https://e.com/1"}))
         self.assertFalse(research.model_verify_eligible(item([])))                    # no reasons
         self.assertFalse(research.model_verify_eligible(item(["missing_price"])))     # no genuine network reason
 
@@ -3150,6 +3153,30 @@ class ResearchTests(unittest.TestCase):
         picked = research.select_model_verify_candidates([native, usd], cfg)
         self.assertEqual([it["url"] for it in picked], ["https://e.com/usd"])
         self.assertEqual(research.select_model_verify_candidates([native, usd], {"model_verify_cap": 0}), [])
+        # an unpriced network-blocked item is eligible but ranks LAST (after any USD-priced one)
+        unpriced = {"reasons": ["bot_blocked", "missing_price"], "url": "https://e.com/nopx"}
+        picked = research.select_model_verify_candidates([unpriced, usd], {"model_verify_cap": 2})
+        self.assertEqual([it["url"] for it in picked], ["https://e.com/usd", "https://e.com/nopx"])
+
+    def test_run_rechecks_counts_slow_cap_drops(self):
+        import tempfile
+        from unittest import mock
+
+        # Only codex remains and its per-phase cap is 0: every rescuable item is cap-dropped and the
+        # drop must be COUNTED (no silent caps), not silently skipped.
+        items = [{"reasons": ["excluded_by_keyword"], "url": f"https://e.com/{i}", "price": 10 + i,
+                  "price_usd": 10 + i, "title": f"t{i}", "source_model": "gemini"} for i in range(3)]
+        cfg = dict(research.make_config("standard", None))
+        cfg["search_legs"] = ["codex"]
+        cfg["codex_task_cap"] = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = research.Path(tmp) / "rc-capdrop"
+            run_dir.mkdir()
+            with mock.patch.object(research, "call_model") as m:
+                records, dropped = research.run_rechecks("p", items, run_dir, cfg, 1, {})
+                m.assert_not_called()
+        self.assertEqual(records, [])
+        self.assertEqual(dropped, 3)
 
     # ---- Round 6: P1 slow-leg cap in follow-up rounds ----
     def test_rechecks_slow_leg_cap(self):

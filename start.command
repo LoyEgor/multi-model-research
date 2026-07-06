@@ -10,7 +10,9 @@ PORT="${RESEARCH_UI_PORT:-8765}"
 # so a foreign app answering 404 — or a stray 200 — on that path is not mistaken for us.
 is_ours() {
   local body
-  body="$(curl -sf --max-time 1 "http://127.0.0.1:$1/api/runs" 2>/dev/null)" || return 1
+  # 2s: a busy server (verification fan-out saturating the pool) can answer slower than 1s, and a
+  # false negative here makes the launcher hop ports away from its own healthy instance.
+  body="$(curl -sf --max-time 2 "http://127.0.0.1:$1/api/runs" 2>/dev/null)" || return 1
   case "$body" in *'"runs"'*) return 0 ;; *) return 1 ;; esac
 }
 

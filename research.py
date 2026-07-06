@@ -1721,15 +1721,15 @@ def is_network_verify_reason(reason: object) -> bool:
 
 def model_verify_eligible(item: dict) -> bool:
     """True for a rejected item that was NEVER semantically rejected — every rejection reason is a
-    network-verification-class failure (see is_network_verify_reason) — and that carries a URL and a
-    model-claimed price to confirm/rank. `missing_price` is tolerated ONLY alongside a genuine
-    network reason (a price we could not read on an unreachable page is a network artifact, not a
-    semantic reject). Such an item may be exactly what the user wants; a model with its own browser
-    can often open what bot-walled us, so it earns one model-assisted look (Q1)."""
+    network-verification-class failure (see is_network_verify_reason) — and that carries a URL.
+    `missing_price` is tolerated ONLY alongside a genuine network reason (a price we could not read
+    on an unreachable page is a network artifact, not a semantic reject); such unpriced items ARE
+    eligible — the verifying model reads the price first-hand off the page (apply_model_verdict
+    adopts it) — they just rank LAST in the top-K selection (sort_by_usd puts no-USD items last).
+    A model with its own browser can often open what bot-walled us, so the item earns one
+    model-assisted look (Q1)."""
     reasons = item.get("reasons") or []
     if not reasons or not item.get("url"):
-        return False
-    if item.get("price_usd") is None and item.get("price") is None:
         return False
     saw_network = False
     for reason in reasons:
@@ -4205,11 +4205,17 @@ def run_rechecks(
             leg for leg in search_legs
             if leg not in tried and not leg_disabled(run_id, leg) and not user_disabled(run_id, leg)
         ]
+        had_untried = bool(untried)
         if slow_used >= codex_cap:
             untried = [leg for leg in untried if leg not in SLOW_LEGS]
         untried.sort(key=lambda leg: leg == item.get("source_model"))  # non-source first
         legs = untried if config["recheck_legs"] >= len(search_legs) else untried[: config["recheck_legs"]]
         if not legs:
+            # No silent caps: a leg WAS available but the slow-leg cap filtered it away — that is a
+            # cap-induced drop and must be counted (surfaced as recheck_dropped). An item whose legs
+            # were all simply tried/disabled already is exhausted, not capped — not counted.
+            if had_untried:
+                dropped += 1
             continue
         if items_used >= config["max_recheck_items"]:
             dropped += 1
