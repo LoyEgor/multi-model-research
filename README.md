@@ -76,7 +76,7 @@ model's text answer to stdout. A leg that cannot serve a strong model exits non-
 services, subscriptions, accounts).
 
 CLI:
-- `python3 research.py "найди самый дешевый MacBook Air M2 в Украине"`
+- `python3 research.py "find the cheapest MacBook Air M2 in Ukraine"`
 - `python3 research.py --effort 3 --site olx.ua "<prompt>"` — deeper run restricted to one site
 - `python3 research.py --list-runs`
 
